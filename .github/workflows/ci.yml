@@ -14,11 +14,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add clippy rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
 
       - name: Check formatting
         run: cargo fmt --check
