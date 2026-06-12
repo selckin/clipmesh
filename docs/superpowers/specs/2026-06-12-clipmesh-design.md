@@ -122,6 +122,20 @@ compositor.
 
 `content_hash` is a hash (BLAKE3) over the sorted `(mime, bytes)` pairs.
 
+### Resync on reconnect
+
+Updates broadcast while a peer is offline would otherwise be lost until
+the next copy. When a peer gains its first connection, both sides push
+their current (filtered) clipboard state as a `Clip` flagged `resync`.
+Every `Clip` carries `set_at_ms`, the wall-clock time the content entered
+the mesh at its originating node. A receiver applies a *resync* only if
+its `set_at_ms` is strictly newer than that of the content it currently
+holds — so two nodes resyncing at each other converge on the most recent
+content instead of swapping. Live (non-resync) updates always apply, so
+clock skew between hosts can never disturb normal operation; it can only
+make a resync decision slightly wrong. Disable pushing with
+`resync_on_connect = false` (default `true`).
+
 ## Configuration
 
 TOML, default path `~/.config/clipmesh/config.toml`:
@@ -157,6 +171,9 @@ Option semantics:
 - **`direction`**: `send_only` broadcasts local copies but ignores inbound
   offers; `receive_only` applies inbound offers but never broadcasts.
   Connections are still established in both modes.
+- **`resync_on_connect`** (default `true`): push current clipboard state
+  to a peer when it (re)connects; newest content wins on the receiving
+  side. `receive_only` nodes never push.
 - **`debounce_ms`**: successive change events within the window collapse
   into one broadcast of the final state.
 - **`max_payload_size`**: offers whose total captured size exceeds the cap

@@ -21,7 +21,13 @@ async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
 }
 
 async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
-    spawn_node(Arc::new(cfg), clip).await.expect("node failed to start")
+    let node = spawn_node(Arc::new(cfg), clip.clone()).await.expect("node failed to start");
+    // don't return before the engine is subscribed, or an immediate
+    // local_copy can fire into the void
+    while clip.watcher_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    node
 }
 
 /// Reserve a free port by binding and dropping (small reuse race, fine for tests).
@@ -65,6 +71,33 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
     sleep(Duration::from_millis(300)).await;
     assert_eq!(clip_a.write_count(), 1);
     assert_eq!(clip_b.write_count(), 1);
+}
+
+#[tokio::test]
+async fn content_copied_while_peer_offline_resyncs_on_connect() {
+    // the sleep/wake scenario: A copies something while B is offline;
+    // when B connects it must receive the current state without a new copy
+    let clip_a = MockClipboard::new();
+    let clip_b = MockClipboard::new();
+
+    let node_a = start(Config::for_test("resync"), clip_a.clone()).await;
+    let o = offer("copied while b was away");
+    clip_a.local_copy(SelectionKind::Clipboard, o.clone());
+    sleep(Duration::from_millis(200)).await; // broadcast goes to nobody
+
+    let mut cfg_b = Config::for_test("resync");
+    cfg_b.peers = vec![node_a.local_addr.to_string()];
+    start(cfg_b, clip_b.clone()).await;
+
+    let cb = clip_b.clone();
+    let expected = o.clone();
+    wait_for(
+        move || cb.get(SelectionKind::Clipboard).as_ref() == Some(&expected),
+        "offline copy to resync onto B",
+    )
+    .await;
+    // and A must not have had anything written back
+    assert_eq!(clip_a.write_count(), 0);
 }
 
 #[tokio::test]

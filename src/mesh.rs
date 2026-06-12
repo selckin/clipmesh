@@ -19,15 +19,23 @@ pub struct Mesh {
     next_conn_id: AtomicU64,
     peers: Mutex<HashMap<Uuid, Vec<ConnHandle>>>,
     inbound_tx: mpsc::Sender<(Uuid, Message)>,
+    /// Notified with the remote node ID when a peer gains its first
+    /// connection (i.e. it just joined or rejoined the mesh).
+    connect_tx: mpsc::Sender<Uuid>,
 }
 
 impl Mesh {
-    pub fn new(own_id: Uuid, inbound_tx: mpsc::Sender<(Uuid, Message)>) -> Arc<Mesh> {
+    pub fn new(
+        own_id: Uuid,
+        inbound_tx: mpsc::Sender<(Uuid, Message)>,
+        connect_tx: mpsc::Sender<Uuid>,
+    ) -> Arc<Mesh> {
         Arc::new(Mesh {
             own_id,
             next_conn_id: AtomicU64::new(0),
             peers: Mutex::new(HashMap::new()),
             inbound_tx,
+            connect_tx,
         })
     }
 
@@ -38,8 +46,16 @@ impl Mesh {
     /// Add a connection for a peer; returns its connection ID.
     pub fn register(&self, remote: Uuid, tx: mpsc::Sender<Message>) -> u64 {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        self.peers.lock().unwrap().entry(remote).or_default().push(ConnHandle { id, tx });
+        let first_connection = {
+            let mut peers = self.peers.lock().unwrap();
+            let conns = peers.entry(remote).or_default();
+            conns.push(ConnHandle { id, tx });
+            conns.len() == 1
+        };
         info!(peer = %remote, conn = id, "connection registered");
+        if first_connection && self.connect_tx.try_send(remote).is_err() {
+            warn!(peer = %remote, "connect-event queue full; resync skipped");
+        }
         id
     }
 
@@ -79,6 +95,25 @@ impl Mesh {
         }
     }
 
+    /// Send a message to one peer's designated connection (used for
+    /// targeted resyncs). Same try_send semantics as broadcast.
+    pub fn send_to(&self, peer: Uuid, msg: &Message) {
+        let target = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .and_then(|conns| conns.first().map(|c| c.tx.clone()));
+        match target {
+            Some(tx) => {
+                if tx.try_send(msg.clone()).is_err() {
+                    warn!(peer = %peer, "send queue full or closed; dropping targeted message");
+                }
+            }
+            None => warn!(peer = %peer, "no connection for targeted message"),
+        }
+    }
+
     pub fn peer_count(&self) -> usize {
         self.peers.lock().unwrap().len()
     }
@@ -99,12 +134,56 @@ mod tests {
         let offer: Offer = [("text/plain".to_string(), text.as_bytes().to_vec())]
             .into_iter()
             .collect();
-        Message::Clip { kind: SelectionKind::Clipboard, hash: content_hash(&offer), offer }
+        Message::Clip {
+            kind: SelectionKind::Clipboard,
+            hash: content_hash(&offer),
+            offer,
+            set_at_ms: 0,
+            resync: false,
+        }
     }
 
     fn new_mesh() -> (std::sync::Arc<Mesh>, mpsc::Receiver<(Uuid, Message)>) {
         let (tx, rx) = mpsc::channel(8);
-        (Mesh::new(Uuid::new_v4(), tx), rx)
+        let (ctx, _crx) = mpsc::channel(8);
+        (Mesh::new(Uuid::new_v4(), tx, ctx), rx)
+    }
+
+    fn new_mesh_with_connects() -> (
+        std::sync::Arc<Mesh>,
+        mpsc::Receiver<(Uuid, Message)>,
+        mpsc::Receiver<Uuid>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let (ctx, crx) = mpsc::channel(8);
+        (Mesh::new(Uuid::new_v4(), tx, ctx), rx, crx)
+    }
+
+    #[tokio::test]
+    async fn first_connection_emits_a_connect_event_standby_does_not() {
+        let (mesh, _rx, mut connects) = new_mesh_with_connects();
+        let peer = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (tx2, _rx2) = mpsc::channel(8);
+        mesh.register(peer, tx1);
+        assert_eq!(connects.try_recv().unwrap(), peer);
+        // a duplicate (standby) connection must not re-trigger resync
+        mesh.register(peer, tx2);
+        assert!(connects.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn send_to_reaches_only_the_target_peer() {
+        let (mesh, _rx) = new_mesh();
+        let peer_a = Uuid::new_v4();
+        let peer_b = Uuid::new_v4();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        mesh.register(peer_a, tx_a);
+        mesh.register(peer_b, tx_b);
+        mesh.send_to(peer_a, &clip("targeted"));
+        assert_eq!(rx_a.try_recv().unwrap(), clip("targeted"));
+        assert!(rx_b.try_recv().is_err());
     }
 
     #[tokio::test]

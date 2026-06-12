@@ -28,7 +28,8 @@ pub struct NodeHandle {
 pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Result<NodeHandle> {
     let node_id = Uuid::new_v4();
     let (inbound_tx, inbound_rx) = mpsc::channel(64);
-    let mesh = Mesh::new(node_id, inbound_tx);
+    let (connect_tx, connect_rx) = mpsc::channel(64);
+    let mesh = Mesh::new(node_id, inbound_tx, connect_tx);
 
     let listener = TcpListener::bind(&cfg.listen)
         .await
@@ -80,7 +81,7 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
     }
 
     let engine = SyncEngine::new(clipboard, mesh.clone(), cfg);
-    let engine_task = tokio::spawn(engine.run(inbound_rx));
+    let engine_task = tokio::spawn(engine.run(inbound_rx, connect_rx));
 
     Ok(NodeHandle { local_addr, mesh, engine_task })
 }

@@ -109,15 +109,23 @@ mod tests {
         let offer: Offer = [("text/plain".to_string(), text.as_bytes().to_vec())]
             .into_iter()
             .collect();
-        Message::Clip { kind: SelectionKind::Clipboard, hash: content_hash(&offer), offer }
+        Message::Clip {
+            kind: SelectionKind::Clipboard,
+            hash: content_hash(&offer),
+            offer,
+            set_at_ms: 0,
+            resync: false,
+        }
     }
 
     #[tokio::test]
     async fn peers_exchange_hello_and_clip_messages() {
         let (in_a_tx, _in_a_rx) = mpsc::channel(8);
         let (in_b_tx, mut in_b_rx) = mpsc::channel(8);
-        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx);
-        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx);
+        let (ctx_a, _crx_a) = mpsc::channel(8);
+        let (ctx_b, _crx_b) = mpsc::channel(8);
+        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx, ctx_a);
+        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx, ctx_b);
 
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh_a.clone()));
@@ -137,7 +145,8 @@ mod tests {
     #[tokio::test]
     async fn self_connection_is_rejected() {
         let (in_tx, _in_rx) = mpsc::channel(8);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx);
+        let (ctx, _crx) = mpsc::channel(8);
+        let mesh = Mesh::new(Uuid::new_v4(), in_tx, ctx);
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         let a = tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh.clone()));
         let b = tokio::spawn(run_connection(io_b, false, PSK, MAX, mesh.clone()));
@@ -151,8 +160,10 @@ mod tests {
     async fn connection_unregisters_when_the_wire_drops() {
         let (in_a_tx, _in_a_rx) = mpsc::channel(8);
         let (in_b_tx, _in_b_rx) = mpsc::channel(8);
-        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx);
-        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx);
+        let (ctx_a, _crx_a) = mpsc::channel(8);
+        let (ctx_b, _crx_b) = mpsc::channel(8);
+        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx, ctx_a);
+        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx, ctx_b);
 
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh_a.clone()));

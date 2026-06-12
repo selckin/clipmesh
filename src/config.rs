@@ -31,6 +31,8 @@ struct RawConfig {
     direction: Direction,
     #[serde(default = "default_true")]
     exclude_sensitive: bool,
+    #[serde(default = "default_true")]
+    resync_on_connect: bool,
     #[serde(default = "default_log_level")]
     log_level: String,
     mime_allow: Option<Vec<String>>,
@@ -65,6 +67,9 @@ pub struct Config {
     pub sync_primary: bool,
     pub direction: Direction,
     pub exclude_sensitive: bool,
+    /// Push current clipboard state to peers when they (re)connect;
+    /// the receiving side applies it only if it is newer than its own.
+    pub resync_on_connect: bool,
     pub log_level: String,
     pub mime_allow: Option<Vec<String>>,
     pub mime_deny: Vec<String>,
@@ -121,6 +126,7 @@ impl Config {
             sync_primary: raw.sync_primary,
             direction: raw.direction,
             exclude_sensitive: raw.exclude_sensitive,
+            resync_on_connect: raw.resync_on_connect,
             log_level: raw.log_level,
             mime_allow: raw.mime_allow,
             mime_deny: raw.mime_deny,
@@ -138,6 +144,7 @@ impl Config {
             sync_primary: false,
             direction: Direction::Both,
             exclude_sensitive: true,
+            resync_on_connect: true,
             log_level: "info".into(),
             mime_allow: None,
             mime_deny: vec![],
@@ -161,6 +168,7 @@ debounce_ms = 250
 sync_primary = true
 direction = "send_only"
 exclude_sensitive = false
+resync_on_connect = false
 log_level = "debug"
 mime_allow = ["text/*"]
 mime_deny = ["image/bmp"]
@@ -174,6 +182,7 @@ mime_deny = ["image/bmp"]
         assert!(cfg.sync_primary);
         assert_eq!(cfg.direction, Direction::SendOnly);
         assert!(!cfg.exclude_sensitive);
+        assert!(!cfg.resync_on_connect);
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.mime_allow, Some(vec!["text/*".to_string()]));
         assert_eq!(cfg.mime_deny, vec!["image/bmp".to_string()]);
@@ -188,6 +197,7 @@ mime_deny = ["image/bmp"]
         assert!(!cfg.sync_primary);
         assert_eq!(cfg.direction, Direction::Both);
         assert!(cfg.exclude_sensitive);
+        assert!(cfg.resync_on_connect);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.mime_allow, None);
         assert!(cfg.mime_deny.is_empty());

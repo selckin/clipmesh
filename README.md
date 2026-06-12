@@ -9,6 +9,9 @@ Copy on one host, paste on all of them.
   secret can neither read nor inject clipboard contents.
 - Mirrors all MIME representations (text, images, ...), capped at 8 MiB.
 - Skips password-manager-flagged contents by default.
+- Resyncs on reconnect: content copied while a peer was offline is pushed
+  to it when it comes back, newest content wins (disable with
+  `resync_on_connect = false`).
 
 ## Requirements
 

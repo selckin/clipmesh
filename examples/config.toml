@@ -15,6 +15,7 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # sync_primary = false        # also sync the middle-click primary selection
 # direction = "both"          # "both" | "send_only" | "receive_only"
 # exclude_sensitive = true    # skip password-manager-flagged contents
+# resync_on_connect = true    # push current clipboard to peers when they (re)connect
 # log_level = "info"          # overridable with RUST_LOG
 # mime_allow = ["text/*", "image/*"]  # example, NOT the default; unset = allow all types
 # mime_deny = []

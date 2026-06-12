@@ -21,6 +21,13 @@ pub enum Message {
         kind: SelectionKind,
         hash: [u8; 32],
         offer: Offer,
+        /// Wall-clock ms since epoch when this content entered the mesh
+        /// (set by the originating node). Used to arbitrate resyncs only.
+        set_at_ms: u64,
+        /// True when pushed on (re)connect rather than on a live copy.
+        /// Receivers apply a resync only if set_at_ms is newer than what
+        /// they currently hold.
+        resync: bool,
     },
 }
 
@@ -83,7 +90,13 @@ mod tests {
         assert_eq!(decode(&encode(&hello)).unwrap(), hello);
 
         let o = offer(&[("text/plain", b"payload")]);
-        let clip = Message::Clip { kind: SelectionKind::Clipboard, hash: content_hash(&o), offer: o };
+        let clip = Message::Clip {
+            kind: SelectionKind::Clipboard,
+            hash: content_hash(&o),
+            offer: o,
+            set_at_ms: 123,
+            resync: false,
+        };
         assert_eq!(decode(&encode(&clip)).unwrap(), clip);
     }
 

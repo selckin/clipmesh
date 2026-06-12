@@ -4,7 +4,7 @@ use crate::mesh::Mesh;
 use crate::protocol::{content_hash, Message, Offer, SelectionKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -52,6 +52,16 @@ pub struct SyncEngine<C> {
     last_applied: Mutex<HashMap<SelectionKind, [u8; 32]>>,
     /// Hash of the last offer we broadcast, per selection.
     last_broadcast: Mutex<HashMap<SelectionKind, [u8; 32]>>,
+    /// When the current content of each selection entered the mesh
+    /// (ms since epoch). Arbitrates resyncs: newest content wins.
+    current_ts: Mutex<HashMap<SelectionKind, u64>>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl<C: Clipboard> SyncEngine<C> {
@@ -62,12 +72,17 @@ impl<C: Clipboard> SyncEngine<C> {
             cfg,
             last_applied: Mutex::new(HashMap::new()),
             last_broadcast: Mutex::new(HashMap::new()),
+            current_ts: Mutex::new(HashMap::new()),
         })
     }
 
     /// Main loop. Runs until either the watcher or the inbound channel
     /// closes (at which point half the engine would be dead, so it stops).
-    pub async fn run(self: Arc<Self>, mut inbound: mpsc::Receiver<(Uuid, Message)>) {
+    pub async fn run(
+        self: Arc<Self>,
+        mut inbound: mpsc::Receiver<(Uuid, Message)>,
+        mut connects: mpsc::Receiver<Uuid>,
+    ) {
         let mut watch = self.clipboard.watch();
         loop {
             tokio::select! {
@@ -82,6 +97,13 @@ impl<C: Clipboard> SyncEngine<C> {
                     Some((from, msg)) => self.on_inbound(from, msg).await,
                     None => {
                         warn!("inbound channel closed; stopping sync engine");
+                        break;
+                    }
+                },
+                peer = connects.recv() => match peer {
+                    Some(peer) => self.on_peer_connected(peer).await,
+                    None => {
+                        warn!("connect-event channel closed; stopping sync engine");
                         break;
                     }
                 },
@@ -121,6 +143,35 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
+    /// Read the selection and apply the content filters (sensitive, MIME,
+    /// size). Returns None when there is nothing syncable.
+    async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
+        let offer = match self.clipboard.read_offer(kind).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("failed to read clipboard: {e:#}");
+                return None;
+            }
+        };
+        if offer.is_empty() {
+            return None;
+        }
+        if self.cfg.exclude_sensitive && is_sensitive(&offer) {
+            debug!("skipping sensitive clipboard contents");
+            return None;
+        }
+        let offer = filter_offer(offer, self.cfg.mime_allow.as_deref(), &self.cfg.mime_deny);
+        if offer.is_empty() {
+            return None;
+        }
+        let size = offer_size(&offer);
+        if size > self.cfg.max_payload_size {
+            debug!(size, cap = self.cfg.max_payload_size, "skipping oversized clipboard contents");
+            return None;
+        }
+        Some(offer)
+    }
+
     async fn broadcast_selection(&self, kind: SelectionKind) {
         if kind == SelectionKind::Primary && !self.cfg.sync_primary {
             return;
@@ -128,29 +179,9 @@ impl<C: Clipboard> SyncEngine<C> {
         if self.cfg.direction == Direction::ReceiveOnly {
             return;
         }
-        let offer = match self.clipboard.read_offer(kind).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!("failed to read clipboard: {e:#}");
-                return;
-            }
+        let Some(offer) = self.capture_offer(kind).await else {
+            return;
         };
-        if offer.is_empty() {
-            return;
-        }
-        if self.cfg.exclude_sensitive && is_sensitive(&offer) {
-            debug!("skipping sensitive clipboard contents");
-            return;
-        }
-        let offer = filter_offer(offer, self.cfg.mime_allow.as_deref(), &self.cfg.mime_deny);
-        if offer.is_empty() {
-            return;
-        }
-        let size = offer_size(&offer);
-        if size > self.cfg.max_payload_size {
-            debug!(size, cap = self.cfg.max_payload_size, "skipping oversized clipboard contents");
-            return;
-        }
         let hash = content_hash(&offer);
         // echo: this change is the one we just applied from the network
         if self.last_applied.lock().unwrap().get(&kind) == Some(&hash) {
@@ -161,12 +192,50 @@ impl<C: Clipboard> SyncEngine<C> {
             return;
         }
         self.last_broadcast.lock().unwrap().insert(kind, hash);
-        debug!(?kind, size, "broadcasting clipboard update");
-        self.mesh.broadcast(&Message::Clip { kind, hash, offer });
+        let set_at_ms = now_ms();
+        self.current_ts.lock().unwrap().insert(kind, set_at_ms);
+        debug!(?kind, size = offer_size(&offer), "broadcasting clipboard update");
+        self.mesh.broadcast(&Message::Clip { kind, hash, offer, set_at_ms, resync: false });
+    }
+
+    /// A peer just (re)connected: push our current state so it converges
+    /// without waiting for the next copy. The receiver applies it only if
+    /// it is newer than what it holds, so two nodes resyncing at each
+    /// other settle on the most recent content instead of swapping.
+    async fn on_peer_connected(&self, peer: Uuid) {
+        if !self.cfg.resync_on_connect {
+            return;
+        }
+        if self.cfg.direction == Direction::ReceiveOnly {
+            return;
+        }
+        let mut kinds = vec![SelectionKind::Clipboard];
+        if self.cfg.sync_primary {
+            kinds.push(SelectionKind::Primary);
+        }
+        for kind in kinds {
+            let Some(offer) = self.capture_offer(kind).await else {
+                continue;
+            };
+            let hash = content_hash(&offer);
+            // Only push content whose mesh entry time we know (it went
+            // through a broadcast or an apply); anything else is in flux
+            // and the watcher/debounce path will handle it.
+            let known = self.last_broadcast.lock().unwrap().get(&kind) == Some(&hash)
+                || self.last_applied.lock().unwrap().get(&kind) == Some(&hash);
+            if !known {
+                continue;
+            }
+            let Some(set_at_ms) = self.current_ts.lock().unwrap().get(&kind).copied() else {
+                continue;
+            };
+            debug!(?kind, %peer, "resyncing clipboard state to reconnected peer");
+            self.mesh.send_to(peer, &Message::Clip { kind, hash, offer, set_at_ms, resync: true });
+        }
     }
 
     async fn on_inbound(&self, from: Uuid, msg: Message) {
-        let Message::Clip { kind, hash, offer } = msg else {
+        let Message::Clip { kind, hash, offer, set_at_ms, resync } = msg else {
             warn!(peer = %from, "unexpected message type after handshake");
             return;
         };
@@ -180,15 +249,25 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!(peer = %from, "hash mismatch on inbound offer; dropping");
             return;
         }
+        // Resyncs only apply when strictly newer than the content we hold;
+        // live updates always apply (clock skew must not break normal use).
+        if resync {
+            let local_ts = self.current_ts.lock().unwrap().get(&kind).copied().unwrap_or(0);
+            if set_at_ms <= local_ts {
+                debug!(?kind, peer = %from, "ignoring stale resync");
+                return;
+            }
+        }
         if self.last_applied.lock().unwrap().get(&kind) == Some(&hash) {
             return; // already applied (e.g. two peers relayed the same copy)
         }
-        debug!(?kind, peer = %from, "applying remote clipboard update");
+        debug!(?kind, peer = %from, resync, "applying remote clipboard update");
         // Record as applied only on success, so a transient write failure
         // doesn't permanently block this content from being re-applied.
         match self.clipboard.write_offer(kind, offer).await {
             Ok(()) => {
                 self.last_applied.lock().unwrap().insert(kind, hash);
+                self.current_ts.lock().unwrap().insert(kind, set_at_ms);
             }
             Err(e) => warn!("failed to write clipboard: {e:#}"),
         }
@@ -210,6 +289,7 @@ mod tests {
 
     struct Harness {
         clip: Arc<MockClipboard>,
+        mesh: Arc<Mesh>,
         conn_rx: mpsc::Receiver<Message>,
         in_tx: mpsc::Sender<(Uuid, Message)>,
         remote_id: Uuid,
@@ -217,23 +297,28 @@ mod tests {
 
     async fn start(cfg: Config) -> Harness {
         let (in_tx, in_rx) = mpsc::channel(64);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone());
+        let (connect_tx, connect_rx) = mpsc::channel(64);
+        let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone(), connect_tx);
         let (conn_tx, conn_rx) = mpsc::channel(64);
         let remote_id = Uuid::new_v4();
         mesh.register(remote_id, conn_tx);
+        // drain the connect event from the initial registration so tests
+        // that don't care about resync aren't affected
+        let mut connect_rx = connect_rx;
+        let _ = connect_rx.try_recv();
         let clip = MockClipboard::new();
-        let engine = SyncEngine::new(clip.clone(), mesh, Arc::new(cfg));
-        tokio::spawn(engine.run(in_rx));
+        let engine = SyncEngine::new(clip.clone(), mesh.clone(), Arc::new(cfg));
+        tokio::spawn(engine.run(in_rx, connect_rx));
         // wait until the engine has subscribed to the watcher
         while clip.watcher_count() == 0 {
             tokio::task::yield_now().await;
         }
-        Harness { clip, conn_rx, in_tx, remote_id }
+        Harness { clip, mesh, conn_rx, in_tx, remote_id }
     }
 
     async fn recv_clip(h: &mut Harness) -> (SelectionKind, [u8; 32], Offer) {
         match timeout(Duration::from_secs(1), h.conn_rx.recv()).await.unwrap().unwrap() {
-            Message::Clip { kind, hash, offer } => (kind, hash, offer),
+            Message::Clip { kind, hash, offer, .. } => (kind, hash, offer),
             other => panic!("expected Clip, got {other:?}"),
         }
     }
@@ -246,7 +331,17 @@ mod tests {
     }
 
     async fn send_inbound(h: &Harness, kind: SelectionKind, o: Offer) {
-        let msg = Message::Clip { kind, hash: content_hash(&o), offer: o };
+        send_inbound_full(h, kind, o, now_ms(), false).await;
+    }
+
+    async fn send_inbound_full(h: &Harness, kind: SelectionKind, o: Offer, ts: u64, resync: bool) {
+        let msg = Message::Clip {
+            kind,
+            hash: content_hash(&o),
+            offer: o,
+            set_at_ms: ts,
+            resync,
+        };
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
     }
 
@@ -330,7 +425,13 @@ mod tests {
     async fn inbound_with_bad_hash_is_rejected() {
         let mut h = start(Config::for_test("s")).await;
         let o = offer("tampered");
-        let msg = Message::Clip { kind: SelectionKind::Clipboard, hash: [9u8; 32], offer: o };
+        let msg = Message::Clip {
+            kind: SelectionKind::Clipboard,
+            hash: [9u8; 32],
+            offer: o,
+            set_at_ms: 1,
+            resync: false,
+        };
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(h.clip.write_count(), 0);
@@ -476,6 +577,63 @@ mod tests {
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, o);
         assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resync_pushes_state_to_newly_connected_peer() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("current"));
+        recv_clip(&mut h).await; // consume the live broadcast
+
+        // a second peer joins; engine must push current state to it only
+        let (tx2, mut rx2) = mpsc::channel(8);
+        let peer2 = Uuid::new_v4();
+        h.mesh.register(peer2, tx2);
+        let msg = timeout(Duration::from_secs(1), rx2.recv()).await.unwrap().unwrap();
+        match msg {
+            Message::Clip { offer: o, resync, .. } => {
+                assert_eq!(o, offer("current"));
+                assert!(resync);
+            }
+            other => panic!("expected resync Clip, got {other:?}"),
+        }
+        // the pre-existing peer must not receive a duplicate
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resync_can_be_disabled() {
+        let mut cfg = Config::for_test("s");
+        cfg.resync_on_connect = false;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("current"));
+        recv_clip(&mut h).await;
+
+        let (tx2, mut rx2) = mpsc::channel(8);
+        h.mesh.register(Uuid::new_v4(), tx2);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx2.try_recv().is_err(), "resync must be disabled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_node_applies_inbound_resync() {
+        let h = start(Config::for_test("s")).await;
+        let o = offer("restored");
+        send_inbound_full(&h, SelectionKind::Clipboard, o.clone(), 5000, true).await;
+        wait_applied(&h, SelectionKind::Clipboard, &o).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_resync_is_ignored() {
+        let h = start(Config::for_test("s")).await;
+        let newer = offer("newer");
+        send_inbound_full(&h, SelectionKind::Clipboard, newer.clone(), 5000, false).await;
+        wait_applied(&h, SelectionKind::Clipboard, &newer).await;
+
+        // an older resync (e.g. from a peer that slept) must not win
+        send_inbound_full(&h, SelectionKind::Clipboard, offer("older"), 1000, true).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(newer));
     }
 
     #[test]
