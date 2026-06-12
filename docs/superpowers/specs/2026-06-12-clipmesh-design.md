@@ -89,7 +89,8 @@ compositor.
   therefore established in-band — peer naming in config need not be
   consistent across hosts, and a node never needs to know its own
   advertised address. A connection announcing the node's own ID is a
-  self-connection: closed with a warning.
+  self-connection: it is closed with a warning and its dial loop stops
+  permanently (the address will never become someone else).
 - **Duplicate-send avoidance:** connections are grouped by remote node
   ID. Per remote ID the node designates exactly one connection for
   sending; all connections receive. Each message is sent exactly once,

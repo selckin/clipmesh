@@ -66,7 +66,12 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
                             )
                             .await
                             {
-                                warn!(%addr, "inbound connection ended: {e:#}");
+                                // our own dialer already reports self-connections
+                                if e.downcast_ref::<peer::SelfConnection>().is_some() {
+                                    debug!(%addr, "inbound self-connection closed");
+                                } else {
+                                    warn!(%addr, "inbound connection ended: {e:#}");
+                                }
                             }
                         });
                     }
@@ -122,6 +127,10 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                 .await
                 {
                     Ok(()) => info!(%addr, "connection closed"),
+                    Err(e) if e.downcast_ref::<peer::SelfConnection>().is_some() => {
+                        warn!(%addr, "peer address is this node itself; not dialing it again");
+                        return;
+                    }
                     Err(e) => warn!(%addr, "connection ended: {e:#}"),
                 }
                 if started.elapsed() >= HEALTHY {

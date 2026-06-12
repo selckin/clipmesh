@@ -7,6 +7,22 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::task::JoinError;
 
+/// Marker error: the dialed/accepted peer announced our own node ID.
+/// Dial loops treat this as permanent and stop retrying the address.
+#[derive(Debug)]
+pub struct SelfConnection;
+
+impl std::fmt::Display for SelfConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "self-connection detected (is this node in its own peer list?)"
+        )
+    }
+}
+
+impl std::error::Error for SelfConnection {}
+
 /// Aborts a spawned task when dropped, so cancelling run_connection
 /// tears down its reader/writer children (and with them the stream).
 struct AbortGuard(tokio::task::AbortHandle);
@@ -51,7 +67,7 @@ where
         bail!("peer did not send hello first");
     };
     if remote_id == mesh.own_id() {
-        bail!("self-connection detected (is this node in its own peer list?)");
+        return Err(SelfConnection.into());
     }
 
     let (tx, mut rx) = mpsc::channel::<Message>(16);
@@ -156,8 +172,17 @@ mod tests {
         let a = tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh.clone()));
         let b = tokio::spawn(run_connection(io_b, false, PSK, MAX, mesh.clone()));
         let (ra, rb) = tokio::join!(a, b);
-        assert!(ra.unwrap().is_err());
-        assert!(rb.unwrap().is_err());
+        // the error must be typed so dial loops can stop retrying for good
+        assert!(ra
+            .unwrap()
+            .unwrap_err()
+            .downcast_ref::<SelfConnection>()
+            .is_some());
+        assert!(rb
+            .unwrap()
+            .unwrap_err()
+            .downcast_ref::<SelfConnection>()
+            .is_some());
         assert_eq!(mesh.peer_count(), 0);
     }
 
