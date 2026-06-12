@@ -403,6 +403,45 @@ mod tests {
         assert_no_broadcast(&mut h).await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn mime_allow_restricts_broadcast_to_matching_types() {
+        let mut cfg = Config::for_test("s");
+        cfg.mime_allow = Some(vec!["text/*".to_string()]);
+        let mut h = start(cfg).await;
+        let mut o = offer("text part");
+        o.insert("image/png".to_string(), vec![0u8; 16]);
+        h.clip.local_copy(SelectionKind::Clipboard, o);
+        let (_, _, got) = recv_clip(&mut h).await;
+        assert_eq!(got, offer("text part"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offer_with_no_allowed_types_is_not_broadcast() {
+        let mut cfg = Config::for_test("s");
+        cfg.mime_allow = Some(vec!["text/*".to_string()]);
+        let mut h = start(cfg).await;
+        let o: Offer = [("image/png".to_string(), vec![0u8; 16])].into_iter().collect();
+        h.clip.local_copy(SelectionKind::Clipboard, o);
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_window_resets_on_new_activity() {
+        let mut cfg = Config::for_test("s");
+        cfg.debounce_ms = 100;
+        let mut h = start(cfg).await;
+        // each copy lands inside the previous quiet window, so the window
+        // keeps resetting and only the final state is broadcast once
+        h.clip.local_copy(SelectionKind::Clipboard, offer("a"));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("b"));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("c"));
+        let (_, _, got) = recv_clip(&mut h).await;
+        assert_eq!(got, offer("c"));
+        assert_no_broadcast(&mut h).await;
+    }
+
     #[test]
     fn mime_matches_patterns() {
         assert!(mime_matches("text/plain", "text/plain"));

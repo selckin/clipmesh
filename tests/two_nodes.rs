@@ -24,6 +24,12 @@ async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
     spawn_node(Arc::new(cfg), clip).await.expect("node failed to start")
 }
 
+/// Reserve a free port by binding and dropping (small reuse race, fine for tests).
+fn reserve_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
 #[tokio::test]
 async fn clipboard_syncs_both_ways_without_echo_storms() {
     let clip_a = MockClipboard::new();
@@ -62,13 +68,33 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
 }
 
 #[tokio::test]
+async fn late_starting_peer_is_eventually_connected() {
+    // exercises dial_loop's retry: B dials a peer that doesn't exist yet
+    let clip_a = MockClipboard::new();
+    let clip_b = MockClipboard::new();
+    let port = reserve_port();
+
+    let mut cfg_b = Config::for_test("late");
+    cfg_b.peers = vec![format!("127.0.0.1:{port}")];
+    let node_b = start(cfg_b, clip_b).await;
+
+    // let several dial attempts fail before the peer appears
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(node_b.mesh.peer_count(), 0);
+
+    let mut cfg_a = Config::for_test("late");
+    cfg_a.listen = format!("127.0.0.1:{port}");
+    let node_a = start(cfg_a, clip_a).await;
+
+    let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
+    wait_for(move || ma.peer_count() == 1 && mb.peer_count() == 1, "late peer to connect").await;
+}
+
+#[tokio::test]
 async fn node_rejects_dialing_itself() {
     let clip = MockClipboard::new();
     // reserve a port, then listen on it and dial it
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = reserve_port();
     let mut cfg = Config::for_test("s");
     cfg.listen = format!("127.0.0.1:{port}");
     cfg.peers = vec![format!("127.0.0.1:{port}")];

@@ -9,11 +9,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+const MAX_INBOUND_CONNECTIONS: usize = 64;
 
 pub struct NodeHandle {
     pub local_addr: SocketAddr,
@@ -38,14 +40,22 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
     {
         let mesh = mesh.clone();
         let cfg = cfg.clone();
+        // Bound concurrent inbound connections so unauthenticated LAN
+        // traffic can't exhaust memory/fds with half-open handshakes.
+        let permits = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
+                        let Ok(permit) = permits.clone().try_acquire_owned() else {
+                            warn!(%addr, "too many inbound connections; dropping");
+                            continue;
+                        };
                         let _ = stream.set_nodelay(true);
                         let mesh = mesh.clone();
                         let cfg = cfg.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) =
                                 peer::run_connection(stream, false, cfg.psk, cfg.max_payload_size, mesh).await
                             {

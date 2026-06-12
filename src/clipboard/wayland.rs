@@ -52,13 +52,14 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     let mut offer = Offer::new();
     let mut total = 0usize;
     for mime in types {
+        // Abort the whole read on any failure: broadcasting a partial offer
+        // would silently strip representations on the peers. If the
+        // clipboard changed mid-read, the watcher fires again for the new
+        // contents anyway.
         let (mut pipe, _actual_mime) =
             match paste::get_contents(ct, paste::Seat::Unspecified, paste::MimeType::Specific(&mime)) {
                 Ok(x) => x,
-                Err(e) => {
-                    warn!(%mime, "failed to read clipboard representation: {e}");
-                    continue;
-                }
+                Err(e) => bail!("failed to read clipboard representation {mime}: {e}"),
             };
         let mut data = Vec::new();
         pipe.read_to_end(&mut data)?;
@@ -89,18 +90,34 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
 }
 
 /// Spawn `wl-paste --watch` and translate its output lines into change
-/// notifications. Restarts the subprocess if it exits.
+/// notifications. Restarts the subprocess if it exits, with backoff on
+/// rapid failures (e.g. no data-control support, WAYLAND_DISPLAY unset)
+/// and wl-paste's stderr forwarded to the log so the cause is visible.
 fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, kind: SelectionKind) {
+    const RESTART_MIN: Duration = Duration::from_secs(1);
+    const RESTART_MAX: Duration = Duration::from_secs(30);
+    /// A run shorter than this counts as a failure and escalates backoff.
+    const STABLE_AFTER: Duration = Duration::from_secs(5);
     tokio::spawn(async move {
+        let mut delay = RESTART_MIN;
         loop {
+            let started = std::time::Instant::now();
             let mut cmd = tokio::process::Command::new("wl-paste");
             if kind == SelectionKind::Primary {
                 cmd.arg("--primary");
             }
             cmd.args(["--watch", "echo", "clipmesh-change"]);
-            cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             match cmd.spawn() {
                 Ok(mut child) => {
+                    if let Some(err) = child.stderr.take() {
+                        tokio::spawn(async move {
+                            let mut lines = BufReader::new(err).lines();
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                warn!("wl-paste: {line}");
+                            }
+                        });
+                    }
                     if let Some(out) = child.stdout.take() {
                         let mut lines = BufReader::new(out).lines();
                         while let Ok(Some(_)) = lines.next_line().await {
@@ -116,8 +133,13 @@ fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, kind: SelectionKind) 
                     error!("failed to spawn wl-paste --watch (is wl-clipboard installed?): {e}");
                 }
             }
-            warn!(?kind, "clipboard watcher exited; restarting in 1s");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            delay = if started.elapsed() < STABLE_AFTER {
+                (delay * 2).min(RESTART_MAX)
+            } else {
+                RESTART_MIN
+            };
+            warn!(?kind, "clipboard watcher exited; restarting in {delay:?}");
+            tokio::time::sleep(delay).await;
         }
     });
 }
