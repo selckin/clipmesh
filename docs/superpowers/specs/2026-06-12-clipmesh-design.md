@@ -71,8 +71,9 @@ compositor.
   (`snow` crate), keyed by the preshared secret. This provides mutual
   authentication (only secret-holders complete the handshake), forward
   secrecy per session, and per-message AEAD with replay protection.
-- The PSK is read from a file path or environment variable named in the
-  config — never inline in the config file.
+- The PSK is read from an inline config value, a file path, or an
+  environment variable named in the config (exactly one of `psk`,
+  `psk_file`, `psk_env`).
 - After the handshake, messages are length-prefixed encrypted frames.
   A frame that fails to decrypt, exceeds the size cap, or fails to parse
   closes the connection (logged; reconnect applies).
@@ -111,7 +112,10 @@ TOML, default path `~/.config/clipmesh/config.toml`:
 ```toml
 listen = "0.0.0.0:48100"            # listen address
 peers = ["host-b:48100", "host-c:48100"]
-psk_file = "~/.config/clipmesh/psk"  # or psk_env = "CLIPMESH_PSK"
+# exactly one of:
+psk_file = "~/.config/clipmesh/psk"  # read PSK from file
+# psk = "supersecret"                # inline in config
+# psk_env = "CLIPMESH_PSK"           # from environment variable
 
 max_payload_size = "8MiB"            # per-message cap, default 8 MiB
 debounce_ms = 100                    # clipboard quiet period before send
