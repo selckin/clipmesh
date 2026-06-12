@@ -15,12 +15,17 @@ async fn main() -> Result<()> {
     };
     let cfg = Arc::new(Config::load(&config_path)?);
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log_level));
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => tracing_subscriber::EnvFilter::try_new(&cfg.log_level)
+            .with_context(|| format!("invalid log_level {:?} in config", cfg.log_level))?,
+    };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let clipboard = Arc::new(WaylandClipboard::new(cfg.sync_primary, cfg.max_payload_size));
     let handle = node::spawn_node(cfg, clipboard).await?;
-    handle.engine_task.await.context("sync engine exited")?;
-    Ok(())
+    handle.engine_task.await.context("sync engine panicked")?;
+    // The engine never stops in normal operation; exit non-zero so
+    // systemd's Restart=on-failure brings the daemon back.
+    bail!("sync engine exited unexpectedly");
 }

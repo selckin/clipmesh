@@ -45,6 +45,7 @@ Then, first time only:
 Distribute the same psk file to every host, then:
 
     cp clipmesh.service ~/.config/systemd/user/
+    systemctl --user daemon-reload
     systemctl --user enable --now clipmesh
 
 </details>

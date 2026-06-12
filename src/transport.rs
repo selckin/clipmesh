@@ -91,8 +91,9 @@ async fn read_record<R: AsyncRead + Unpin>(io: &mut R) -> Result<Vec<u8>> {
 impl<W: AsyncWrite + Unpin> SendHalf<W> {
     /// Send one logical message of any size (chunked into Noise records).
     pub async fn send(&mut self, plaintext: &[u8]) -> Result<()> {
+        let len = u32::try_from(plaintext.len()).context("message too large for framing")?;
         let mut framed = Vec::with_capacity(4 + plaintext.len());
-        framed.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&len.to_be_bytes());
         framed.extend_from_slice(plaintext);
         let mut out = vec![0u8; NOISE_MAX];
         for chunk in framed.chunks(CHUNK) {

@@ -83,7 +83,7 @@ pub fn parse_size(s: &str) -> Result<usize> {
         (s, 1)
     };
     let value: usize = num.trim().parse().with_context(|| format!("invalid size: {s:?}"))?;
-    Ok(value * mult)
+    value.checked_mul(mult).with_context(|| format!("size overflows: {s:?}"))
 }
 
 impl Config {
@@ -232,5 +232,6 @@ mime_deny = ["image/bmp"]
         assert_eq!(parse_size("64B").unwrap(), 64);
         assert_eq!(parse_size("1048576").unwrap(), 1048576);
         assert!(parse_size("eight").is_err());
+        assert!(parse_size("9999999999999999999MiB").is_err()); // overflow
     }
 }

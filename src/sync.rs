@@ -65,18 +65,25 @@ impl<C: Clipboard> SyncEngine<C> {
         })
     }
 
-    /// Main loop. Runs until both the watcher and inbound channels close.
+    /// Main loop. Runs until either the watcher or the inbound channel
+    /// closes (at which point half the engine would be dead, so it stops).
     pub async fn run(self: Arc<Self>, mut inbound: mpsc::Receiver<(Uuid, Message)>) {
         let mut watch = self.clipboard.watch();
         loop {
             tokio::select! {
                 kind = watch.recv() => match kind {
                     Some(kind) => self.on_local_change(kind, &mut watch).await,
-                    None => break,
+                    None => {
+                        warn!("clipboard watcher channel closed; stopping sync engine");
+                        break;
+                    }
                 },
                 msg = inbound.recv() => match msg {
                     Some((from, msg)) => self.on_inbound(from, msg).await,
-                    None => break,
+                    None => {
+                        warn!("inbound channel closed; stopping sync engine");
+                        break;
+                    }
                 },
             }
         }
@@ -306,7 +313,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_write_does_not_poison_dedup() {
-        let mut h = start(Config::for_test("s")).await;
+        let h = start(Config::for_test("s")).await;
         let o = offer("retry me");
         // first delivery fails at the clipboard layer
         h.clip.set_fail_writes(true);
@@ -439,6 +446,35 @@ mod tests {
         h.clip.local_copy(SelectionKind::Clipboard, offer("c"));
         let (_, _, got) = recv_clip(&mut h).await;
         assert_eq!(got, offer("c"));
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_primary_applies_to_primary_only() {
+        let mut cfg = Config::for_test("s");
+        cfg.sync_primary = true;
+        let h = start(cfg).await;
+        let o = offer("sel");
+        send_inbound(&h, SelectionKind::Primary, o.clone()).await;
+        wait_applied(&h, SelectionKind::Primary, &o).await;
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn payload_exactly_at_cap_is_broadcast() {
+        // offer_size counts mime key bytes + data bytes
+        let o = offer("12345678"); // "text/plain" (10) + 8 = 18
+        let mut cfg = Config::for_test("s");
+        cfg.max_payload_size = 18;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, o.clone());
+        let (_, _, got) = recv_clip(&mut h).await;
+        assert_eq!(got, o);
+
+        let mut cfg = Config::for_test("s");
+        cfg.max_payload_size = 17; // one byte under
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, o);
         assert_no_broadcast(&mut h).await;
     }
 
