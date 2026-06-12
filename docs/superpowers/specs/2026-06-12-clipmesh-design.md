@@ -44,7 +44,7 @@ One binary, tokio async runtime, modules with narrow interfaces:
 | `clipboard` | `Clipboard` trait + Wayland impl (`wl-clipboard-rs`, data-control) + mock impl for tests. |
 | `transport` | Noise `NNpsk0` handshake + length-prefixed AEAD frames over TCP. |
 | `peer`      | Lifecycle of one connection: dial/accept, backoff, send/recv messages. |
-| `mesh`      | Set of live peers; broadcast; dual-connection avoidance. |
+| `mesh`      | Peer table keyed by node ID; broadcast; send-connection designation and failover. |
 | `sync`      | Glue: watcher → broadcast; inbound → apply; echo suppression; debounce; direction control; sensitive-content filtering. |
 
 ### `clipboard` interface
@@ -81,13 +81,30 @@ compositor.
 ### Mesh topology
 
 - Symmetric config: every node lists every other node as a peer and also
-  listens.
-- **Dual-connection avoidance:** each node only *dials* peers whose
-  identity (host:port string) sorts greater than its own listen identity,
-  and *accepts* connections from the rest — exactly one connection per
-  pair.
-- Outbound connections retry with exponential backoff (with cap and
-  jitter). One peer being down never affects the others.
+  listens. Both sides of a pair dial each other, so a pair may have up to
+  two live connections.
+- **Node identity:** each node generates a random node ID (UUID) at
+  startup. The first message on every connection (inside the encrypted
+  channel, after the Noise handshake) announces this ID. Identity is
+  therefore established in-band — peer naming in config need not be
+  consistent across hosts, and a node never needs to know its own
+  advertised address. A connection announcing the node's own ID is a
+  self-connection: closed with a warning.
+- **Duplicate-send avoidance:** connections are grouped by remote node
+  ID. Per remote ID the node designates exactly one connection for
+  sending; all connections receive. Each message is sent exactly once,
+  on exactly one connection, so duplicate connections are harmless and
+  the two sides need not agree on which connection each sends on. A
+  redundant connection is kept open as a warm standby: if the designated
+  send connection dies, the survivor is promoted.
+- Reconnect logic is address-based: dial every configured peer to which
+  no live *dialed* connection exists, with exponential backoff (cap and
+  jitter). The peer table is keyed by node ID. One peer being down never
+  affects the others.
+- Ordering across a send-connection failover is not guaranteed (TCP
+  orders per connection only). Accepted: clipboard updates are
+  human-paced and apply is last-write-wins; a stale update landing after
+  a failover is harmless.
 
 ### Data flow
 
@@ -159,7 +176,9 @@ Option semantics:
 
 - Unit tests: frame round-trip (encode/encrypt/decrypt/decode), echo
   suppression and dedup logic, debounce behavior, config parsing and
-  validation, sensitive-content filtering, direction-control gating.
+  validation, sensitive-content filtering, direction-control gating,
+  send-connection designation/failover (duplicate connections, self-
+  connection rejection).
 - Integration test: two in-process nodes over loopback TCP with mock
   clipboards; a copy on node A appears on node B (and vice versa), echo
   suppression verified by asserting no rebroadcast.
