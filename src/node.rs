@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::mesh::Mesh;
 use crate::peer;
 use crate::sync::SyncEngine;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Result};
 use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,9 +31,7 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
     let (connect_tx, connect_rx) = mpsc::channel(64);
     let mesh = Mesh::new(node_id, inbound_tx, connect_tx);
 
-    let listener = TcpListener::bind(&cfg.listen)
-        .await
-        .with_context(|| format!("binding {}", cfg.listen))?;
+    let listener = bind_listener(&cfg.listen).await?;
     let local_addr = listener.local_addr()?;
     info!(%node_id, %local_addr, "clipmesh node started");
 
@@ -101,6 +99,27 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
     })
 }
 
+/// Bind the listen socket. tokio already sets SO_REUSEADDR (so restarting
+/// over a previous instance's TIME_WAIT connections is fine), but a second
+/// live bind to the same port still fails with EADDRINUSE — which almost
+/// always means another clipmesh is already running. Turn that into an
+/// actionable message rather than the bare OS error.
+async fn bind_listener(listen: &str) -> Result<TcpListener> {
+    match TcpListener::bind(listen).await {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let port = listen.rsplit(':').next().unwrap_or(listen);
+            Err(anyhow!(
+                "cannot bind {listen}: address already in use. Another process \
+                 is bound to this port — most likely another clipmesh instance. \
+                 Check: `ss -tlnp 'sport = :{port}'`, `systemctl --user status \
+                 clipmesh`, `pgrep -af clipmesh`."
+            ))
+        }
+        Err(e) => Err(anyhow::Error::new(e).context(format!("binding {listen}"))),
+    }
+}
+
 /// Keep one outbound connection attempt going to a peer, forever.
 /// Exponential backoff with jitter; reset after a connection that lived
 /// long enough to be considered healthy.
@@ -151,5 +170,32 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
         let jitter_ms = rand::thread_rng().gen_range(0..=backoff.as_millis() as u64 / 2);
         sleep(backoff + Duration::from_millis(jitter_ms)).await;
         backoff = (backoff * 2).min(CAP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_conflict_reports_already_in_use_with_a_hint() {
+        // hold the port, then binding it again must fail with the actionable
+        // message (this is exactly the user-reported EADDRINUSE situation)
+        let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+
+        let err = bind_listener(&addr.to_string()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already in use"), "got: {msg}");
+        assert!(msg.contains("another clipmesh"), "got: {msg}");
+        assert!(
+            msg.contains(&addr.port().to_string()),
+            "hint should name the port: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_listener_succeeds_on_a_free_port() {
+        assert!(bind_listener("127.0.0.1:0").await.is_ok());
     }
 }
