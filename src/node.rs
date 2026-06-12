@@ -83,9 +83,11 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
     const CAP: Duration = Duration::from_secs(60);
     const HEALTHY: Duration = Duration::from_secs(30);
     let mut backoff = INITIAL;
+    let mut dial_failures: u32 = 0;
     loop {
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
+                dial_failures = 0;
                 let _ = stream.set_nodelay(true);
                 info!(%addr, "connected");
                 let started = Instant::now();
@@ -97,7 +99,16 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                     backoff = INITIAL;
                 }
             }
-            Err(e) => debug!(%addr, "dial failed: {e}"),
+            Err(e) => {
+                // first failure of a streak at warn so a dead peer is
+                // visible at the default log level; repeats at debug
+                if dial_failures == 0 {
+                    warn!(%addr, "dial failed: {e} (retrying with backoff)");
+                } else {
+                    debug!(%addr, "dial failed: {e}");
+                }
+                dial_failures += 1;
+            }
         }
         let jitter_ms = rand::thread_rng().gen_range(0..=backoff.as_millis() as u64 / 2);
         sleep(backoff + Duration::from_millis(jitter_ms)).await;

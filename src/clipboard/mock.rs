@@ -13,6 +13,7 @@ pub struct MockClipboard {
     state: Mutex<HashMap<SelectionKind, Offer>>,
     watchers: Mutex<Vec<mpsc::UnboundedSender<SelectionKind>>>,
     writes: AtomicUsize,
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 impl MockClipboard {
@@ -22,7 +23,14 @@ impl MockClipboard {
             state: Mutex::new(HashMap::new()),
             watchers: Mutex::new(Vec::new()),
             writes: AtomicUsize::new(0),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Make subsequent write_offer calls fail (simulates transient
+    /// compositor errors).
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes.store(fail, Ordering::SeqCst);
     }
 
     /// Simulate a user copying something locally.
@@ -62,6 +70,9 @@ impl Clipboard for MockClipboard {
     }
 
     async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()> {
+        if self.fail_writes.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated clipboard write failure");
+        }
         self.writes.fetch_add(1, Ordering::SeqCst);
         self.state.lock().unwrap().insert(kind, offer);
         self.notify(kind);

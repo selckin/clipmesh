@@ -2,6 +2,7 @@
 # Build and install clipmesh on this host. Idempotent: safe to re-run
 # after every update; existing config and psk are never overwritten.
 set -euo pipefail
+umask 077  # secret material is created below; never expose it via umask
 
 cd "$(dirname "$0")"
 
@@ -12,7 +13,11 @@ PSK="$CONFIG_DIR/psk"
 
 echo "==> Building and installing binary"
 cargo install --path . --quiet
-echo "    installed $(command -v clipmesh)"
+if BIN=$(command -v clipmesh); then
+    echo "    installed $BIN"
+else
+    echo "    warning: clipmesh not on PATH (is ~/.cargo/bin in PATH?); the systemd unit uses the absolute path and will still work"
+fi
 
 echo "==> Installing systemd user unit"
 mkdir -p "$UNIT_DIR"
@@ -20,6 +25,7 @@ cp clipmesh.service "$UNIT_DIR/"
 systemctl --user daemon-reload
 
 mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 
 fresh_config=0
 if [[ ! -f "$CONFIG" ]]; then

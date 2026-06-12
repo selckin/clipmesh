@@ -176,10 +176,14 @@ impl<C: Clipboard> SyncEngine<C> {
         if self.last_applied.lock().unwrap().get(&kind) == Some(&hash) {
             return; // already applied (e.g. two peers relayed the same copy)
         }
-        self.last_applied.lock().unwrap().insert(kind, hash);
         debug!(?kind, peer = %from, "applying remote clipboard update");
-        if let Err(e) = self.clipboard.write_offer(kind, offer).await {
-            warn!("failed to write clipboard: {e:#}");
+        // Record as applied only on success, so a transient write failure
+        // doesn't permanently block this content from being re-applied.
+        match self.clipboard.write_offer(kind, offer).await {
+            Ok(()) => {
+                self.last_applied.lock().unwrap().insert(kind, hash);
+            }
+            Err(e) => warn!("failed to write clipboard: {e:#}"),
         }
     }
 }
@@ -298,6 +302,21 @@ mod tests {
         assert_eq!(h.clip.write_count(), 1);
         // applying re-fired the watcher; echo suppression must hold
         assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_write_does_not_poison_dedup() {
+        let mut h = start(Config::for_test("s")).await;
+        let o = offer("retry me");
+        // first delivery fails at the clipboard layer
+        h.clip.set_fail_writes(true);
+        send_inbound(&h, SelectionKind::Clipboard, o.clone()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), None);
+        // a relay of the same content must still be applied
+        h.clip.set_fail_writes(false);
+        send_inbound(&h, SelectionKind::Clipboard, o.clone()).await;
+        wait_applied(&h, SelectionKind::Clipboard, &o).await;
     }
 
     #[tokio::test(start_paused = true)]
