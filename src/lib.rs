@@ -6,4 +6,4 @@ pub mod config;
 // pub mod peer;
 pub mod protocol;
 // pub mod sync;
-// pub mod transport;
+pub mod transport;
