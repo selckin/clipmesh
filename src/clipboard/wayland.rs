@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use wl_clipboard_rs::copy;
 use wl_clipboard_rs::paste;
 
@@ -55,11 +55,10 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     let mut offer = Offer::new();
     let mut total = 0usize;
     for mime in types {
-        // Abort the whole read on any failure: broadcasting a partial offer
-        // would silently strip representations on the peers. If the
-        // clipboard changed mid-read, the watcher fires again for the new
-        // contents anyway.
-        let (mut pipe, _actual_mime) = match paste::get_contents(
+        // A genuine read error aborts the whole offer: silently dropping one
+        // representation would ship a mutated offer to peers. If the
+        // clipboard changed mid-read, the watcher fires again anyway.
+        let (pipe, _actual_mime) = match paste::get_contents(
             ct,
             paste::Seat::Unspecified,
             paste::MimeType::Specific(&mime),
@@ -67,12 +66,20 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
             Ok(x) => x,
             Err(e) => bail!("failed to read clipboard representation {mime}: {e}"),
         };
+        // Bound the read by the remaining budget (+1 to detect overflow) so a
+        // huge or unbounded representation can't OOM the daemon before the
+        // cap is consulted. total never exceeds max, so the subtraction is safe.
+        let budget = max - total;
         let mut data = Vec::new();
-        pipe.read_to_end(&mut data)?;
-        total += mime.len() + data.len();
-        if total > max {
-            bail!("clipboard contents exceed max_payload_size ({max} bytes)");
+        pipe.take(budget as u64 + 1).read_to_end(&mut data)?;
+        if mime.len() + data.len() > budget {
+            // This representation would push the offer over the cap. Skip it
+            // but keep the rest, so a small syncable payload alongside a giant
+            // image (which can never sync) still propagates.
+            debug!(%mime, "skipping clipboard representation over size cap");
+            continue;
         }
+        total += mime.len() + data.len();
         offer.insert(mime, data);
     }
     Ok(offer)
@@ -91,6 +98,12 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
     }
     let mut opts = copy::Options::new();
     opts.clipboard(copy_type(kind));
+    // Advertise exactly the MIME types we were given. Without this,
+    // wl-clipboard-rs adds text/plain;charset=utf-8, STRING, UTF8_STRING and
+    // TEXT whenever any text type is present, so reading the selection back
+    // would not byte-match what we wrote — defeating echo suppression and
+    // causing the node to re-broadcast a mutated offer (an echo loop).
+    opts.omit_additional_text_mime_types(true);
     opts.copy_multi(sources)?;
     Ok(())
 }
