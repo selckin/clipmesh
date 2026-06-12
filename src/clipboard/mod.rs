@@ -1,5 +1,5 @@
 pub mod mock;
-// pub mod wayland; // implemented in Task 10
+pub mod wayland;
 
 use crate::protocol::{Offer, SelectionKind};
 use anyhow::Result;
