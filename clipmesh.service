@@ -1,0 +1,12 @@
+[Unit]
+Description=clipmesh - encrypted LAN clipboard sync
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/clipmesh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

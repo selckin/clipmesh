@@ -324,7 +324,7 @@ mod tests {
     async fn send_only_ignores_inbound() {
         let mut cfg = Config::for_test("s");
         cfg.direction = Direction::SendOnly;
-        let mut h = start(cfg).await;
+        let h = start(cfg).await;
         send_inbound(&h, SelectionKind::Clipboard, offer("remote")).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(h.clip.write_count(), 0);

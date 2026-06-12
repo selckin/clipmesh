@@ -1,0 +1,20 @@
+# clipmesh example configuration
+# Copy to ~/.config/clipmesh/config.toml and edit.
+
+listen = "0.0.0.0:48100"
+peers = ["host-b:48100", "host-c:48100"]
+
+# Exactly one of psk, psk_file, psk_env:
+psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
+# psk = "supersecret"                  # inline secret
+# psk_env = "CLIPMESH_PSK"             # name of an environment variable
+
+# Everything below is optional (defaults shown):
+# max_payload_size = "8MiB"   # skip clipboard contents larger than this
+# debounce_ms = 100           # quiet period before broadcasting
+# sync_primary = false        # also sync the middle-click primary selection
+# direction = "both"          # "both" | "send_only" | "receive_only"
+# exclude_sensitive = true    # skip password-manager-flagged contents
+# log_level = "info"          # overridable with RUST_LOG
+# mime_allow = ["text/*", "image/*"]
+# mime_deny = []
