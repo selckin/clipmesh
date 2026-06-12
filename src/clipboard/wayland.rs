@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use wl_clipboard_rs::copy;
 use wl_clipboard_rs::paste;
 
@@ -75,8 +75,9 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
         if mime.len() + data.len() > budget {
             // This representation would push the offer over the cap. Skip it
             // but keep the rest, so a small syncable payload alongside a giant
-            // image (which can never sync) still propagates.
-            debug!(%mime, "skipping clipboard representation over size cap");
+            // image (which can never sync) still propagates. warn, not debug,
+            // so the user can see why a large representation isn't syncing.
+            warn!(%mime, cap = max, "clipboard representation exceeds max_payload_size; skipping it");
             continue;
         }
         total += mime.len() + data.len();
@@ -99,10 +100,11 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
     let mut opts = copy::Options::new();
     opts.clipboard(copy_type(kind));
     // Advertise exactly the MIME types we were given. Without this,
-    // wl-clipboard-rs adds text/plain;charset=utf-8, STRING, UTF8_STRING and
-    // TEXT whenever any text type is present, so reading the selection back
-    // would not byte-match what we wrote — defeating echo suppression and
-    // causing the node to re-broadcast a mutated offer (an echo loop).
+    // wl-clipboard-rs adds text/plain, text/plain;charset=utf-8, STRING,
+    // UTF8_STRING and TEXT whenever any text type is present, so reading the
+    // selection back would not byte-match what we wrote — defeating echo
+    // suppression and causing the node to re-broadcast a mutated offer (an
+    // echo loop).
     opts.omit_additional_text_mime_types(true);
     opts.copy_multi(sources)?;
     Ok(())

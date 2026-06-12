@@ -11,6 +11,12 @@ use uuid::Uuid;
 
 pub const SENSITIVE_MIME: &str = "x-kde-passwordManagerHint";
 
+/// Reject inbound stamps more than this far in the future. A healthy hybrid
+/// clock stamp is always near wall-clock time; a wildly larger value (a
+/// buggy/malicious peer, or one with a broken RTC) would otherwise pin our
+/// logical clock high and stop our own copies from ever winning again.
+const MAX_FUTURE_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// Password managers mark secret clipboard contents with this hint.
 pub fn is_sensitive(offer: &Offer) -> bool {
     offer
@@ -116,10 +122,12 @@ impl<C: Clipboard> SyncEngine<C> {
             && (kind != SelectionKind::Primary || self.cfg.sync_primary)
     }
 
-    /// Issue a fresh stamp for locally originated content.
+    /// Issue a fresh stamp for locally originated content. saturating_add
+    /// keeps a poisoned clock from panicking (debug) or wrapping to 0
+    /// (release) — defense in depth behind the inbound skew check.
     fn tick(&self) -> u64 {
         let mut c = self.clock.lock().unwrap();
-        *c = (*c + 1).max(now_ms());
+        *c = c.saturating_add(1).max(now_ms());
         *c
     }
 
@@ -203,6 +211,11 @@ impl<C: Clipboard> SyncEngine<C> {
         for kind in self.synced_kinds() {
             if let Some(offer) = self.capture_offer(kind).await {
                 let hash = content_hash(&offer);
+                debug!(
+                    ?kind,
+                    size = offer_size(&offer),
+                    "primed existing clipboard state"
+                );
                 self.current.lock().unwrap().insert(
                     kind,
                     ContentState {
@@ -231,10 +244,12 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         let size = offer_size(&offer);
         if size > self.cfg.max_payload_size {
-            debug!(
+            // warn, not debug: at the default log level the user would
+            // otherwise have no clue why a large copy never syncs.
+            warn!(
                 size,
                 cap = self.cfg.max_payload_size,
-                "skipping oversized clipboard contents"
+                "clipboard contents exceed max_payload_size; not syncing"
             );
             return None;
         }
@@ -342,6 +357,12 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!(peer = %from, "hash mismatch on inbound offer; dropping");
             return;
         }
+        // Drop implausibly-future stamps before they reach the clock, so one
+        // peer with a broken clock can't poison ordering for this node.
+        if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
+            warn!(peer = %from, stamp, "rejecting update with implausibly-future stamp (peer clock skew?)");
+            return;
+        }
         self.observe(stamp);
         // Apply the receiver's own content policy: configs can differ
         // between peers, and a node must not write contents it would never
@@ -365,6 +386,9 @@ impl<C: Clipboard> SyncEngine<C> {
         debug!(?kind, peer = %from, "applying remote clipboard update");
         // Record as current only on a successful write, so a transient
         // failure doesn't permanently block this content from re-applying.
+        // The whole handler runs to completion on the single engine task
+        // (it is awaited inline in run()'s select), so `current` cannot be
+        // mutated across this await — the post-write insert is not a TOCTOU.
         match self.clipboard.write_offer(kind, offer).await {
             Ok(()) => {
                 self.current.lock().unwrap().insert(
@@ -405,6 +429,12 @@ mod tests {
     }
 
     async fn start(cfg: Config) -> Harness {
+        start_seeded(cfg, None).await
+    }
+
+    /// Start the engine, optionally with clipboard content already present
+    /// before it primes (models a daemon restart over an existing clipboard).
+    async fn start_seeded(cfg: Config, seed: Option<Offer>) -> Harness {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (connect_tx, connect_rx) = mpsc::channel(64);
         let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone(), connect_tx);
@@ -416,6 +446,9 @@ mod tests {
         let mut connect_rx = connect_rx;
         let _ = connect_rx.try_recv();
         let clip = MockClipboard::new();
+        if let Some(o) = seed {
+            clip.seed(SelectionKind::Clipboard, o);
+        }
         let engine = SyncEngine::new(clip.clone(), mesh.clone(), Arc::new(cfg));
         tokio::spawn(engine.run(in_rx, connect_rx));
         // wait until the engine has subscribed to the watcher
@@ -428,6 +461,21 @@ mod tests {
             conn_rx,
             in_tx,
             remote_id,
+        }
+    }
+
+    async fn recv_msg(h: &mut Harness) -> Message {
+        timeout(Duration::from_secs(1), h.conn_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The stamp of the next broadcast/resync message.
+    async fn recv_stamp(h: &mut Harness) -> u64 {
+        match recv_msg(h).await {
+            Message::Clip { stamp, .. } => stamp,
+            other => panic!("expected Clip, got {other:?}"),
         }
     }
 
@@ -836,6 +884,120 @@ mod tests {
         )
         .await;
         wait_applied(&h, SelectionKind::Clipboard, &offer("foo")).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejects_implausibly_future_stamp() {
+        // a peer with a broken clock must not poison ordering or crash us
+        let h = start(Config::for_test("s")).await;
+        send_inbound_full(
+            &h,
+            SelectionKind::Clipboard,
+            offer("from the future"),
+            now_ms() + 48 * 60 * 60 * 1000, // 48h ahead, past the skew bound
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(h.clip.write_count(), 0);
+        // a normal local copy afterwards must still be able to win
+        let mut h = h;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("normal"));
+        let (_, _, got) = recv_clip(&mut h).await;
+        assert_eq!(got, offer("normal"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clock_observes_remote_stamp_so_local_copies_outrank_it() {
+        let mut h = start(Config::for_test("s")).await;
+        let high = now_ms() + 60 * 60 * 1000; // 1h ahead, within the skew bound
+        send_inbound_full(&h, SelectionKind::Clipboard, offer("remote"), high).await;
+        wait_applied(&h, SelectionKind::Clipboard, &offer("remote")).await;
+        // our next local copy must carry a stamp above the observed remote one
+        h.clip.local_copy(SelectionKind::Clipboard, offer("local"));
+        assert!(recv_stamp(&mut h).await > high);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_stamps_are_strictly_monotonic() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("a"));
+        let s1 = recv_stamp(&mut h).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("b"));
+        let s2 = recv_stamp(&mut h).await;
+        assert!(s2 > s1, "{s2} must exceed {s1}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primed_content_loses_resync_to_real_remote_content() {
+        // a restarted node's restored clipboard (stamp 0) must yield to a
+        // peer's genuinely-stamped content
+        let h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
+        send_inbound_full(
+            &h,
+            SelectionKind::Clipboard,
+            offer("real"),
+            future_stamp(1000),
+        )
+        .await;
+        wait_applied(&h, SelectionKind::Clipboard, &offer("real")).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primed_content_is_not_rebroadcast_as_fresh() {
+        // the compositor's subscribe-time event for restored content (modelled
+        // by a local_copy of the same bytes) must be suppressed, not broadcast
+        let mut h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("restored"));
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primed_content_resyncs_with_stamp_zero() {
+        let h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
+        let (tx2, mut rx2) = mpsc::channel(8);
+        h.mesh.register(Uuid::new_v4(), tx2);
+        match timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::Clip {
+                offer: o, stamp, ..
+            } => {
+                assert_eq!(o, offer("restored"));
+                assert_eq!(stamp, 0, "restored content must resync at stamp 0");
+            }
+            other => panic!("expected resync Clip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_is_serviced_during_a_local_event_storm() {
+        // the debounce-as-select-arm rewrite must not let a flood of local
+        // change events starve inbound processing
+        let mut cfg = Config::for_test("s");
+        cfg.debounce_ms = 100;
+        let h = start(cfg).await;
+        for i in 0..50 {
+            h.clip
+                .local_copy(SelectionKind::Clipboard, offer(&format!("v{i}")));
+        }
+        send_inbound_full(
+            &h,
+            SelectionKind::Clipboard,
+            offer("remote"),
+            future_stamp(60_000),
+        )
+        .await;
+        // the inbound must apply well before the 100ms debounce window closes
+        timeout(Duration::from_millis(20), async {
+            while h.clip.get(SelectionKind::Clipboard) != Some(offer("remote")) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("inbound starved by local-event storm");
     }
 
     #[test]

@@ -33,6 +33,13 @@ impl MockClipboard {
         self.fail_writes.store(fail, Ordering::SeqCst);
     }
 
+    /// Seed existing clipboard content without notifying watchers, modelling
+    /// a selection that already existed before the daemon started (so tests
+    /// can exercise startup priming).
+    pub fn seed(&self, kind: SelectionKind, offer: Offer) {
+        self.state.lock().unwrap().insert(kind, offer);
+    }
+
     /// Simulate a user copying something locally.
     pub fn local_copy(&self, kind: SelectionKind, offer: Offer) {
         self.state.lock().unwrap().insert(kind, offer);
