@@ -1,0 +1,93 @@
+use clipmesh::clipboard::mock::MockClipboard;
+use clipmesh::config::Config;
+use clipmesh::node::{spawn_node, NodeHandle};
+use clipmesh::protocol::{Offer, SelectionKind};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
+
+fn offer(text: &str) -> Offer {
+    [("text/plain".to_string(), text.as_bytes().to_vec())].into_iter().collect()
+}
+
+async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+    timeout(Duration::from_secs(10), async {
+        while !cond() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
+    spawn_node(Arc::new(cfg), clip).await.expect("node failed to start")
+}
+
+#[tokio::test]
+async fn clipboard_syncs_both_ways_without_echo_storms() {
+    let clip_a = MockClipboard::new();
+    let clip_b = MockClipboard::new();
+
+    let node_a = start(Config::for_test("shared-secret"), clip_a.clone()).await;
+    let mut cfg_b = Config::for_test("shared-secret");
+    cfg_b.peers = vec![node_a.local_addr.to_string()];
+    let node_b = start(cfg_b, clip_b.clone()).await;
+
+    // mesh forms
+    let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
+    wait_for(move || ma.peer_count() == 1 && mb.peer_count() == 1, "mesh to form").await;
+
+    // A -> B
+    let o1 = offer("hello from a");
+    clip_a.local_copy(SelectionKind::Clipboard, o1.clone());
+    let cb = clip_b.clone();
+    let expected = o1.clone();
+    wait_for(move || cb.get(SelectionKind::Clipboard).as_ref() == Some(&expected), "A's copy on B").await;
+    assert_eq!(clip_b.write_count(), 1);
+    assert_eq!(clip_a.write_count(), 0, "A must not receive its own copy back");
+
+    // B -> A
+    let o2 = offer("hello from b");
+    clip_b.local_copy(SelectionKind::Clipboard, o2.clone());
+    let ca = clip_a.clone();
+    let expected = o2.clone();
+    wait_for(move || ca.get(SelectionKind::Clipboard).as_ref() == Some(&expected), "B's copy on A").await;
+    assert_eq!(clip_a.write_count(), 1);
+
+    // quiet period: no echo storm
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(clip_a.write_count(), 1);
+    assert_eq!(clip_b.write_count(), 1);
+}
+
+#[tokio::test]
+async fn node_rejects_dialing_itself() {
+    let clip = MockClipboard::new();
+    // reserve a port, then listen on it and dial it
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut cfg = Config::for_test("s");
+    cfg.listen = format!("127.0.0.1:{port}");
+    cfg.peers = vec![format!("127.0.0.1:{port}")];
+    let node = start(cfg, clip).await;
+
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(node.mesh.peer_count(), 0, "self-connection must not register a peer");
+}
+
+#[tokio::test]
+async fn wrong_psk_peers_never_form_a_mesh() {
+    let clip_a = MockClipboard::new();
+    let clip_b = MockClipboard::new();
+    let node_a = start(Config::for_test("secret-one"), clip_a).await;
+    let mut cfg_b = Config::for_test("secret-two");
+    cfg_b.peers = vec![node_a.local_addr.to_string()];
+    let node_b = start(cfg_b, clip_b).await;
+
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(node_a.mesh.peer_count(), 0);
+    assert_eq!(node_b.mesh.peer_count(), 0);
+}
