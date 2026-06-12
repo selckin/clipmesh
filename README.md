@@ -18,6 +18,23 @@ Copy on one host, paste on all of them.
 
 ## Setup
 
+On each host:
+
+    ./install.sh
+
+The script builds and installs the binary, the systemd user unit, a config
+skeleton, and generates a secret on first run (existing config/psk are never
+touched). Re-run it after every update; it restarts the service for you.
+
+Then, first time only:
+
+    $EDITOR ~/.config/clipmesh/config.toml   # set listen + peers
+    # copy ~/.config/clipmesh/psk to every other host
+    systemctl --user enable --now clipmesh
+
+<details>
+<summary>Manual setup (what the script does)</summary>
+
     cargo install --path .
     mkdir -p ~/.config/clipmesh
     cp examples/config.toml ~/.config/clipmesh/config.toml
@@ -29,6 +46,8 @@ Distribute the same psk file to every host, then:
 
     cp clipmesh.service ~/.config/systemd/user/
     systemctl --user enable --now clipmesh
+
+</details>
 
 ## Configuration
 
