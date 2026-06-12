@@ -1,6 +1,6 @@
 // Modules are added task by task:
 // pub mod clipboard;
-// pub mod config;
+pub mod config;
 // pub mod mesh;
 // pub mod node;
 // pub mod peer;
