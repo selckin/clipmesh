@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release binary
+        run: |
+          cargo build --release
+          strip target/release/clipmesh
+
+      - name: Package tarball
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          PKG="clipmesh-${TAG}-x86_64-linux"
+          mkdir "$PKG"
+          cp target/release/clipmesh clipmesh.service README.md "$PKG/"
+          cp examples/config.toml "$PKG/config.example.toml"
+          tar -czf "$PKG.tar.gz" "$PKG"
+          sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "clipmesh $TAG" \
+            --generate-notes \
+            "clipmesh-${TAG}-x86_64-linux.tar.gz" \
+            "clipmesh-${TAG}-x86_64-linux.tar.gz.sha256"
