@@ -50,14 +50,15 @@ One binary, tokio async runtime, modules with narrow interfaces:
 ### `clipboard` interface
 
 ```rust
+// Illustrative; the implemented trait returns an mpsc receiver and Results.
 trait Clipboard {
-    /// Stream of change notifications (regular clipboard and, if enabled,
-    /// primary selection), each identifying which selection changed.
-    fn watch(&self) -> impl Stream<Item = SelectionKind>;
+    /// Change notifications (regular clipboard and, if enabled, primary
+    /// selection), each identifying which selection changed.
+    fn watch(&self) -> mpsc::UnboundedReceiver<SelectionKind>;
     /// Read all offered MIME types eagerly, bounded by the size cap.
-    async fn read_offer(&self, kind: SelectionKind) -> Offer; // {mime -> bytes}
+    async fn read_offer(&self, kind: SelectionKind) -> Result<Offer>; // {mime -> bytes}
     /// Set the local selection to the given representations.
-    async fn write_offer(&self, kind: SelectionKind, offer: Offer);
+    async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()>;
 }
 ```
 
@@ -111,15 +112,18 @@ compositor.
 
 1. Local copy → `watch()` fires → debounce window (default 100 ms) →
    `read_offer()` captures all MIME representations (cap enforced) →
-   message `{content_hash, selection_kind, {mime: bytes}}` → broadcast to
-   all connected peers.
-2. Inbound message → sanity checks → `write_offer()` applies it locally →
-   `content_hash` recorded as last-applied-from-network.
+   message `{kind, content_hash, {mime: bytes}, stamp, origin}` → its
+   `{hash, stamp, origin}` is recorded as the selection's mesh-current
+   content → broadcast to all connected peers.
+2. Inbound message → sanity checks + ordering (see below) → `write_offer()`
+   applies it locally → its `{hash, stamp, origin}` becomes the selection's
+   mesh-current content.
 3. **Echo suppression:** applying a remote offer re-triggers the local
-   watcher; if the re-read content hashes to the last network-applied
-   hash (tracked separately per selection kind), it is consumed without
-   rebroadcast. Combined with no-relaying, this prevents broadcast
-   storms.
+   watcher; the re-read content hashes equal to the mesh-current record, so
+   it is consumed without rebroadcast. The single current record is updated
+   on both broadcast and apply, so a re-copy of content the mesh has since
+   moved past is *not* suppressed. Combined with no-relaying, this prevents
+   broadcast storms.
 
 `content_hash` is a hash (BLAKE3) over the sorted `(mime, bytes)` pairs.
 
@@ -177,6 +181,7 @@ debounce_ms = 100                    # clipboard quiet period before send
 sync_primary = false                 # also sync primary selection
 direction = "both"                   # "both" | "send_only" | "receive_only"
 exclude_sensitive = true             # skip x-kde-passwordManagerHint=secret
+resync_on_connect = true             # push current state to (re)connecting peers
 log_level = "info"                   # overridable via RUST_LOG
 
 # optional MIME filtering

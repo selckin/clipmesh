@@ -10,8 +10,8 @@ Copy on one host, paste on all of them.
 - Mirrors all MIME representations (text, images, ...), capped at 8 MiB.
 - Skips password-manager-flagged contents by default.
 - Resyncs on reconnect: content copied while a peer was offline is pushed
-  to it when it comes back, newest content wins (disable with
-  `resync_on_connect = false`).
+  to it when it comes back, newer content wins (ties broken deterministically
+  by node ID; disable with `resync_on_connect = false`).
 
 ## Requirements
 
