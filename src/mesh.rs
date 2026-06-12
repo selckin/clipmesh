@@ -197,7 +197,10 @@ mod tests {
 
         mesh.broadcast(&clip("a"));
         assert_eq!(rx1.try_recv().unwrap(), clip("a"));
-        assert!(rx2.try_recv().is_err(), "standby connection must not receive sends");
+        assert!(
+            rx2.try_recv().is_err(),
+            "standby connection must not receive sends"
+        );
 
         // failover: drop the designated connection, standby is promoted
         mesh.unregister(peer, c1);

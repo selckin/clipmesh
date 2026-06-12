@@ -34,7 +34,11 @@ fn filter_offer(offer: Offer, allow: Option<&[String]>, deny: &[String]) -> Offe
     offer
         .into_iter()
         .filter(|(m, _)| !deny.iter().any(|p| mime_matches(p, m)))
-        .filter(|(m, _)| allow.map(|a| a.iter().any(|p| mime_matches(p, m))).unwrap_or(true))
+        .filter(|(m, _)| {
+            allow
+                .map(|a| a.iter().any(|p| mime_matches(p, m)))
+                .unwrap_or(true)
+        })
         .collect()
 }
 
@@ -166,7 +170,11 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         let size = offer_size(&offer);
         if size > self.cfg.max_payload_size {
-            debug!(size, cap = self.cfg.max_payload_size, "skipping oversized clipboard contents");
+            debug!(
+                size,
+                cap = self.cfg.max_payload_size,
+                "skipping oversized clipboard contents"
+            );
             return None;
         }
         Some(offer)
@@ -194,8 +202,18 @@ impl<C: Clipboard> SyncEngine<C> {
         self.last_broadcast.lock().unwrap().insert(kind, hash);
         let set_at_ms = now_ms();
         self.current_ts.lock().unwrap().insert(kind, set_at_ms);
-        debug!(?kind, size = offer_size(&offer), "broadcasting clipboard update");
-        self.mesh.broadcast(&Message::Clip { kind, hash, offer, set_at_ms, resync: false });
+        debug!(
+            ?kind,
+            size = offer_size(&offer),
+            "broadcasting clipboard update"
+        );
+        self.mesh.broadcast(&Message::Clip {
+            kind,
+            hash,
+            offer,
+            set_at_ms,
+            resync: false,
+        });
     }
 
     /// A peer just (re)connected: push our current state so it converges
@@ -230,12 +248,28 @@ impl<C: Clipboard> SyncEngine<C> {
                 continue;
             };
             debug!(?kind, %peer, "resyncing clipboard state to reconnected peer");
-            self.mesh.send_to(peer, &Message::Clip { kind, hash, offer, set_at_ms, resync: true });
+            self.mesh.send_to(
+                peer,
+                &Message::Clip {
+                    kind,
+                    hash,
+                    offer,
+                    set_at_ms,
+                    resync: true,
+                },
+            );
         }
     }
 
     async fn on_inbound(&self, from: Uuid, msg: Message) {
-        let Message::Clip { kind, hash, offer, set_at_ms, resync } = msg else {
+        let Message::Clip {
+            kind,
+            hash,
+            offer,
+            set_at_ms,
+            resync,
+        } = msg
+        else {
             warn!(peer = %from, "unexpected message type after handshake");
             return;
         };
@@ -252,7 +286,13 @@ impl<C: Clipboard> SyncEngine<C> {
         // Resyncs only apply when strictly newer than the content we hold;
         // live updates always apply (clock skew must not break normal use).
         if resync {
-            let local_ts = self.current_ts.lock().unwrap().get(&kind).copied().unwrap_or(0);
+            let local_ts = self
+                .current_ts
+                .lock()
+                .unwrap()
+                .get(&kind)
+                .copied()
+                .unwrap_or(0);
             if set_at_ms <= local_ts {
                 debug!(?kind, peer = %from, "ignoring stale resync");
                 return;
@@ -284,7 +324,9 @@ mod tests {
     use tokio::time::timeout;
 
     fn offer(text: &str) -> Offer {
-        [("text/plain".to_string(), text.as_bytes().to_vec())].into_iter().collect()
+        [("text/plain".to_string(), text.as_bytes().to_vec())]
+            .into_iter()
+            .collect()
     }
 
     struct Harness {
@@ -313,19 +355,33 @@ mod tests {
         while clip.watcher_count() == 0 {
             tokio::task::yield_now().await;
         }
-        Harness { clip, mesh, conn_rx, in_tx, remote_id }
+        Harness {
+            clip,
+            mesh,
+            conn_rx,
+            in_tx,
+            remote_id,
+        }
     }
 
     async fn recv_clip(h: &mut Harness) -> (SelectionKind, [u8; 32], Offer) {
-        match timeout(Duration::from_secs(1), h.conn_rx.recv()).await.unwrap().unwrap() {
-            Message::Clip { kind, hash, offer, .. } => (kind, hash, offer),
+        match timeout(Duration::from_secs(1), h.conn_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::Clip {
+                kind, hash, offer, ..
+            } => (kind, hash, offer),
             other => panic!("expected Clip, got {other:?}"),
         }
     }
 
     async fn assert_no_broadcast(h: &mut Harness) {
         assert!(
-            timeout(Duration::from_millis(200), h.conn_rx.recv()).await.is_err(),
+            timeout(Duration::from_millis(200), h.conn_rx.recv())
+                .await
+                .is_err(),
             "unexpected broadcast"
         );
     }
@@ -483,7 +539,8 @@ mod tests {
         let mut cfg = Config::for_test("s");
         cfg.max_payload_size = 8;
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Clipboard, offer("way more than eight bytes"));
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("way more than eight bytes"));
         assert_no_broadcast(&mut h).await;
     }
 
@@ -528,7 +585,9 @@ mod tests {
         let mut cfg = Config::for_test("s");
         cfg.mime_allow = Some(vec!["text/*".to_string()]);
         let mut h = start(cfg).await;
-        let o: Offer = [("image/png".to_string(), vec![0u8; 16])].into_iter().collect();
+        let o: Offer = [("image/png".to_string(), vec![0u8; 16])]
+            .into_iter()
+            .collect();
         h.clip.local_copy(SelectionKind::Clipboard, o);
         assert_no_broadcast(&mut h).await;
     }
@@ -582,16 +641,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn resync_pushes_state_to_newly_connected_peer() {
         let mut h = start(Config::for_test("s")).await;
-        h.clip.local_copy(SelectionKind::Clipboard, offer("current"));
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("current"));
         recv_clip(&mut h).await; // consume the live broadcast
 
         // a second peer joins; engine must push current state to it only
         let (tx2, mut rx2) = mpsc::channel(8);
         let peer2 = Uuid::new_v4();
         h.mesh.register(peer2, tx2);
-        let msg = timeout(Duration::from_secs(1), rx2.recv()).await.unwrap().unwrap();
+        let msg = timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
         match msg {
-            Message::Clip { offer: o, resync, .. } => {
+            Message::Clip {
+                offer: o, resync, ..
+            } => {
                 assert_eq!(o, offer("current"));
                 assert!(resync);
             }
@@ -606,7 +671,8 @@ mod tests {
         let mut cfg = Config::for_test("s");
         cfg.resync_on_connect = false;
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Clipboard, offer("current"));
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("current"));
         recv_clip(&mut h).await;
 
         let (tx2, mut rx2) = mpsc::channel(8);

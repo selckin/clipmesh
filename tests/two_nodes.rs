@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 fn offer(text: &str) -> Offer {
-    [("text/plain".to_string(), text.as_bytes().to_vec())].into_iter().collect()
+    [("text/plain".to_string(), text.as_bytes().to_vec())]
+        .into_iter()
+        .collect()
 }
 
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
@@ -21,7 +23,9 @@ async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
 }
 
 async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
-    let node = spawn_node(Arc::new(cfg), clip.clone()).await.expect("node failed to start");
+    let node = spawn_node(Arc::new(cfg), clip.clone())
+        .await
+        .expect("node failed to start");
     // don't return before the engine is subscribed, or an immediate
     // local_copy can fire into the void
     while clip.watcher_count() == 0 {
@@ -48,23 +52,39 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
 
     // mesh forms
     let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
-    wait_for(move || ma.peer_count() == 1 && mb.peer_count() == 1, "mesh to form").await;
+    wait_for(
+        move || ma.peer_count() == 1 && mb.peer_count() == 1,
+        "mesh to form",
+    )
+    .await;
 
     // A -> B
     let o1 = offer("hello from a");
     clip_a.local_copy(SelectionKind::Clipboard, o1.clone());
     let cb = clip_b.clone();
     let expected = o1.clone();
-    wait_for(move || cb.get(SelectionKind::Clipboard).as_ref() == Some(&expected), "A's copy on B").await;
+    wait_for(
+        move || cb.get(SelectionKind::Clipboard).as_ref() == Some(&expected),
+        "A's copy on B",
+    )
+    .await;
     assert_eq!(clip_b.write_count(), 1);
-    assert_eq!(clip_a.write_count(), 0, "A must not receive its own copy back");
+    assert_eq!(
+        clip_a.write_count(),
+        0,
+        "A must not receive its own copy back"
+    );
 
     // B -> A
     let o2 = offer("hello from b");
     clip_b.local_copy(SelectionKind::Clipboard, o2.clone());
     let ca = clip_a.clone();
     let expected = o2.clone();
-    wait_for(move || ca.get(SelectionKind::Clipboard).as_ref() == Some(&expected), "B's copy on A").await;
+    wait_for(
+        move || ca.get(SelectionKind::Clipboard).as_ref() == Some(&expected),
+        "B's copy on A",
+    )
+    .await;
     assert_eq!(clip_a.write_count(), 1);
 
     // quiet period: no echo storm
@@ -120,7 +140,11 @@ async fn late_starting_peer_is_eventually_connected() {
     let node_a = start(cfg_a, clip_a).await;
 
     let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
-    wait_for(move || ma.peer_count() == 1 && mb.peer_count() == 1, "late peer to connect").await;
+    wait_for(
+        move || ma.peer_count() == 1 && mb.peer_count() == 1,
+        "late peer to connect",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -134,7 +158,11 @@ async fn node_rejects_dialing_itself() {
     let node = start(cfg, clip).await;
 
     sleep(Duration::from_millis(500)).await;
-    assert_eq!(node.mesh.peer_count(), 0, "self-connection must not register a peer");
+    assert_eq!(
+        node.mesh.peer_count(),
+        0,
+        "self-connection must not register a peer"
+    );
 }
 
 #[tokio::test]

@@ -42,7 +42,10 @@ where
     let (mut send, mut recv) = transport::handshake(io, &psk, initiator, max_message).await?;
 
     // hello exchange, inside the encrypted channel
-    send.send(&protocol::encode(&Message::Hello { node_id: mesh.own_id() })).await?;
+    send.send(&protocol::encode(&Message::Hello {
+        node_id: mesh.own_id(),
+    }))
+    .await?;
     let hello = protocol::decode(&recv.recv().await?)?;
     let Message::Hello { node_id: remote_id } = hello else {
         bail!("peer did not send hello first");
@@ -59,7 +62,9 @@ where
         let result: Result<()> = async {
             loop {
                 let raw = recv.recv().await?;
-                reader_mesh.deliver(remote_id, protocol::decode(&raw)?).await;
+                reader_mesh
+                    .deliver(remote_id, protocol::decode(&raw)?)
+                    .await;
             }
         }
         .await;

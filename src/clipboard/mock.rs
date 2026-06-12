@@ -53,7 +53,10 @@ impl MockClipboard {
     }
 
     fn notify(&self, kind: SelectionKind) {
-        self.watchers.lock().unwrap().retain(|tx| tx.send(kind).is_ok());
+        self.watchers
+            .lock()
+            .unwrap()
+            .retain(|tx| tx.send(kind).is_ok());
     }
 }
 
@@ -86,7 +89,9 @@ mod tests {
     use crate::protocol::SelectionKind;
 
     fn offer(text: &str) -> crate::protocol::Offer {
-        [("text/plain".to_string(), text.as_bytes().to_vec())].into_iter().collect()
+        [("text/plain".to_string(), text.as_bytes().to_vec())]
+            .into_iter()
+            .collect()
     }
 
     #[tokio::test]
@@ -95,7 +100,10 @@ mod tests {
         let mut watch = clip.watch();
         clip.local_copy(SelectionKind::Clipboard, offer("hello"));
         assert_eq!(watch.recv().await, Some(SelectionKind::Clipboard));
-        assert_eq!(clip.read_offer(SelectionKind::Clipboard).await.unwrap(), offer("hello"));
+        assert_eq!(
+            clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
+            offer("hello")
+        );
     }
 
     #[tokio::test]
@@ -103,7 +111,9 @@ mod tests {
         let clip = MockClipboard::new();
         let mut watch = clip.watch();
         assert_eq!(clip.write_count(), 0);
-        clip.write_offer(SelectionKind::Clipboard, offer("net")).await.unwrap();
+        clip.write_offer(SelectionKind::Clipboard, offer("net"))
+            .await
+            .unwrap();
         assert_eq!(clip.write_count(), 1);
         assert_eq!(clip.get(SelectionKind::Clipboard), Some(offer("net")));
         // real clipboards re-fire the watcher on programmatic set
@@ -114,7 +124,13 @@ mod tests {
     async fn selections_are_independent() {
         let clip = MockClipboard::new();
         clip.local_copy(SelectionKind::Primary, offer("prim"));
-        assert_eq!(clip.read_offer(SelectionKind::Clipboard).await.unwrap(), Default::default());
-        assert_eq!(clip.read_offer(SelectionKind::Primary).await.unwrap(), offer("prim"));
+        assert_eq!(
+            clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
+            Default::default()
+        );
+        assert_eq!(
+            clip.read_offer(SelectionKind::Primary).await.unwrap(),
+            offer("prim")
+        );
     }
 }

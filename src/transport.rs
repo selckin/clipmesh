@@ -64,8 +64,18 @@ where
 
     let st = Arc::new(hs.into_stateless_transport_mode()?);
     Ok((
-        SendHalf { io: wr, st: st.clone(), nonce: 0 },
-        RecvHalf { io: rd, st, nonce: 0, plain_buf: Vec::new(), max_message },
+        SendHalf {
+            io: wr,
+            st: st.clone(),
+            nonce: 0,
+        },
+        RecvHalf {
+            io: rd,
+            st,
+            nonce: 0,
+            plain_buf: Vec::new(),
+            max_message,
+        },
     ))
 }
 
@@ -142,8 +152,14 @@ mod tests {
         psk_a: [u8; 32],
         psk_b: [u8; 32],
     ) -> (
-        anyhow::Result<(SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>, RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>)>,
-        anyhow::Result<(SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>, RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>)>,
+        anyhow::Result<(
+            SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+            RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        )>,
+        anyhow::Result<(
+            SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+            RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        )>,
     ) {
         let (a, b) = tokio::io::duplex(4 * 1024 * 1024);
         tokio::join!(

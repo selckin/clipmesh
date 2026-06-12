@@ -57,8 +57,14 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
                         let cfg = cfg.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if let Err(e) =
-                                peer::run_connection(stream, false, cfg.psk, cfg.max_payload_size, mesh).await
+                            if let Err(e) = peer::run_connection(
+                                stream,
+                                false,
+                                cfg.psk,
+                                cfg.max_payload_size,
+                                mesh,
+                            )
+                            .await
                             {
                                 warn!(%addr, "inbound connection ended: {e:#}");
                             }
@@ -83,7 +89,11 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
     let engine = SyncEngine::new(clipboard, mesh.clone(), cfg);
     let engine_task = tokio::spawn(engine.run(inbound_rx, connect_rx));
 
-    Ok(NodeHandle { local_addr, mesh, engine_task })
+    Ok(NodeHandle {
+        local_addr,
+        mesh,
+        engine_task,
+    })
 }
 
 /// Keep one outbound connection attempt going to a peer, forever.
@@ -102,7 +112,15 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                 let _ = stream.set_nodelay(true);
                 info!(%addr, "connected");
                 let started = Instant::now();
-                match peer::run_connection(stream, true, cfg.psk, cfg.max_payload_size, mesh.clone()).await {
+                match peer::run_connection(
+                    stream,
+                    true,
+                    cfg.psk,
+                    cfg.max_payload_size,
+                    mesh.clone(),
+                )
+                .await
+                {
                     Ok(()) => info!(%addr, "connection closed"),
                     Err(e) => warn!(%addr, "connection ended: {e:#}"),
                 }

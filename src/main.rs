@@ -22,7 +22,10 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let clipboard = Arc::new(WaylandClipboard::new(cfg.sync_primary, cfg.max_payload_size));
+    let clipboard = Arc::new(WaylandClipboard::new(
+        cfg.sync_primary,
+        cfg.max_payload_size,
+    ));
     let handle = node::spawn_node(cfg, clipboard).await?;
     handle.engine_task.await.context("sync engine panicked")?;
     // The engine never stops in normal operation; exit non-zero so

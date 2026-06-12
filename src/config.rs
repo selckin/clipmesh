@@ -87,8 +87,13 @@ pub fn parse_size(s: &str) -> Result<usize> {
     } else {
         (s, 1)
     };
-    let value: usize = num.trim().parse().with_context(|| format!("invalid size: {s:?}"))?;
-    value.checked_mul(mult).with_context(|| format!("size overflows: {s:?}"))
+    let value: usize = num
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid size: {s:?}"))?;
+    value
+        .checked_mul(mult)
+        .with_context(|| format!("size overflows: {s:?}"))
 }
 
 impl Config {

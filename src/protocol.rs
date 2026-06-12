@@ -58,7 +58,10 @@ mod tests {
     use uuid::Uuid;
 
     fn offer(pairs: &[(&str, &[u8])]) -> Offer {
-        pairs.iter().map(|(m, d)| (m.to_string(), d.to_vec())).collect()
+        pairs
+            .iter()
+            .map(|(m, d)| (m.to_string(), d.to_vec()))
+            .collect()
     }
 
     #[test]
@@ -86,7 +89,9 @@ mod tests {
 
     #[test]
     fn messages_round_trip_through_encode_decode() {
-        let hello = Message::Hello { node_id: Uuid::new_v4() };
+        let hello = Message::Hello {
+            node_id: Uuid::new_v4(),
+        };
         assert_eq!(decode(&encode(&hello)).unwrap(), hello);
 
         let o = offer(&[("text/plain", b"payload")]);

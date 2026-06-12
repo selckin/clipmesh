@@ -22,7 +22,10 @@ pub struct WaylandClipboard {
 
 impl WaylandClipboard {
     pub fn new(sync_primary: bool, max_payload: usize) -> WaylandClipboard {
-        WaylandClipboard { sync_primary, max_payload }
+        WaylandClipboard {
+            sync_primary,
+            max_payload,
+        }
     }
 }
 
@@ -44,9 +47,9 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     let ct = paste_type(kind);
     let types = match paste::get_mime_types(ct, paste::Seat::Unspecified) {
         Ok(t) => t,
-        Err(
-            paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType,
-        ) => return Ok(Offer::new()),
+        Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => {
+            return Ok(Offer::new())
+        }
         Err(e) => return Err(e.into()),
     };
     let mut offer = Offer::new();
@@ -56,11 +59,14 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
         // would silently strip representations on the peers. If the
         // clipboard changed mid-read, the watcher fires again for the new
         // contents anyway.
-        let (mut pipe, _actual_mime) =
-            match paste::get_contents(ct, paste::Seat::Unspecified, paste::MimeType::Specific(&mime)) {
-                Ok(x) => x,
-                Err(e) => bail!("failed to read clipboard representation {mime}: {e}"),
-            };
+        let (mut pipe, _actual_mime) = match paste::get_contents(
+            ct,
+            paste::Seat::Unspecified,
+            paste::MimeType::Specific(&mime),
+        ) {
+            Ok(x) => x,
+            Err(e) => bail!("failed to read clipboard representation {mime}: {e}"),
+        };
         let mut data = Vec::new();
         pipe.read_to_end(&mut data)?;
         total += mime.len() + data.len();
