@@ -138,8 +138,8 @@ mod tests {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&offer),
             offer,
-            set_at_ms: 0,
-            resync: false,
+            stamp: 0,
+            origin: Uuid::nil(),
         }
     }
 

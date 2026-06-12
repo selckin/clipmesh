@@ -21,13 +21,14 @@ pub enum Message {
         kind: SelectionKind,
         hash: [u8; 32],
         offer: Offer,
-        /// Wall-clock ms since epoch when this content entered the mesh
-        /// (set by the originating node). Used to arbitrate resyncs only.
-        set_at_ms: u64,
-        /// True when pushed on (re)connect rather than on a live copy.
-        /// Receivers apply a resync only if set_at_ms is newer than what
-        /// they currently hold.
-        resync: bool,
+        /// Hybrid logical stamp at the originating node: the max of its
+        /// wall-clock ms and the highest stamp it has seen. Higher wins;
+        /// `origin` breaks ties. Used to order every update (live and
+        /// reconnect resync) by the same rule.
+        stamp: u64,
+        /// Node ID that created this content; deterministic tiebreaker
+        /// when two updates carry the same stamp.
+        origin: Uuid,
     },
 }
 
@@ -99,8 +100,8 @@ mod tests {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&o),
             offer: o,
-            set_at_ms: 123,
-            resync: false,
+            stamp: 123,
+            origin: Uuid::new_v4(),
         };
         assert_eq!(decode(&encode(&clip)).unwrap(), clip);
     }

@@ -121,6 +121,50 @@ async fn content_copied_while_peer_offline_resyncs_on_connect() {
 }
 
 #[tokio::test]
+async fn three_node_mesh_copy_reaches_all_without_storms() {
+    // full mesh A/B/C; a copy on A must reach B and C exactly once and not
+    // loop back to A (echo suppression must hold across 3 nodes)
+    let clip_a = MockClipboard::new();
+    let clip_b = MockClipboard::new();
+    let clip_c = MockClipboard::new();
+
+    let node_a = start(Config::for_test("trio"), clip_a.clone()).await;
+    let mut cfg_b = Config::for_test("trio");
+    cfg_b.peers = vec![node_a.local_addr.to_string()];
+    let node_b = start(cfg_b, clip_b.clone()).await;
+    let mut cfg_c = Config::for_test("trio");
+    cfg_c.peers = vec![node_a.local_addr.to_string(), node_b.local_addr.to_string()];
+    let node_c = start(cfg_c, clip_c.clone()).await;
+
+    let (ma, mb, mc) = (
+        node_a.mesh.clone(),
+        node_b.mesh.clone(),
+        node_c.mesh.clone(),
+    );
+    wait_for(
+        move || ma.peer_count() == 2 && mb.peer_count() == 2 && mc.peer_count() == 2,
+        "full 3-node mesh",
+    )
+    .await;
+
+    let o = offer("from a");
+    clip_a.local_copy(SelectionKind::Clipboard, o.clone());
+    let (cb, cc, eb, ec) = (clip_b.clone(), clip_c.clone(), o.clone(), o.clone());
+    wait_for(
+        move || {
+            cb.get(SelectionKind::Clipboard).as_ref() == Some(&eb)
+                && cc.get(SelectionKind::Clipboard).as_ref() == Some(&ec)
+        },
+        "A's copy on B and C",
+    )
+    .await;
+    sleep(Duration::from_millis(300)).await; // no storm
+    assert_eq!(clip_a.write_count(), 0, "A must not receive its own copy");
+    assert_eq!(clip_b.write_count(), 1);
+    assert_eq!(clip_c.write_count(), 1);
+}
+
+#[tokio::test]
 async fn late_starting_peer_is_eventually_connected() {
     // exercises dial_loop's retry: B dials a peer that doesn't exist yet
     let clip_a = MockClipboard::new();

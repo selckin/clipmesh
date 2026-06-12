@@ -123,19 +123,42 @@ compositor.
 
 `content_hash` is a hash (BLAKE3) over the sorted `(mime, bytes)` pairs.
 
-### Resync on reconnect
+### Ordering and resync on reconnect
+
+Every `Clip` carries `(stamp, origin)`: `stamp` is a hybrid logical clock
+(the max of the originating node's wall-clock ms and the highest stamp it
+has seen), `origin` is the originating node ID. A receiver keeps one
+`{hash, stamp, origin}` record per selection (the mesh-current content as
+it sees it) and applies an incoming update iff `(stamp, origin)` strictly
+exceeds its own — identical bytes are a no-op, the origin tiebreaker makes
+equal-stamp conflicts converge deterministically instead of swapping. The
+same rule governs live updates and reconnect resyncs; there is no separate
+regime. Because the record holds hash, stamp, and origin together, echo
+suppression ("incoming hash == current hash") and ordering can never
+disagree about which content is current.
 
 Updates broadcast while a peer is offline would otherwise be lost until
-the next copy. When a peer gains its first connection, both sides push
-their current (filtered) clipboard state as a `Clip` flagged `resync`.
-Every `Clip` carries `set_at_ms`, the wall-clock time the content entered
-the mesh at its originating node. A receiver applies a *resync* only if
-its `set_at_ms` is strictly newer than that of the content it currently
-holds — so two nodes resyncing at each other converge on the most recent
-content instead of swapping. Live (non-resync) updates always apply, so
-clock skew between hosts can never disturb normal operation; it can only
-make a resync decision slightly wrong. Disable pushing with
+the next copy. When a peer gains its first connection, each side sends its
+current state (re-read and filtered, ordered by its recorded stamp). A
+freshly started node primes its existing clipboard with `stamp = 0`, so it
+neither re-broadcasts restored content as fresh nor wins a resync against a
+peer's genuinely newer content — the first real local copy stamps a real
+clock value and propagates normally. Disable pushing with
 `resync_on_connect = false` (default `true`).
+
+Limitation: ordering relies on roughly synchronized wall clocks (keep NTP
+running). The hybrid clock bounds reordering, but a node whose clock is
+persistently far ahead will have its copies win until others catch up.
+
+### Receiver-side content policy
+
+`exclude_sensitive`, `mime_allow`/`mime_deny`, and `max_payload_size` are
+enforced on both the send and the receive path, because peers may run
+different configs. A node never writes contents it would not itself have
+sent: an inbound password-manager secret is dropped when
+`exclude_sensitive` is set, denied MIME types are stripped before writing
+(the node then keeps that filtered subset locally), and oversized inbound
+offers are not applied.
 
 ## Configuration
 
