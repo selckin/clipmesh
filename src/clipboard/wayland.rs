@@ -147,7 +147,22 @@ fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, kind: SelectionKind) 
             if kind == SelectionKind::Primary {
                 cmd.arg("--primary");
             }
-            cmd.args(["--watch", "echo", "clipmesh-change"]);
+            // `wl-paste --watch` pipes the *full clipboard contents* to the
+            // command's stdin on every change. The command MUST drain that
+            // stdin: if it exits without reading (as a bare `echo` does), the
+            // write hits a closed pipe and — for payloads above the ~64 KiB
+            // pipe buffer — that broken pipe propagates back to whoever owns
+            // the selection, including our own wl-clipboard-rs serve thread,
+            // which then errors and *destroys the selection*, wiping the
+            // clipboard. That is precisely why images (>64 KiB) vanished while
+            // small text survived. `cat >/dev/null` consumes the contents
+            // first; the marker we read for change detection follows on stdout.
+            cmd.args([
+                "--watch",
+                "sh",
+                "-c",
+                "cat >/dev/null 2>&1; echo clipmesh-change",
+            ]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             match cmd.spawn() {
                 Ok(mut child) => {
