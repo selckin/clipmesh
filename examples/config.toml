@@ -24,6 +24,7 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # direction = "both"          # "both" | "send_only" | "receive_only"
 # exclude_sensitive = true    # skip password-manager-flagged contents
 # resync_on_connect = true    # push current clipboard to peers when they (re)connect
+# share_mime_rules = true    # share the MIME-rules file across the mesh (below)
 # log_level = "info"          # overridable with RUST_LOG
 
 # Which MIME types sync is controlled per-type by a separate rules file (see
@@ -42,3 +43,10 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # when it changes — edit it to choose what syncs. An optional per-type max-size
 # caps that type on top of max_payload_size.
 # mime_rules_file = "~/.config/clipmesh/mimetypes"
+
+# When share_mime_rules is on (default), clipmesh keeps the MIME-rules file in
+# sync across the mesh: edit it on one host and the others converge to it. It is
+# whole-file last-writer-wins — the most recently edited file wins outright and
+# replaces the others (it does not merge per-type), and clipmesh stamps the file
+# with a managed "# clipmesh-version:" header line to order edits. Turn it off to
+# keep each host's rules independent.

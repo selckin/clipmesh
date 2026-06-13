@@ -12,7 +12,8 @@ Copy on one host, paste on all of them.
   secret can neither read nor inject clipboard contents.
 - Mirrors clipboard MIME representations (text, images, ...), capped at 32 MiB
   total. Which types sync is controlled per-type by a rules file, deny-by-default
-  (see Configuration).
+  (see Configuration). By default the rules file is shared across the mesh (whole-file
+  last-writer-wins); disable with `share_mime_rules = false`.
 - Skips password-manager-flagged contents by default.
 - Resyncs on reconnect: content copied while a peer was offline is pushed
   to it when it comes back, newer content wins (ties broken deterministically
@@ -99,3 +100,14 @@ clipmesh manages the file for you:
 - The file is watched and reloaded as soon as it changes, so edits take effect
   right away — no restart needed. A line that can't be parsed is kept but
   commented out rather than dropped.
+- With `share_mime_rules` (on by default), the rules file is kept in sync
+  across the mesh: edit it on one host and the others converge to it. It is
+  whole-file last-writer-wins — the most recently edited file wins outright and
+  replaces the others rather than merging per-type, so a type one host had
+  curated but another never saw is dropped when the older file loses (it
+  reappears, deny-by-default, the next time that type is copied). clipmesh
+  stamps the file with a managed `# clipmesh-version:` header line to order
+  edits; every sharing host grows that line on first connect. A peer that flips
+  a type to `allow` will make it sync on your host — that is the point. The
+  password-manager `exclude_sensitive` filter is never shared and stays local.
+  Set `share_mime_rules = false` to keep each host's rules independent.

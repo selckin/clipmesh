@@ -222,3 +222,49 @@ async fn wrong_psk_peers_never_form_a_mesh() {
     assert_eq!(node_a.mesh.peer_count(), 0);
     assert_eq!(node_b.mesh.peer_count(), 0);
 }
+
+#[tokio::test]
+async fn mime_rules_converge_on_connect() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_a = dir_a.path().join("mimetypes");
+    let path_b = dir_b.path().join("mimetypes");
+    let origin_a = uuid::Uuid::from_u128(0xA);
+    // A's file is stamped 1h ahead (within the skew bound), so it wins.
+    let high = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60 * 60 * 1000;
+    std::fs::write(
+        &path_a,
+        format!("# clipmesh-version: {high} {origin_a}\nimage/webp allow\n"),
+    )
+    .unwrap();
+    std::fs::write(&path_b, "image/webp deny\n").unwrap();
+
+    let clip_a = MockClipboard::new();
+    let clip_b = MockClipboard::new();
+
+    let mut cfg_a = Config::for_test("rules");
+    cfg_a.share_mime_rules = true;
+    cfg_a.mime_rules_path = Some(path_a.clone());
+    let node_a = start(cfg_a, clip_a.clone()).await;
+
+    let mut cfg_b = Config::for_test("rules");
+    cfg_b.share_mime_rules = true;
+    cfg_b.mime_rules_path = Some(path_b.clone());
+    cfg_b.peers = vec![node_a.local_addr.to_string()];
+    start(cfg_b, clip_b.clone()).await;
+
+    let pb = path_b.clone();
+    wait_for(
+        move || {
+            std::fs::read_to_string(&pb)
+                .map(|s| s.contains("image/webp allow"))
+                .unwrap_or(false)
+        },
+        "B to adopt A's newer rules file",
+    )
+    .await;
+}

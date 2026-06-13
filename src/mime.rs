@@ -10,6 +10,7 @@ use crate::config::{parse_size, MimePolicy};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 const HEADER: &str = "\
 # clipmesh MIME rules — one line per type: <mime> <allow|deny> [max-size]
@@ -20,6 +21,11 @@ const HEADER: &str = "\
 /// Prefix used to comment out a line that doesn't parse. Kept as a constant so
 /// the dedup check (`has_line_for`) can recover the original mime from it.
 const UNPARSED_PREFIX: &str = "# (unparsed) ";
+
+/// Header line clipmesh manages to stamp the file's whole-file LWW version
+/// when rule-sharing is on: `# clipmesh-version: <stamp> <origin-uuid>`. It is
+/// a comment, so it round-trips through parsing untouched.
+const VERSION_PREFIX: &str = "# clipmesh-version: ";
 
 /// One rule: whether the type may sync, and an optional per-type size cap
 /// (applied to that representation's bytes, on top of `max_payload_size`).
@@ -130,15 +136,32 @@ impl MimeRules {
         }
     }
 
-    fn write_file(&mut self) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
+    /// Render the current ruleset to its on-disk text form, so it can be sent
+    /// to peers verbatim. Identical to what `write_file` writes.
+    pub fn body(&self) -> String {
         let mut text = String::new();
         for line in &self.lines {
             text.push_str(&line.text);
             text.push('\n');
         }
+        text
+    }
+
+    /// Replace the entire ruleset with `text` (a file body received from a
+    /// peer), marking it dirty so a subsequent `persist` writes it. Does not
+    /// touch `loaded` — `persist` updates that once the bytes are on disk, so a
+    /// concurrent watcher reload can't clobber the in-memory rules mid-adopt.
+    pub fn replace_from(&mut self, text: String) {
+        let (lines, _had_bad) = parse(&text);
+        self.lines = lines;
+        self.dirty = true;
+    }
+
+    fn write_file(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let text = self.body();
         match fs::write(&path, &text) {
             Ok(()) => {
                 // Remember our own write so reload_if_changed treats it as
@@ -155,17 +178,27 @@ impl MimeRules {
     /// Reload from disk if the file's contents differ from what we last read
     /// or wrote. Comparing contents (not mtime) catches edits the filesystem's
     /// mtime granularity would hide, and recognizes our own writes so persist()
-    /// can't trigger a reload via the watcher.
-    pub fn reload_if_changed(&mut self) {
+    /// can't trigger a reload via the watcher. Returns whether a new external
+    /// file was applied.
+    pub fn reload_if_changed(&mut self) -> bool {
         let Some(path) = self.path.clone() else {
-            return;
+            return false;
         };
         match fs::read_to_string(&path) {
             // Unchanged (includes our own writes): nothing to do, stay quiet.
-            Ok(text) if self.loaded.as_deref() == Some(text.as_str()) => {}
+            Ok(text) if self.loaded.as_deref() == Some(text.as_str()) => false,
+            // An empty/whitespace read while we already hold rules is almost
+            // always a mid-save transient (a watcher event arriving before the
+            // editor finished writing). Keep the current rules rather than
+            // wiping them — same stance as the momentarily-absent case below.
+            Ok(text) if text.trim().is_empty() && !self.lines.is_empty() => {
+                debug!("MIME rules file read empty (likely a mid-save transient); keeping current rules");
+                false
+            }
             Ok(text) => {
                 debug!("MIME rules file changed on disk; reloading");
                 self.ingest(text, &path);
+                true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // The file is momentarily absent (often an editor's
@@ -173,8 +206,12 @@ impl MimeRules {
                 // rather than flipping every type to the unknown_mime policy; a
                 // later write reloads the new content.
                 debug!("MIME rules file is momentarily absent; keeping current rules");
+                false
             }
-            Err(e) => warn!("couldn't read MIME rules from {}: {e}", path.display()),
+            Err(e) => {
+                warn!("couldn't read MIME rules from {}: {e}", path.display());
+                false
+            }
         }
     }
 
@@ -217,11 +254,79 @@ impl MimeRules {
     }
 
     /// Write the rules to disk if there are unsaved changes (a no-op otherwise,
-    /// so it's cheap to call unconditionally).
-    pub fn persist(&mut self) {
+    /// so it's cheap to call unconditionally). Returns whether the on-disk file
+    /// is now in sync — `true` if it wrote successfully or there was nothing to
+    /// write, `false` if the write failed and changes are still pending.
+    pub fn persist(&mut self) -> bool {
         if self.dirty {
             self.write_file();
         }
+        !self.dirty
+    }
+
+    /// Discard in-memory changes and restore the ruleset to the last content we
+    /// read or wrote (`loaded`). Used to roll back a stamp bump or an adoption
+    /// after a failed `persist`, so the in-memory rules never silently diverge
+    /// from what's on disk (which would otherwise be lost on restart).
+    pub fn revert_to_loaded(&mut self) {
+        self.lines = match self.loaded.clone() {
+            Some(text) => parse(&text).0,
+            None => Vec::new(),
+        };
+        self.dirty = false;
+    }
+
+    /// The file's whole-file LWW version. Reads the managed header line if
+    /// present; otherwise falls back to a baseline of (file mtime in ms,
+    /// own_id) so enabling sharing converges on the most-recently-edited file.
+    /// mtime is 0 if unreadable or there is no path.
+    pub fn version(&self, own_id: Uuid) -> (u64, Uuid) {
+        for l in &self.lines {
+            if let Some(rest) = l.text.strip_prefix(VERSION_PREFIX) {
+                let mut f = rest.split_whitespace();
+                if let (Some(s), Some(o)) = (f.next(), f.next()) {
+                    if let (Ok(stamp), Ok(origin)) = (s.parse::<u64>(), o.parse::<Uuid>()) {
+                        return (stamp, origin);
+                    }
+                }
+            }
+        }
+        (self.file_mtime_ms(), own_id)
+    }
+
+    /// Whether the managed version header line is present.
+    pub fn has_version_header(&self) -> bool {
+        self.lines
+            .iter()
+            .any(|l| l.text.starts_with(VERSION_PREFIX))
+    }
+
+    /// Set (or replace) the version header at the top of the file and mark
+    /// dirty. Removes any existing header first, so there is always exactly one.
+    pub fn set_version(&mut self, stamp: u64, origin: Uuid) {
+        self.lines.retain(|l| !l.text.starts_with(VERSION_PREFIX));
+        self.lines.insert(
+            0,
+            Line {
+                text: format!("{VERSION_PREFIX}{stamp} {origin}"),
+                rule: None,
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// The rules file's mtime in epoch-ms, or 0 if there is no path or it can't
+    /// be read. Used as the version baseline before a header is materialised.
+    fn file_mtime_ms(&self) -> u64 {
+        let Some(path) = &self.path else {
+            return 0;
+        };
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     /// Whether a `size`-byte representation of `mime` may sync.
@@ -589,6 +694,129 @@ mod tests {
         let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(!rules.has_unseen([&s("image/png")]));
         assert!(rules.has_unseen([&s("text/plain")]));
+    }
+
+    #[test]
+    fn version_reads_the_header_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        let origin = Uuid::from_u128(7);
+        std::fs::write(
+            &path,
+            format!("# clipmesh-version: 1234 {origin}\nimage/png allow\n"),
+        )
+        .unwrap();
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        assert_eq!(rules.version(Uuid::nil()), (1234, origin));
+        assert!(rules.has_version_header());
+    }
+
+    #[test]
+    fn version_falls_back_to_mtime_baseline_without_a_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png allow\n").unwrap();
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let own = Uuid::from_u128(9);
+        let (stamp, origin) = rules.version(own);
+        assert!(stamp > 0, "mtime baseline should be a real epoch-ms value");
+        assert_eq!(origin, own);
+        assert!(!rules.has_version_header());
+    }
+
+    #[test]
+    fn set_version_inserts_then_replaces_a_single_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png allow\n").unwrap();
+        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let o = Uuid::from_u128(3);
+        rules.set_version(100, o);
+        rules.persist();
+        rules.set_version(200, o); // must replace, not duplicate
+        rules.persist();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.matches("clipmesh-version").count(),
+            1,
+            "exactly one header:\n{body}"
+        );
+        assert!(
+            body.starts_with(&format!("# clipmesh-version: 200 {o}")),
+            "header at top:\n{body}"
+        );
+        assert_eq!(rules.version(Uuid::nil()), (200, o));
+        assert!(rules.allows("image/png", 1), "rules survive header writes");
+    }
+
+    #[test]
+    fn body_renders_all_lines_with_trailing_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "# c\nimage/png allow\n").unwrap();
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        assert_eq!(rules.body(), "# c\nimage/png allow\n");
+    }
+
+    #[test]
+    fn replace_from_swaps_the_whole_ruleset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png deny\n").unwrap();
+        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert!(!rules.allows("image/png", 1));
+        rules.replace_from("image/png allow\ntext/plain allow\n".to_string());
+        rules.persist();
+        assert!(rules.allows("image/png", 1));
+        assert!(rules.allows("text/plain", 1));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "image/png allow\ntext/plain allow\n"
+        );
+    }
+
+    #[test]
+    fn reload_if_changed_reports_whether_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png deny\n").unwrap();
+        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert!(
+            !rules.reload_if_changed(),
+            "no change immediately after load"
+        );
+        std::fs::write(&path, "image/png allow\n").unwrap();
+        assert!(
+            rules.reload_if_changed(),
+            "external edit must report changed"
+        );
+        assert!(!rules.reload_if_changed(), "no change on re-check");
+    }
+
+    #[test]
+    fn reload_ignores_an_empty_read_and_keeps_rules() {
+        // A watcher event can catch the file empty while an editor is mid-save;
+        // that must not wipe the rules.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png allow\n").unwrap();
+        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert!(rules.allows("image/png", 1));
+
+        std::fs::write(&path, "").unwrap(); // transient empty mid-save
+        assert!(
+            !rules.reload_if_changed(),
+            "an empty read must be treated as no-change"
+        );
+        assert!(
+            rules.allows("image/png", 1),
+            "rules must survive an empty read"
+        );
+
+        // A real (non-empty) edit still applies.
+        std::fs::write(&path, "image/png deny\n").unwrap();
+        assert!(rules.reload_if_changed());
+        assert!(!rules.allows("image/png", 1));
     }
 
     #[test]

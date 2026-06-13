@@ -48,6 +48,22 @@ fn flatten(r: Result<Result<()>, JoinError>) -> Result<()> {
     }
 }
 
+/// Refuse a peer whose wire protocol version differs from ours. bincode is not
+/// self-describing, so two builds with different message formats would just
+/// fail to decode each other's messages and drop the connection with a
+/// corruption-like error; checking the version during the hello exchange turns
+/// that into an actionable message instead.
+fn check_protocol_version(remote: u32) -> Result<()> {
+    if remote != protocol::PROTOCOL_VERSION {
+        bail!(
+            "protocol version mismatch: peer speaks v{remote}, we speak v{} — \
+             upgrade all clipmesh nodes to the same version",
+            protocol::PROTOCOL_VERSION
+        );
+    }
+    Ok(())
+}
+
 /// Unregisters a peer connection from the mesh when dropped. This runs on
 /// every exit path including cancellation (the future being dropped between
 /// register and teardown), so a cancelled connection can never leak a dead
@@ -86,12 +102,20 @@ where
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, async move {
             let (mut send, mut recv) =
                 transport::handshake(io, &psk, initiator, max_message).await?;
-            send.send(&protocol::encode(&Message::Hello { node_id: own_id }))
-                .await?;
+            send.send(&protocol::encode(&Message::Hello {
+                node_id: own_id,
+                protocol_version: protocol::PROTOCOL_VERSION,
+            }))
+            .await?;
             let hello = protocol::decode(&recv.recv().await?)?;
-            let Message::Hello { node_id: remote_id } = hello else {
+            let Message::Hello {
+                node_id: remote_id,
+                protocol_version,
+            } = hello
+            else {
                 bail!("peer did not send hello first");
             };
+            check_protocol_version(protocol_version)?;
             Ok::<_, anyhow::Error>((remote_id, send, recv))
         })
         .await
@@ -154,6 +178,20 @@ mod tests {
 
     const MAX: usize = 8 * 1024 * 1024;
     const PSK: [u8; 32] = [1u8; 32];
+
+    #[test]
+    fn matching_protocol_version_is_accepted() {
+        assert!(check_protocol_version(protocol::PROTOCOL_VERSION).is_ok());
+    }
+
+    #[test]
+    fn mismatched_protocol_version_is_rejected() {
+        let err = check_protocol_version(protocol::PROTOCOL_VERSION.wrapping_add(1)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("protocol version mismatch"),
+            "got: {err:#}"
+        );
+    }
 
     async fn wait_for(mut cond: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(5), async {

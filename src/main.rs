@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
         .without_time()
         .with_target(false)
         .init();
+    tracing::info!(
+        "clipmesh protocol v{}",
+        clipmesh::protocol::PROTOCOL_VERSION
+    );
 
     let clipboard = Arc::new(WaylandClipboard::new(
         cfg.sync_primary,
@@ -45,6 +49,7 @@ async fn main() -> Result<()> {
         original_config,
         rules_path,
         handle.mime_rules.clone(),
+        handle.rules_changed_tx.clone(),
     );
     handle.engine_task.await.context("sync engine panicked")?;
     // The engine never stops in normal operation; exit non-zero so systemd

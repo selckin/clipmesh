@@ -24,6 +24,9 @@ pub struct NodeHandle {
     pub engine_task: JoinHandle<()>,
     /// Shared MIME ruleset, exposed so a file watcher can reload it on edits.
     pub mime_rules: Arc<Mutex<MimeRules>>,
+    /// Sender the file watcher uses to notify the engine that the MIME-rules
+    /// file changed on disk (so the engine bumps the version and broadcasts).
+    pub rules_changed_tx: mpsc::Sender<()>,
 }
 
 /// Start a node: listener + accept loop, a dial loop per configured peer,
@@ -96,14 +99,22 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
         cfg.mime_rules_path.clone(),
         cfg.unknown_mime,
     )));
-    let engine = SyncEngine::new(clipboard, mesh.clone(), cfg, mime_rules.clone());
-    let engine_task = tokio::spawn(engine.run(inbound_rx, connect_rx));
+    let (rules_changed_tx, rules_changed_rx) = mpsc::channel(8);
+    let engine = SyncEngine::new(
+        clipboard,
+        mesh.clone(),
+        cfg,
+        mime_rules.clone(),
+        rules_changed_tx.clone(),
+    );
+    let engine_task = tokio::spawn(engine.run(inbound_rx, connect_rx, rules_changed_rx));
 
     Ok(NodeHandle {
         local_addr,
         mesh,
         engine_task,
         mime_rules,
+        rules_changed_tx,
     })
 }
 

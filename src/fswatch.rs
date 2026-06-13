@@ -24,6 +24,7 @@ pub fn spawn(
     original_config: String,
     rules_path: Option<PathBuf>,
     rules: Arc<Mutex<MimeRules>>,
+    rules_changed_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     thread::spawn(move || {
         watch_forever(
@@ -31,6 +32,7 @@ pub fn spawn(
             &original_config,
             rules_path.as_deref(),
             &rules,
+            &rules_changed_tx,
         )
     });
 }
@@ -45,6 +47,7 @@ fn watch_forever(
     original_config: &str,
     rules_path: Option<&Path>,
     rules: &Arc<Mutex<MimeRules>>,
+    rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) {
     const RESTART_MIN: Duration = Duration::from_secs(1);
     const RESTART_MAX: Duration = Duration::from_secs(30);
@@ -56,7 +59,13 @@ fn watch_forever(
         let started = Instant::now();
         let mut on_config_change = || restart_on_config_change(config_path, original_config);
         // run() only returns on error; falling through reconnects.
-        if let Err(e) = run(config_path, rules_path, rules, &mut on_config_change) {
+        if let Err(e) = run(
+            config_path,
+            rules_path,
+            rules,
+            &mut on_config_change,
+            rules_changed_tx,
+        ) {
             warn!("file watcher error ({e:#}); reconnecting");
         }
         delay = crate::backoff::next_delay(
@@ -78,6 +87,7 @@ fn run(
     rules_path: Option<&Path>,
     rules: &Arc<Mutex<MimeRules>>,
     on_config_change: &mut dyn FnMut(),
+    rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) -> Result<()> {
     let mut inotify = Inotify::init().context("initializing inotify")?;
 
@@ -93,7 +103,12 @@ fn run(
             dirs.push(d);
         }
     }
-    let mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE;
+    // Trigger only on events that signal a COMPLETE write: CLOSE_WRITE (in-place
+    // edits) and MOVED_TO (atomic temp-file-rename saves). Deliberately NOT
+    // CREATE: it fires the instant a file is created — before the editor has
+    // written its contents — so reacting to it reads an empty/partial file. A
+    // freshly-created file still fires CLOSE_WRITE once the editor closes it.
+    let mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
     for dir in &dirs {
         inotify
             .watches()
@@ -132,10 +147,16 @@ fn run(
         // Reload rules before (possibly) restarting on a config change, so a
         // simultaneous edit to both still takes effect.
         if rules_changed {
-            rules
+            let changed = rules
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .reload_if_changed();
+            // Only ping on a *real* external change. Our own writes (adopt /
+            // version bump / materialise) return false here, so they don't
+            // trigger a spurious bump-and-rebroadcast loop.
+            if changed {
+                let _ = rules_changed_tx.try_send(());
+            }
         }
         if config_changed {
             on_config_change();
@@ -256,6 +277,90 @@ mod tests {
     }
 
     #[test]
+    fn editing_the_rules_file_pings_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        let rules_path = dir.path().join("mimetypes");
+        std::fs::write(&rules_path, "image/png deny\n").unwrap();
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(rules_path.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let rules_w = rules.clone();
+        let cfg_w = config_path.clone();
+        let rules_path_w = rules_path.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx_w);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            std::fs::write(&rules_path, "image/png allow\n").unwrap();
+            if rx.try_recv().is_ok() {
+                return; // got a ping — success
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("editing the rules file did not ping the engine");
+    }
+
+    #[test]
+    fn an_unchanged_rewrite_does_not_ping_the_engine() {
+        // Loop-prevention guard: an inotify CLOSE_WRITE whose content matches
+        // what we already loaded (e.g. the engine's own adopt/bump/materialise
+        // write) must NOT ping — otherwise our writes would re-broadcast forever.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        let rules_path = dir.path().join("mimetypes");
+        std::fs::write(&rules_path, "image/png deny\n").unwrap();
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(rules_path.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let rules_w = rules.clone();
+        let cfg_w = config_path.clone();
+        let rules_path_w = rules_path.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx_w);
+        });
+
+        // Establish the watch and confirm a real change pings (this also makes
+        // the watcher's loaded snapshot become "image/png allow\n").
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("watcher never delivered the initial change ping");
+            }
+            std::fs::write(&rules_path, "image/png allow\n").unwrap();
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Drain any further pings from the establishment phase.
+        while rx.try_recv().is_ok() {}
+
+        // Rewrite identical content: CLOSE_WRITE fires, but reload_if_changed()
+        // returns false (content == loaded), so NO ping must be sent.
+        std::fs::write(&rules_path, "image/png allow\n").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged rewrite must not ping the engine (loop-prevention)"
+        );
+    }
+
+    #[test]
     fn editing_the_rules_file_reloads_it() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -271,9 +376,10 @@ mod tests {
         let rules_w = rules.clone();
         let cfg_w = config_path.clone();
         let rules_path_w = rules_path.clone();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         thread::spawn(move || {
             let mut noop = || {};
-            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop);
+            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx);
         });
 
         // Rewrite the file each iteration rather than sleeping a fixed amount

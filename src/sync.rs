@@ -78,6 +78,10 @@ pub struct SyncEngine<C> {
     /// when it's about to record a new type, so the common capture path does no
     /// file I/O.
     mime_rules: Arc<Mutex<MimeRules>>,
+    /// Self-ping used by the capture path to ask the run loop to bump the
+    /// shared rules version and broadcast the file (so the broadcast happens on
+    /// the loop, not inside the sync filter). fswatch holds a clone too.
+    rules_changed_tx: mpsc::Sender<()>,
 }
 
 impl<C: Clipboard> SyncEngine<C> {
@@ -86,6 +90,7 @@ impl<C: Clipboard> SyncEngine<C> {
         mesh: Arc<Mesh>,
         cfg: Arc<Config>,
         mime_rules: Arc<Mutex<MimeRules>>,
+        rules_changed_tx: mpsc::Sender<()>,
     ) -> Arc<SyncEngine<C>> {
         Arc::new(SyncEngine {
             clipboard,
@@ -94,6 +99,7 @@ impl<C: Clipboard> SyncEngine<C> {
             current: Mutex::new(HashMap::new()),
             clock: Mutex::new(0),
             mime_rules,
+            rules_changed_tx,
         })
     }
 
@@ -138,8 +144,21 @@ impl<C: Clipboard> SyncEngine<C> {
         self: Arc<Self>,
         mut inbound: mpsc::Receiver<(Uuid, Message)>,
         mut connects: mpsc::Receiver<Uuid>,
+        mut rules_changed: mpsc::Receiver<()>,
     ) {
         let mut watch = self.clipboard.watch();
+
+        // Adopt the rules file's persisted version into the clock so the next
+        // local edit outranks it after a restart.
+        {
+            let own_id = self.mesh.own_id();
+            let (stamp, _) = self
+                .mime_rules
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .version(own_id);
+            self.observe(stamp);
+        }
 
         // Prime concurrently: reading the existing clipboard can block on a slow
         // selection owner, and must NOT stall inbound/connect handling (a node
@@ -222,6 +241,16 @@ impl<C: Clipboard> SyncEngine<C> {
                     Some(peer) => self.on_peer_connected(peer).await,
                     None => {
                         warn!("connect-event channel closed; shutting down the sync engine");
+                        break;
+                    }
+                },
+                res = rules_changed.recv() => match res {
+                    Some(()) => self.on_local_rules_changed(),
+                    // The engine itself holds a sender clone, so this channel
+                    // can't actually close while run() is alive; the break is a
+                    // safety net against a busy-loop if it somehow did.
+                    None => {
+                        warn!("rules-change channel closed unexpectedly; stopping the sync engine");
                         break;
                     }
                 },
@@ -333,12 +362,18 @@ impl<C: Clipboard> SyncEngine<C> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if record_unseen {
+            let mut appended = false;
             if rules.has_unseen(offer.keys()) {
                 rules.reload_if_changed();
-                rules.ensure(offer.keys());
+                appended = rules.ensure(offer.keys());
             }
             // No-op unless something is unsaved (incl. retrying a failed write).
             rules.persist();
+            // A newly-recorded type changes the file; share it (try_send only —
+            // we still hold the rules lock here, so we must not re-lock).
+            if appended && self.cfg.share_mime_rules {
+                self.note_rules_changed();
+            }
         }
         offer
             .into_iter()
@@ -413,11 +448,71 @@ impl<C: Clipboard> SyncEngine<C> {
         });
     }
 
+    /// Whether a rules-file body is small enough to put on (or accept off) the
+    /// wire. The limit is `max_payload_size`, so the body always fits the
+    /// transport frame (`max_message` = `max_payload_size` + slack) however the
+    /// user tuned it — and a peer can't make us persist a file larger than that.
+    /// Warns (naming the limit) when it doesn't fit, so an oversized file is
+    /// diagnosable on both the send and receive sides.
+    fn rules_body_ok(&self, len: usize, context: &str) -> bool {
+        let limit = self.cfg.max_payload_size;
+        if len > limit {
+            warn!(
+                "MIME-rules file{context} is {} (over the {} max_payload_size limit); skipping it",
+                human_bytes(len),
+                human_bytes(limit),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Push our whole MIME-rules file to a peer that just connected, so the
+    /// mesh converges. Independent of `direction`/`resync_on_connect` (those
+    /// gate clipboard content); gated only by `share_mime_rules` and having a
+    /// file. Materialises the version header on first send so the version is
+    /// pinned to disk and survives restarts.
+    fn resync_rules_to(&self, peer: Uuid) {
+        if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
+            return;
+        }
+        let own_id = self.mesh.own_id();
+        let (stamp, origin, body) = {
+            let mut rules = self
+                .mime_rules
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Read the version once; set_version below stores exactly this, so
+            // it is also what we send.
+            let (stamp, origin) = rules.version(own_id);
+            if !rules.has_version_header() {
+                // Pin the current (baseline) version to disk; do NOT bump.
+                rules.set_version(stamp, origin);
+                rules.persist();
+            }
+            (stamp, origin, rules.body())
+        };
+        if !self.rules_body_ok(body.len(), &format!(" for peer {peer}")) {
+            return;
+        }
+        debug!("pushing shared MIME-rules to peer {peer} (stamp {stamp})");
+        self.mesh.send_to(
+            peer,
+            &Message::Rules {
+                stamp,
+                origin,
+                body,
+            },
+        );
+    }
+
     /// A peer just (re)connected: push our current state so it converges
     /// without waiting for the next copy. The receiver orders it by
     /// `(stamp, origin)` like any other update, so two nodes resyncing at
     /// each other settle on the same content instead of swapping.
     async fn on_peer_connected(&self, peer: Uuid) {
+        // Rules sharing is independent of clipboard direction/resync settings.
+        self.resync_rules_to(peer);
         if !self.cfg.resync_on_connect || self.cfg.direction == Direction::ReceiveOnly {
             return;
         }
@@ -447,18 +542,39 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
+    /// Dispatch an inbound message from a peer to the right handler.
     async fn on_inbound(&self, from: Uuid, msg: Message) {
-        let Message::Clip {
-            kind,
-            hash,
-            offer,
-            stamp,
-            origin,
-        } = msg
-        else {
-            warn!("ignoring an unexpected message type from peer {from} (expected a clipboard update)");
-            return;
-        };
+        match msg {
+            Message::Clip {
+                kind,
+                hash,
+                offer,
+                stamp,
+                origin,
+            } => {
+                self.on_inbound_clip(from, kind, hash, offer, stamp, origin)
+                    .await
+            }
+            Message::Rules {
+                stamp,
+                origin,
+                body,
+            } => self.on_inbound_rules(from, stamp, origin, body),
+            Message::Hello { .. } => {
+                warn!("ignoring an unexpected Hello from peer {from} after handshake")
+            }
+        }
+    }
+
+    async fn on_inbound_clip(
+        &self,
+        from: Uuid,
+        kind: SelectionKind,
+        hash: [u8; 32],
+        offer: Offer,
+        stamp: u64,
+        origin: Uuid,
+    ) {
         debug!(
             "received {kind:?} update from peer {from} ({}, stamp {stamp})",
             describe_offer(&offer)
@@ -539,6 +655,98 @@ impl<C: Clipboard> SyncEngine<C> {
             Err(e) => warn!("couldn't write to the clipboard: {e:#}"),
         }
     }
+
+    /// Signal the run loop that the rules file changed locally, so it bumps the
+    /// shared version and broadcasts. Cheap and coalescing: a full queue just
+    /// means a bump is already pending.
+    fn note_rules_changed(&self) {
+        let _ = self.rules_changed_tx.try_send(());
+    }
+
+    /// A local change to the rules file (a captured new type, or a human edit
+    /// the watcher picked up) bumps the file version and broadcasts the whole
+    /// file. No-op when sharing is off or there is no rules file.
+    fn on_local_rules_changed(&self) {
+        if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
+            return;
+        }
+        let stamp = self.tick();
+        let origin = self.mesh.own_id();
+        let body = {
+            let mut rules = self
+                .mime_rules
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            rules.set_version(stamp, origin);
+            // Measure the real (post-stamp) body, then persist. If it's over the
+            // wire limit or the write fails, roll the stamp back: we must not
+            // keep or announce a version that isn't durably on disk (it would
+            // make version() outrank what peers actually have, and be lost on a
+            // restart).
+            let body = rules.body();
+            if !self.rules_body_ok(body.len(), "") || !rules.persist() {
+                rules.revert_to_loaded();
+                return;
+            }
+            body
+        };
+        debug!("broadcasting shared MIME-rules (stamp {stamp})");
+        self.mesh.broadcast(&Message::Rules {
+            stamp,
+            origin,
+            body,
+        });
+    }
+
+    /// Adopt a peer's shared MIME-rules file under whole-file last-writer-wins.
+    /// Ignored unless sharing is on and we have a rules file. Rejects
+    /// implausibly-future stamps and `observe()`s the stamp so a later local
+    /// edit outranks the adopted version (otherwise a local edit stamped below
+    /// it would revert to the version it just replaced).
+    fn on_inbound_rules(&self, from: Uuid, stamp: u64, origin: Uuid, body: String) {
+        if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
+            return;
+        }
+        // Reject an oversized body before parsing/persisting it: a peer must not
+        // be able to make us write a huge file (the send-side cap only bounds
+        // what WE send).
+        if !self.rules_body_ok(body.len(), &format!(" from peer {from}")) {
+            return;
+        }
+        if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
+            warn!("rejecting MIME-rules from peer {from}: timestamp {stamp} is implausibly far in the future (peer clock skew?)");
+            return;
+        }
+        self.observe(stamp);
+        let own_id = self.mesh.own_id();
+        let mut rules = self
+            .mime_rules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = rules.version(own_id);
+        if (stamp, origin) > current {
+            debug!(
+                "adopting shared MIME-rules from peer {from} (stamp {stamp}); replaces our (stamp {}, origin {})",
+                current.0, current.1
+            );
+            rules.replace_from(body);
+            // Stamp the adopted version explicitly so version() reflects
+            // (stamp, origin) even if the peer body lacked the header line —
+            // otherwise it would fall back to the new file's mtime and diverge.
+            rules.set_version(stamp, origin);
+            if !rules.persist() {
+                // Couldn't durably write the adoption; roll back so memory
+                // matches disk rather than silently diverging (which would be
+                // lost on restart). The peer re-pushes on the next connect.
+                rules.revert_to_loaded();
+            }
+        } else {
+            debug!(
+                "ignoring shared MIME-rules from peer {from} (stamp {stamp}); we hold a newer-or-equal version (stamp {})",
+                current.0
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -610,8 +818,9 @@ mod tests {
         let remote_id = Uuid::new_v4();
         let cfg = Arc::new(Config::for_test("s"));
         let mime_rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Allow)));
-        let engine = SyncEngine::new(clip.clone(), mesh, cfg, mime_rules);
-        tokio::spawn(engine.run(in_rx, connect_rx));
+        let (rules_tx, rules_rx) = mpsc::channel(8);
+        let engine = SyncEngine::new(clip.clone(), mesh, cfg, mime_rules, rules_tx);
+        tokio::spawn(engine.run(in_rx, connect_rx, rules_rx));
 
         // prime() is now awaiting read_offer (gated). A peer update should still
         // be applied to the local clipboard.
@@ -656,7 +865,8 @@ mod tests {
         let mesh = Mesh::new(Uuid::new_v4(), in_tx, connect_tx);
         let cfg = Arc::new(Config::for_test("s"));
         let mime_rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Allow)));
-        let engine = SyncEngine::new(clip, mesh, cfg, mime_rules);
+        let (rules_tx, _rules_rx) = mpsc::channel(8);
+        let engine = SyncEngine::new(clip, mesh, cfg, mime_rules, rules_tx);
         assert_eq!(engine.capture_offer(SelectionKind::Clipboard).await, None);
     }
 
@@ -694,8 +904,9 @@ mod tests {
             cfg.mime_rules_path.clone(),
             cfg.unknown_mime,
         )));
-        let engine = SyncEngine::new(clip.clone(), mesh.clone(), cfg, mime_rules);
-        tokio::spawn(engine.run(in_rx, connect_rx));
+        let (rules_tx, rules_rx) = mpsc::channel(8);
+        let engine = SyncEngine::new(clip.clone(), mesh.clone(), cfg, mime_rules, rules_tx);
+        tokio::spawn(engine.run(in_rx, connect_rx, rules_rx));
         // wait until the engine has subscribed to the watcher
         while clip.watcher_count() == 0 {
             tokio::task::yield_now().await;
@@ -716,24 +927,28 @@ mod tests {
             .unwrap()
     }
 
-    /// The stamp of the next broadcast/resync message.
+    /// The stamp of the next clipboard broadcast/resync message. Skips rules
+    /// pushes (present when share_mime_rules is on) so the helper stays usable
+    /// in sharing-enabled tests.
     async fn recv_stamp(h: &mut Harness) -> u64 {
-        match recv_msg(h).await {
-            Message::Clip { stamp, .. } => stamp,
-            other => panic!("expected Clip, got {other:?}"),
+        loop {
+            match recv_msg(h).await {
+                Message::Clip { stamp, .. } => return stamp,
+                Message::Rules { .. } => continue,
+                other => panic!("expected Clip, got {other:?}"),
+            }
         }
     }
 
     async fn recv_clip(h: &mut Harness) -> (SelectionKind, [u8; 32], Offer) {
-        match timeout(Duration::from_secs(1), h.conn_rx.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            Message::Clip {
-                kind, hash, offer, ..
-            } => (kind, hash, offer),
-            other => panic!("expected Clip, got {other:?}"),
+        loop {
+            match recv_msg(h).await {
+                Message::Clip {
+                    kind, hash, offer, ..
+                } => return (kind, hash, offer),
+                Message::Rules { .. } => continue,
+                other => panic!("expected Clip, got {other:?}"),
+            }
         }
     }
 
@@ -1375,6 +1590,215 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_failed_persist_does_not_broadcast_rules() {
+        // If we can't durably write the new version, we must not announce it
+        // (a peer would adopt a stamp our disk doesn't have, and we'd lose it on
+        // restart). A directory at the rules path makes every write fail.
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        cfg.unknown_mime = MimePolicy::Allow;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::create_dir(&path).unwrap();
+        cfg.mime_rules_path = Some(path.clone());
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        // The clipboard content still broadcasts...
+        assert!(matches!(recv_msg(&mut h).await, Message::Clip { .. }));
+        // ...but no Rules push, because the version couldn't be persisted.
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_oversized_rules_is_rejected() {
+        // A peer must not be able to make us persist a file larger than our
+        // max_payload_size (the send-side cap only bounds what we send).
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        cfg.max_payload_size = 8; // tiny: any real rules body is over the limit
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let path = dir.path().join("mimetypes");
+        let h = start(cfg).await;
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp: future_stamp(1000),
+                    origin: h.remote_id,
+                    body: "image/png allow\n".to_string(), // 16 bytes > 8
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "image/png deny\n",
+            "oversized inbound rules must be rejected, not written to disk"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_rules_newer_is_adopted() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let path = dir.path().join("mimetypes");
+        let mut h = start(cfg).await;
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp: future_stamp(1000),
+                    origin: h.remote_id,
+                    body: "image/png allow\n".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("image/png allow")
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("newer rules were not adopted");
+        // The adopted version is stamped into the header (so version() is
+        // authoritative, not the file's mtime).
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("clipmesh-version"),
+            "adopted file must carry the version header"
+        );
+        // Adopting a peer file must not bounce back as a broadcast.
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_rules_equal_stamp_higher_origin_wins() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        // Seed a header with a known stamp and a LOW origin, so an equal-stamp
+        // peer with a higher origin wins the deterministic tiebreak.
+        let low = Uuid::from_u128(1);
+        std::fs::write(
+            &path,
+            format!("# clipmesh-version: 5000 {low}\nimage/png deny\n"),
+        )
+        .unwrap();
+        cfg.unknown_mime = MimePolicy::Deny;
+        cfg.mime_rules_path = Some(path.clone());
+        let h = start(cfg).await;
+        let high = Uuid::from_u128(2);
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp: 5000,
+                    origin: high,
+                    body: "image/png allow\n".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("image/png allow")
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("equal-stamp higher-origin peer should win the tiebreak");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_rules_older_is_ignored() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png allow\n");
+        let path = dir.path().join("mimetypes");
+        let h = start(cfg).await;
+        // our baseline is the file's (recent) mtime, so stamp 1 must lose
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp: 1,
+                    origin: h.remote_id,
+                    body: "image/png deny\n".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "image/png allow\n",
+            "older rules must not overwrite"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_rules_ignored_when_sharing_off() {
+        let mut cfg = Config::for_test("s"); // sharing off by default
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let path = dir.path().join("mimetypes");
+        let h = start(cfg).await;
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp: future_stamp(1000),
+                    origin: h.remote_id,
+                    body: "image/png allow\n".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "image/png deny\n",
+            "sharing off must ignore inbound rules"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_future_rules_stamp_is_rejected() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let path = dir.path().join("mimetypes");
+        let h = start(cfg).await;
+        let insane = now_ms() + 48 * 60 * 60 * 1000; // past the skew bound
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp: insane,
+                    origin: h.remote_id,
+                    body: "image/png allow\n".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "image/png deny\n",
+            "implausibly-future rules must be rejected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn inbound_peer_types_are_not_written_to_the_rules_file() {
         // A peer's advertised MIME types must not grow/pollute our local rules
         // file; the inbound path applies rules but never records unseen types.
@@ -1392,6 +1816,158 @@ mod tests {
         assert_eq!(
             before, after,
             "inbound peer types were written to the rules file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capturing_a_new_type_broadcasts_the_rules_file() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        cfg.unknown_mime = MimePolicy::Allow; // captured type also syncs
+        let dir = tempfile::tempdir().unwrap();
+        cfg.mime_rules_path = Some(dir.path().join("mimetypes"));
+        let mut h = start(cfg).await;
+        // text/plain is a brand-new type
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        // we should see a Clip (content) and, separately, a Rules broadcast
+        let mut saw_rules = false;
+        for _ in 0..3 {
+            match recv_msg(&mut h).await {
+                Message::Rules { body, .. } => {
+                    assert!(body.contains("text/plain"), "body:\n{body}");
+                    assert!(body.contains("clipmesh-version"), "body:\n{body}");
+                    saw_rules = true;
+                    break;
+                }
+                Message::Clip { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(
+            saw_rules,
+            "capturing a new type should broadcast the rules file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capturing_a_new_type_does_not_broadcast_rules_when_sharing_off() {
+        let mut cfg = Config::for_test("s"); // sharing off
+        cfg.unknown_mime = MimePolicy::Allow;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        cfg.mime_rules_path = Some(path.clone());
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        assert!(matches!(recv_msg(&mut h).await, Message::Clip { .. }));
+        assert_no_broadcast(&mut h).await; // no Rules follows
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !body.contains("clipmesh-version"),
+            "sharing off must not stamp the file:\n{body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_pushes_the_rules_file_to_a_new_peer() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png allow\n").unwrap();
+        cfg.mime_rules_path = Some(path.clone());
+        let h = start(cfg).await;
+        // a new peer joins; it must receive our rules file
+        let (tx2, mut rx2) = mpsc::channel(8);
+        h.mesh.register(Uuid::new_v4(), tx2);
+        let msg = timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match msg {
+            Message::Rules { body, .. } => {
+                assert!(body.contains("image/png allow"), "body:\n{body}")
+            }
+            other => panic!("expected a Rules push, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_pushes_rules_even_when_receive_only() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        cfg.direction = Direction::ReceiveOnly;
+        cfg.resync_on_connect = false;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png allow\n").unwrap();
+        cfg.mime_rules_path = Some(path.clone());
+        let h = start(cfg).await;
+        let (tx2, mut rx2) = mpsc::channel(8);
+        h.mesh.register(Uuid::new_v4(), tx2);
+        let msg = timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(msg, Message::Rules { .. }),
+            "rules push must ignore direction/resync_on_connect"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_materialises_the_version_header() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::write(&path, "image/png allow\n").unwrap(); // no header yet
+        cfg.mime_rules_path = Some(path.clone());
+        let h = start(cfg).await;
+        let (tx2, mut rx2) = mpsc::channel(8);
+        h.mesh.register(Uuid::new_v4(), tx2);
+        let _ = timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("clipmesh-version"),
+            "header must be materialised on first push:\n{body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_change_outranks_the_persisted_version_after_restart() {
+        // The engine observes the file's header stamp at startup, so a fresh
+        // local change is stamped above it (not below, which would lose).
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        cfg.unknown_mime = MimePolicy::Allow;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        cfg.mime_rules_path = Some(path.clone());
+        let peer = Uuid::from_u128(123);
+        let high = now_ms() + 60 * 60 * 1000; // 1h ahead, within the skew bound
+        std::fs::write(
+            &path,
+            format!("# clipmesh-version: {high} {peer}\ntext/plain allow\n"),
+        )
+        .unwrap();
+        let mut h = start(cfg).await;
+        // a NEW type (image/png) is captured -> append -> version bump
+        let mut o = offer("x"); // text/plain already known
+        o.insert("image/png".to_string(), vec![0u8; 4]);
+        h.clip.local_copy(SelectionKind::Clipboard, o);
+        let mut stamp = None;
+        for _ in 0..3 {
+            if let Message::Rules { stamp: s, .. } = recv_msg(&mut h).await {
+                stamp = Some(s);
+                break;
+            }
+        }
+        assert!(
+            stamp.unwrap() > high,
+            "local change must outrank the observed header stamp {high}"
         );
     }
 }

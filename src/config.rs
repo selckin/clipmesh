@@ -41,6 +41,8 @@ struct RawConfig {
     exclude_sensitive: bool,
     #[serde(default = "default_true")]
     resync_on_connect: bool,
+    #[serde(default = "default_true")]
+    share_mime_rules: bool,
     #[serde(default = "default_log_level")]
     log_level: String,
     /// Allow or deny a MIME type that has no rule yet (default deny).
@@ -84,6 +86,9 @@ pub struct Config {
     /// Push current clipboard state to peers when they (re)connect;
     /// the receiving side applies it only if it is newer than its own.
     pub resync_on_connect: bool,
+    /// Share the per-type MIME-rules file across the mesh (whole-file
+    /// last-writer-wins). Default on. Independent of `direction`.
+    pub share_mime_rules: bool,
     pub log_level: String,
     /// Allow or deny a MIME type that is not yet listed in the rules file.
     pub unknown_mime: MimePolicy,
@@ -160,6 +165,7 @@ impl Config {
             direction: raw.direction,
             exclude_sensitive: raw.exclude_sensitive,
             resync_on_connect: raw.resync_on_connect,
+            share_mime_rules: raw.share_mime_rules,
             log_level: raw.log_level,
             unknown_mime: raw.unknown_mime,
             mime_rules_path: raw
@@ -180,6 +186,9 @@ impl Config {
             direction: Direction::Both,
             exclude_sensitive: true,
             resync_on_connect: true,
+            // Off in tests: existing tests assert verbatim file contents and
+            // must not get a version header written. Sharing tests opt in.
+            share_mime_rules: false,
             log_level: "info".into(),
             // Permissive default for tests; rule-specific tests set their own
             // policy and a rules file path.
@@ -281,6 +290,19 @@ mime_rules_file = "/tmp/clipmesh-test/mimetypes"
         std::env::set_var("CLIPMESH_TEST_PSK", "envsecret");
         let cfg = Config::from_toml("listen = \"x:1\"\npsk_env = \"CLIPMESH_TEST_PSK\"\n").unwrap();
         assert_eq!(cfg.psk, *blake3::hash(b"envsecret").as_bytes());
+    }
+
+    #[test]
+    fn share_mime_rules_defaults_on_and_parses() {
+        // default on
+        let cfg = Config::from_toml("listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        assert!(cfg.share_mime_rules);
+        // explicit off
+        let cfg =
+            Config::from_toml("listen = \"x:1\"\npsk = \"s\"\nshare_mime_rules = false\n").unwrap();
+        assert!(!cfg.share_mime_rules);
+        // tests opt out by default so existing verbatim-file tests are unaffected
+        assert!(!Config::for_test("s").share_mime_rules);
     }
 
     #[test]

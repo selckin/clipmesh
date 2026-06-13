@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// Wire protocol version. Bumped whenever the on-wire message format changes.
+/// bincode is not self-describing, so mismatched versions cannot interoperate —
+/// all nodes must run a compatible build. Logged at startup for diagnosis.
+pub const PROTOCOL_VERSION: u32 = 3;
+
 /// All MIME representations of one clipboard state. BTreeMap keeps keys
 /// sorted, which makes content_hash deterministic.
 pub type Offer = BTreeMap<String, Vec<u8>>;
@@ -14,8 +19,15 @@ pub enum SelectionKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
-    /// First message on every connection: announces the sender's node ID.
-    Hello { node_id: Uuid },
+    /// First message on every connection: announces the sender's node ID and
+    /// the wire protocol version it speaks. A peer whose version differs is
+    /// refused during the handshake — bincode is not self-describing, so
+    /// mismatched builds would otherwise just fail to decode each other's
+    /// messages and drop the connection with a corruption-like error.
+    Hello {
+        node_id: Uuid,
+        protocol_version: u32,
+    },
     /// A clipboard update.
     Clip {
         kind: SelectionKind,
@@ -29,6 +41,15 @@ pub enum Message {
         /// Node ID that created this content; deterministic tiebreaker
         /// when two updates carry the same stamp.
         origin: Uuid,
+    },
+    /// The full MIME-rules file, shared across the mesh under whole-file
+    /// last-writer-wins. `body` is the entire file text (including the
+    /// `# clipmesh-version:` header line); `(stamp, origin)` order it the same
+    /// way a clipboard update is ordered.
+    Rules {
+        stamp: u64,
+        origin: Uuid,
+        body: String,
     },
 }
 
@@ -121,6 +142,7 @@ mod tests {
     fn messages_round_trip_through_encode_decode() {
         let hello = Message::Hello {
             node_id: Uuid::new_v4(),
+            protocol_version: PROTOCOL_VERSION,
         };
         assert_eq!(decode(&encode(&hello)).unwrap(), hello);
 
@@ -165,5 +187,15 @@ mod tests {
         // otherwise round to "1024.0" of the smaller unit.
         assert_eq!(human_bytes(1024 * 1024 - 1), "1.0 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024 - 1), "1.0 GiB");
+    }
+
+    #[test]
+    fn rules_message_round_trips() {
+        let msg = Message::Rules {
+            stamp: 42,
+            origin: Uuid::new_v4(),
+            body: "# clipmesh-version: 42 x\nimage/png allow\n".to_string(),
+        };
+        assert_eq!(decode(&encode(&msg)).unwrap(), msg);
     }
 }
