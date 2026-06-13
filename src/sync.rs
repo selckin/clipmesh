@@ -764,12 +764,25 @@ mod tests {
             .collect()
     }
 
-    /// Point `cfg` at a fresh MIME rules file with the given contents and
-    /// unknown-type policy. The returned TempDir must be kept alive for the
-    /// duration of the test (dropping it deletes the file).
-    fn with_rules(cfg: &mut Config, unknown: MimePolicy, lines: &str) -> tempfile::TempDir {
+    /// A `[rules]` TOML body from (mime, rule-word) pairs.
+    fn rules_toml(rules: &[(&str, &str)]) -> String {
+        let mut body = String::from("[rules]\n");
+        for (mime, rule) in rules {
+            body.push_str(&format!("\"{mime}\" = \"{rule}\"\n"));
+        }
+        body
+    }
+
+    /// Point `cfg` at a fresh TOML MIME-rules file with the given (mime, rule)
+    /// entries and unknown-type policy. The returned TempDir must be kept alive
+    /// for the duration of the test (dropping it deletes the file).
+    fn with_rules(
+        cfg: &mut Config,
+        unknown: MimePolicy,
+        rules: &[(&str, &str)],
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mimetypes"), lines).unwrap();
+        std::fs::write(dir.path().join("mimetypes"), rules_toml(rules)).unwrap();
         cfg.unknown_mime = unknown;
         cfg.mime_rules_path = Some(dir.path().join("mimetypes"));
         dir
@@ -1127,7 +1140,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn denied_mime_types_are_stripped() {
         let mut cfg = Config::for_test("s");
-        let _dir = with_rules(&mut cfg, MimePolicy::Allow, "image/png deny\n");
+        let _dir = with_rules(&mut cfg, MimePolicy::Allow, &[("image/png", "deny")]);
         let mut h = start(cfg).await;
         let mut o = offer("text part");
         o.insert("image/png".to_string(), vec![0u8; 16]);
@@ -1151,7 +1164,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unknown_deny_syncs_only_allowed_types() {
         let mut cfg = Config::for_test("s");
-        let _dir = with_rules(&mut cfg, MimePolicy::Deny, "text/plain allow\n");
+        let _dir = with_rules(&mut cfg, MimePolicy::Deny, &[("text/plain", "allow")]);
         let mut h = start(cfg).await;
         let mut o = offer("text part"); // text/plain explicitly allowed
         o.insert("image/png".to_string(), vec![0u8; 16]); // unknown -> denied
@@ -1163,7 +1176,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn offer_with_only_denied_types_is_not_broadcast() {
         let mut cfg = Config::for_test("s");
-        let _dir = with_rules(&mut cfg, MimePolicy::Deny, ""); // deny everything unseen
+        let _dir = with_rules(&mut cfg, MimePolicy::Deny, &[]); // deny everything unseen
         let mut h = start(cfg).await;
         let o: Offer = [("image/png".to_string(), vec![0u8; 16])]
             .into_iter()
@@ -1306,7 +1319,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn inbound_denied_types_are_stripped_before_writing() {
         let mut cfg = Config::for_test("s");
-        let _dir = with_rules(&mut cfg, MimePolicy::Allow, "image/png deny\n");
+        let _dir = with_rules(&mut cfg, MimePolicy::Allow, &[("image/png", "deny")]);
         let h = start(cfg).await;
         let mut o = offer("text part");
         o.insert("image/png".to_string(), vec![0u8; 16]);
@@ -1519,7 +1532,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn per_type_max_size_drops_oversized_representations() {
         let mut cfg = Config::for_test("s");
-        let _dir = with_rules(&mut cfg, MimePolicy::Allow, "image/png allow 8B\n");
+        let _dir = {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("mimetypes"),
+                "[rules]\n\"image/png\" = { rule = \"allow\", max = \"8B\" }\n",
+            )
+            .unwrap();
+            cfg.unknown_mime = MimePolicy::Allow;
+            cfg.mime_rules_path = Some(dir.path().join("mimetypes"));
+            dir
+        };
         let mut h = start(cfg).await;
         let mut o = offer("hi"); // text/plain (unknown -> allow, no cap)
         o.insert("image/png".to_string(), vec![0u8; 16]); // 16 B over the 8 B cap
@@ -1540,7 +1563,10 @@ mod tests {
         // deny-by-default: nothing syncs, but the new type is written out
         assert_no_broadcast(&mut h).await;
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("text/plain deny"), "got:\n{written}");
+        assert!(
+            written.contains("\"text/plain\" = \"deny\""),
+            "got:\n{written}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1550,10 +1576,10 @@ mod tests {
         // by the inotify watcher, which this harness doesn't run — so with no
         // new type, the engine keeps the rules it loaded at start.
         let mut cfg = Config::for_test("s");
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "text/plain deny\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("text/plain", "deny")]);
         let path = dir.path().join("mimetypes");
         let mut h = start(cfg).await;
-        std::fs::write(&path, "text/plain allow\n").unwrap();
+        std::fs::write(&path, "[rules]\n\"text/plain\" = \"allow\"\n").unwrap();
         h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
         // No watcher + no new type -> the on-disk flip is not applied here.
         assert_no_broadcast(&mut h).await;
@@ -1565,12 +1591,12 @@ mod tests {
         // appends, so a concurrent on-disk edit is merged rather than clobbered
         // by the append (verified here without a running watcher).
         let mut cfg = Config::for_test("s");
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "text/plain deny\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("text/plain", "deny")]);
         let path = dir.path().join("mimetypes");
         let mut h = start(cfg).await;
 
         // User flips text/plain to allow on disk; no watcher fires.
-        std::fs::write(&path, "text/plain allow\n").unwrap();
+        std::fs::write(&path, "[rules]\n\"text/plain\" = \"allow\"\n").unwrap();
         // Copy with a NEW type (image/png), which triggers record + persist.
         let mut o = offer("hi"); // text/plain
         o.insert("image/png".to_string(), vec![1, 2, 3]);
@@ -1580,11 +1606,11 @@ mod tests {
         assert_eq!(got, offer("hi"));
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
-            body.contains("text/plain allow"),
+            body.contains("\"text/plain\" = \"allow\""),
             "user edit was clobbered:\n{body}"
         );
         assert!(
-            body.contains("image/png deny"),
+            body.contains("\"image/png\" = \"deny\""),
             "new type not recorded:\n{body}"
         );
     }
@@ -1616,7 +1642,7 @@ mod tests {
         let mut cfg = Config::for_test("s");
         cfg.share_mime_rules = true;
         cfg.max_payload_size = 8; // tiny: any real rules body is over the limit
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
         h.in_tx
@@ -1625,7 +1651,7 @@ mod tests {
                 Message::Rules {
                     stamp: future_stamp(1000),
                     origin: h.remote_id,
-                    body: "image/png allow\n".to_string(), // 16 bytes > 8
+                    body: rules_toml(&[("image/png", "allow")]), // well over the 8-byte cap
                 },
             ))
             .await
@@ -1633,7 +1659,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "image/png deny\n",
+            rules_toml(&[("image/png", "deny")]),
             "oversized inbound rules must be rejected, not written to disk"
         );
     }
@@ -1642,7 +1668,7 @@ mod tests {
     async fn inbound_rules_newer_is_adopted() {
         let mut cfg = Config::for_test("s");
         cfg.share_mime_rules = true;
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let mut h = start(cfg).await;
         h.in_tx
@@ -1651,7 +1677,7 @@ mod tests {
                 Message::Rules {
                     stamp: future_stamp(1000),
                     origin: h.remote_id,
-                    body: "image/png allow\n".to_string(),
+                    body: rules_toml(&[("image/png", "allow")]),
                 },
             ))
             .await
@@ -1659,7 +1685,7 @@ mod tests {
         timeout(Duration::from_secs(1), async {
             while !std::fs::read_to_string(&path)
                 .unwrap()
-                .contains("image/png allow")
+                .contains("\"image/png\" = \"allow\"")
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1671,7 +1697,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()
-                .contains("clipmesh-version"),
+                .contains("version ="),
             "adopted file must carry the version header"
         );
         // Adopting a peer file must not bounce back as a broadcast.
@@ -1689,7 +1715,7 @@ mod tests {
         let low = Uuid::from_u128(1);
         std::fs::write(
             &path,
-            format!("# clipmesh-version: 5000 {low}\nimage/png deny\n"),
+            format!("[clipmesh]\nversion = 5000\norigin = \"{low}\"\n[rules]\n\"image/png\" = \"deny\"\n"),
         )
         .unwrap();
         cfg.unknown_mime = MimePolicy::Deny;
@@ -1702,7 +1728,7 @@ mod tests {
                 Message::Rules {
                     stamp: 5000,
                     origin: high,
-                    body: "image/png allow\n".to_string(),
+                    body: rules_toml(&[("image/png", "allow")]),
                 },
             ))
             .await
@@ -1710,7 +1736,7 @@ mod tests {
         timeout(Duration::from_secs(1), async {
             while !std::fs::read_to_string(&path)
                 .unwrap()
-                .contains("image/png allow")
+                .contains("\"image/png\" = \"allow\"")
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1723,7 +1749,7 @@ mod tests {
     async fn inbound_rules_older_is_ignored() {
         let mut cfg = Config::for_test("s");
         cfg.share_mime_rules = true;
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png allow\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "allow")]);
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
         // our baseline is the file's (recent) mtime, so stamp 1 must lose
@@ -1733,7 +1759,7 @@ mod tests {
                 Message::Rules {
                     stamp: 1,
                     origin: h.remote_id,
-                    body: "image/png deny\n".to_string(),
+                    body: rules_toml(&[("image/png", "deny")]),
                 },
             ))
             .await
@@ -1741,7 +1767,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "image/png allow\n",
+            rules_toml(&[("image/png", "allow")]),
             "older rules must not overwrite"
         );
     }
@@ -1749,7 +1775,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn inbound_rules_ignored_when_sharing_off() {
         let mut cfg = Config::for_test("s"); // sharing off by default
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
         h.in_tx
@@ -1758,7 +1784,7 @@ mod tests {
                 Message::Rules {
                     stamp: future_stamp(1000),
                     origin: h.remote_id,
-                    body: "image/png allow\n".to_string(),
+                    body: rules_toml(&[("image/png", "allow")]),
                 },
             ))
             .await
@@ -1766,7 +1792,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "image/png deny\n",
+            rules_toml(&[("image/png", "deny")]),
             "sharing off must ignore inbound rules"
         );
     }
@@ -1775,7 +1801,7 @@ mod tests {
     async fn inbound_future_rules_stamp_is_rejected() {
         let mut cfg = Config::for_test("s");
         cfg.share_mime_rules = true;
-        let dir = with_rules(&mut cfg, MimePolicy::Deny, "image/png deny\n");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
         let insane = now_ms() + 48 * 60 * 60 * 1000; // past the skew bound
@@ -1785,7 +1811,7 @@ mod tests {
                 Message::Rules {
                     stamp: insane,
                     origin: h.remote_id,
-                    body: "image/png allow\n".to_string(),
+                    body: rules_toml(&[("image/png", "allow")]),
                 },
             ))
             .await
@@ -1793,7 +1819,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "image/png deny\n",
+            rules_toml(&[("image/png", "deny")]),
             "implausibly-future rules must be rejected"
         );
     }
@@ -1835,7 +1861,7 @@ mod tests {
             match recv_msg(&mut h).await {
                 Message::Rules { body, .. } => {
                     assert!(body.contains("text/plain"), "body:\n{body}");
-                    assert!(body.contains("clipmesh-version"), "body:\n{body}");
+                    assert!(body.contains("version ="), "body:\n{body}");
                     saw_rules = true;
                     break;
                 }
@@ -1862,7 +1888,7 @@ mod tests {
         assert_no_broadcast(&mut h).await; // no Rules follows
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !body.contains("clipmesh-version"),
+            !body.contains("version ="),
             "sharing off must not stamp the file:\n{body}"
         );
     }
@@ -1873,7 +1899,7 @@ mod tests {
         cfg.share_mime_rules = true;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
-        std::fs::write(&path, "image/png allow\n").unwrap();
+        std::fs::write(&path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
         cfg.mime_rules_path = Some(path.clone());
         let h = start(cfg).await;
         // a new peer joins; it must receive our rules file
@@ -1885,7 +1911,7 @@ mod tests {
             .unwrap();
         match msg {
             Message::Rules { body, .. } => {
-                assert!(body.contains("image/png allow"), "body:\n{body}")
+                assert!(body.contains("\"image/png\" = \"allow\""), "body:\n{body}")
             }
             other => panic!("expected a Rules push, got {other:?}"),
         }
@@ -1899,7 +1925,7 @@ mod tests {
         cfg.resync_on_connect = false;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
-        std::fs::write(&path, "image/png allow\n").unwrap();
+        std::fs::write(&path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
         cfg.mime_rules_path = Some(path.clone());
         let h = start(cfg).await;
         let (tx2, mut rx2) = mpsc::channel(8);
@@ -1920,7 +1946,7 @@ mod tests {
         cfg.share_mime_rules = true;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
-        std::fs::write(&path, "image/png allow\n").unwrap(); // no header yet
+        std::fs::write(&path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(); // no header yet
         cfg.mime_rules_path = Some(path.clone());
         let h = start(cfg).await;
         let (tx2, mut rx2) = mpsc::channel(8);
@@ -1931,7 +1957,7 @@ mod tests {
             .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
-            body.contains("clipmesh-version"),
+            body.contains("version ="),
             "header must be materialised on first push:\n{body}"
         );
     }
@@ -1950,7 +1976,7 @@ mod tests {
         let high = now_ms() + 60 * 60 * 1000; // 1h ahead, within the skew bound
         std::fs::write(
             &path,
-            format!("# clipmesh-version: {high} {peer}\ntext/plain allow\n"),
+            format!("[clipmesh]\nversion = {high}\norigin = \"{peer}\"\n[rules]\n\"text/plain\" = \"allow\"\n"),
         )
         .unwrap();
         let mut h = start(cfg).await;

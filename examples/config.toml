@@ -33,15 +33,17 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # everything not explicitly denied.
 # unknown_mime = "deny"
 
-# Per-type allow/deny rules file. Defaults to "mimetypes" beside this config.
-# Each line is `<mime> <allow|deny> [max-size]`, e.g.:
-#     text/plain allow
-#     image/png  allow 4MiB
-#     image/bmp  deny
-# clipmesh creates the file, appends any new type it sees (using unknown_mime)
-# at the end, leaves your existing lines/comments/order alone, and reloads it
-# when it changes — edit it to choose what syncs. An optional per-type max-size
-# caps that type on top of max_payload_size.
+# Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside this
+# config. Each entry under [rules] is, e.g.:
+#     [rules]
+#     "text/plain" = "allow"
+#     "image/png"  = { rule = "allow", max = "4MiB" }
+#     "image/bmp"  = "deny"
+# Keys are quoted TOML strings, so MIME types with spaces or punctuation are
+# fine. clipmesh creates the file, appends any new type it sees (using
+# unknown_mime), leaves your existing entries/comments/order alone, and reloads
+# it when it changes — edit it to choose what syncs. An optional per-type
+# max-size caps that type on top of max_payload_size.
 # mime_rules_file = "~/.config/clipmesh/mimetypes"
 
 # When share_mime_rules is on (default), clipmesh keeps the MIME-rules file in

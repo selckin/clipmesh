@@ -238,10 +238,10 @@ async fn mime_rules_converge_on_connect() {
         + 60 * 60 * 1000;
     std::fs::write(
         &path_a,
-        format!("# clipmesh-version: {high} {origin_a}\nimage/webp allow\n"),
+        format!("[clipmesh]\nversion = {high}\norigin = \"{origin_a}\"\n[rules]\n\"image/webp\" = \"allow\"\n"),
     )
     .unwrap();
-    std::fs::write(&path_b, "image/webp deny\n").unwrap();
+    std::fs::write(&path_b, "[rules]\n\"image/webp\" = \"deny\"\n").unwrap();
 
     let clip_a = MockClipboard::new();
     let clip_b = MockClipboard::new();
@@ -261,7 +261,7 @@ async fn mime_rules_converge_on_connect() {
     wait_for(
         move || {
             std::fs::read_to_string(&pb)
-                .map(|s| s.contains("image/webp allow"))
+                .map(|s| s.contains("\"image/webp\" = \"allow\""))
                 .unwrap_or(false)
         },
         "B to adopt A's newer rules file",

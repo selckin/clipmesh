@@ -282,7 +282,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
         let rules_path = dir.path().join("mimetypes");
-        std::fs::write(&rules_path, "image/png deny\n").unwrap();
+        std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
         let rules = Arc::new(Mutex::new(MimeRules::load(
             Some(rules_path.clone()),
             MimePolicy::Deny,
@@ -300,7 +300,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            std::fs::write(&rules_path, "image/png allow\n").unwrap();
+            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
             if rx.try_recv().is_ok() {
                 return; // got a ping — success
             }
@@ -318,7 +318,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
         let rules_path = dir.path().join("mimetypes");
-        std::fs::write(&rules_path, "image/png deny\n").unwrap();
+        std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
         let rules = Arc::new(Mutex::new(MimeRules::load(
             Some(rules_path.clone()),
             MimePolicy::Deny,
@@ -341,7 +341,7 @@ mod tests {
             if Instant::now() >= deadline {
                 panic!("watcher never delivered the initial change ping");
             }
-            std::fs::write(&rules_path, "image/png allow\n").unwrap();
+            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
             if rx.try_recv().is_ok() {
                 break;
             }
@@ -352,7 +352,7 @@ mod tests {
 
         // Rewrite identical content: CLOSE_WRITE fires, but reload_if_changed()
         // returns false (content == loaded), so NO ping must be sent.
-        std::fs::write(&rules_path, "image/png allow\n").unwrap();
+        std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
         thread::sleep(Duration::from_millis(300));
         assert!(
             rx.try_recv().is_err(),
@@ -366,7 +366,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
         let rules_path = dir.path().join("mimetypes");
-        std::fs::write(&rules_path, "image/png deny\n").unwrap();
+        std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
         let rules = Arc::new(Mutex::new(MimeRules::load(
             Some(rules_path.clone()),
             MimePolicy::Deny,
@@ -388,7 +388,7 @@ mod tests {
         // test isn't flaky under load.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            std::fs::write(&rules_path, "image/png allow\n").unwrap();
+            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
             if rules.lock().unwrap().allows("image/png", 1) {
                 return; // reloaded — success
             }

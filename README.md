@@ -79,27 +79,30 @@ foreground) and a config change just stops the daemon. Live MIME-rule reloads
 
 ### MIME type rules
 
-Which clipboard types sync is decided per-type by a rules file kept next to the
-config (default `~/.config/clipmesh/mimetypes`; see `examples/mimetypes`). Each
-line is:
+Which clipboard types sync is decided per-type by a TOML rules file kept next to
+the config (default `~/.config/clipmesh/mimetypes`; see `examples/mimetypes`).
+Each entry under `[rules]` is:
 
-    <mime> <allow|deny> [max-size]
+    "<mime>" = "allow" | "deny"           # or, with a per-type size cap:
+    "<mime>" = { rule = "allow", max = "4MiB" }
 
-e.g. `image/png allow 4MiB`. The optional max-size caps that one type, on top of
-the global `max_payload_size`.
+The MIME is a quoted TOML key, so types with spaces, `;`, `=` or other
+punctuation (e.g. Java dataflavors) work. The optional `max` caps that one type,
+on top of the global `max_payload_size`.
 
 clipmesh manages the file for you:
 
 - The `unknown_mime` config option decides what happens to a type with no rule
   yet — **`deny` by default**, so nothing syncs until you allow it. Set it to
   `allow` to sync everything you haven't explicitly denied.
-- Any new type clipmesh sees is appended automatically at the end of the file
-  with the `unknown_mime` default — so to curate what syncs, copy a few things,
-  then edit the generated file and flip types to `allow`/`deny`. Your existing
-  lines, comments, and ordering are left as-is (the file is not reordered).
+- Any new type clipmesh sees is appended automatically with the `unknown_mime`
+  default — so to curate what syncs, copy a few things, then edit the generated
+  file and flip types to `allow`/`deny`. Your existing entries, comments, and
+  ordering are left as-is, and the managed `[clipmesh]` table (the sync version)
+  is maintained automatically.
 - The file is watched and reloaded as soon as it changes, so edits take effect
-  right away — no restart needed. A line that can't be parsed is kept but
-  commented out rather than dropped.
+  right away — no restart needed. An entry with an invalid value is ignored
+  (with a warning) but kept in the file rather than dropped.
 - With `share_mime_rules` (on by default), the rules file is kept in sync
   across the mesh: edit it on one host and the others converge to it. It is
   whole-file last-writer-wins — the most recently edited file wins outright and

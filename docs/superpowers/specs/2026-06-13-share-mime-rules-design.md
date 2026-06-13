@@ -3,6 +3,13 @@
 **Date:** 2026-06-13
 **Status:** Approved design
 
+> **Update:** the rules file was subsequently switched from the line format
+> described below to **TOML** (entries `"<mime>" = "allow"|"deny"|{ rule, max }`
+> under `[rules]`; the managed version lives in a `[clipmesh]` table instead of a
+> `# clipmesh-version:` comment). This was to support MIME types containing
+> spaces/punctuation (e.g. Java dataflavors), which the whitespace-delimited
+> format couldn't parse. The whole-file LWW design below is otherwise unchanged.
+
 ## Summary
 
 Add an option (`share_mime_rules`, **default on**) that propagates the
