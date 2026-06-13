@@ -32,8 +32,9 @@ On each host:
     ./install.sh
 
 The script builds and installs the binary, the systemd user unit, a config
-skeleton, and generates a secret on first run (existing config/psk are never
-touched). Re-run it after every update; it restarts the service for you.
+skeleton, a starter MIME-rules file, and generates a secret on first run
+(existing config/rules/psk are never touched). Re-run it after every update; it
+restarts the service for you.
 
 Then, first time only:
 

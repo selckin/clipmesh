@@ -9,6 +9,7 @@ cd "$(dirname "$0")"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/clipmesh"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 CONFIG="$CONFIG_DIR/config.toml"
+MIMETYPES="$CONFIG_DIR/mimetypes"
 PSK="$CONFIG_DIR/psk"
 
 echo "==> Building and installing binary"
@@ -34,6 +35,17 @@ if [[ ! -f "$CONFIG" ]]; then
     echo "==> Created $CONFIG from example -- edit listen/peers before starting"
 else
     echo "==> Keeping existing $CONFIG"
+fi
+
+# Seed the MIME-rules file from the example so common text/image types sync out
+# of the box (clipmesh otherwise creates a header-only file and, with the
+# deny-by-default policy, syncs nothing until you curate it). Never overwrite an
+# existing file -- it's yours to edit and clipmesh appends to it.
+if [[ ! -f "$MIMETYPES" ]]; then
+    cp examples/mimetypes "$MIMETYPES"
+    echo "==> Created $MIMETYPES from example -- edit to allow/deny types"
+else
+    echo "==> Keeping existing $MIMETYPES"
 fi
 
 if [[ ! -f "$PSK" ]]; then
