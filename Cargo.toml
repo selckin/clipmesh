@@ -2,6 +2,8 @@
 name = "clipmesh"
 version = "0.1.0"
 edition = "2021"
+# <[u8]>::trim_ascii (src/sync.rs) was stabilized in 1.80.
+rust-version = "1.80"
 
 [dependencies]
 anyhow = "1"

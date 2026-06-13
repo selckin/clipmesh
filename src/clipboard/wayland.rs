@@ -11,8 +11,9 @@ use wl_clipboard_rs::paste;
 
 /// Wayland clipboard via the data-control protocol. Requires a compositor
 /// implementing ext-data-control-v1 or zwlr-data-control-v1 (niri, Sway,
-/// Hyprland, KDE Plasma, ...). Watching requires the `wl-paste` binary
-/// from the wl-clipboard package.
+/// Hyprland, KDE Plasma, ...). Reading, writing, and change watching are all
+/// in-process over that protocol; no external wl-clipboard/wl-paste binary
+/// is required.
 pub struct WaylandClipboard {
     sync_primary: bool,
     max_payload: usize,

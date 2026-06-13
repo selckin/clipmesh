@@ -1,7 +1,14 @@
 # clipmesh example configuration
 # Copy to ~/.config/clipmesh/config.toml and edit.
 
+# 0.0.0.0 binds every interface; restrict to a specific LAN address (or
+# firewall the port) on hosts reachable from untrusted networks. Traffic is
+# Noise-encrypted, so peers without the psk can neither read nor inject.
 listen = "0.0.0.0:48100"
+
+# List every other node directly. clipmesh connects peers point-to-point and
+# does not forward between them, so leaving a node out here means copies won't
+# reach it, even via a shared third node.
 peers = ["host-b:48100", "host-c:48100"]
 
 # Exactly one of psk, psk_file, psk_env:

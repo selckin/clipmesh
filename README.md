@@ -4,7 +4,10 @@ Encrypted clipboard sync for a mesh of Wayland machines on a LAN.
 Copy on one host, paste on all of them.
 
 - Full peer mesh over TCP, every node dials every other; duplicate
-  connections are tolerated by design (node-ID based dedup).
+  connections are tolerated by design (node-ID based dedup). Peers are
+  connected point-to-point and clipmesh does not forward between them, so
+  every node must list every other node directly — leaving a node out of
+  another's `peers` means copies won't reach it, even via a shared third node.
 - Noise NNpsk0 encryption keyed by a preshared secret: peers without the
   secret can neither read nor inject clipboard contents.
 - Mirrors all MIME representations (text, images, ...), capped at 8 MiB.

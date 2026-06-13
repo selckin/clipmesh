@@ -31,7 +31,9 @@ pub fn mime_matches(pattern: &str, mime: &str) -> bool {
         return true;
     }
     match pattern.strip_suffix("/*") {
-        Some(prefix) => mime.split('/').next() == Some(prefix),
+        // split_once keeps a slashless value (e.g. bare "text") from matching
+        // a "text/*" prefix wildcard — only a real "top/sub" type can.
+        Some(prefix) => mime.split_once('/').map(|(top, _)| top) == Some(prefix),
         None => false,
     }
 }
@@ -150,8 +152,9 @@ impl<C: Clipboard> SyncEngine<C> {
 
         let window = Duration::from_millis(self.cfg.debounce_ms);
         let mut pending: Vec<SelectionKind> = Vec::new();
-        // Far-future placeholder; the `armed` precondition keeps it from
-        // firing (and from registering a timer) until we arm it.
+        // Far-future placeholder so the timer is always present in the
+        // select; the `armed` precondition keeps it from firing until a
+        // local change arms it.
         let deadline = tokio::time::sleep(Duration::from_secs(86_400));
         tokio::pin!(deadline);
         let mut armed = false;
@@ -399,11 +402,27 @@ impl<C: Clipboard> SyncEngine<C> {
         };
         let applied_hash = content_hash(&offer);
         {
-            let current = self.current.lock().unwrap();
-            if let Some(state) = current.get(&kind) {
+            let mut current = self.current.lock().unwrap();
+            if let Some(state) = current.get(&kind).copied() {
                 if state.hash == applied_hash {
+                    // Already hold exactly this content, so no clipboard write
+                    // is needed — but still adopt a higher (stamp, origin).
+                    // The LWW timestamp must track the newest write of the
+                    // current content; keeping a stale stamp would let a later
+                    // update stamped between ours and a peer's newer one win
+                    // here yet lose on that peer, diverging the mesh.
+                    if state.superseded_by(stamp, origin) {
+                        current.insert(
+                            kind,
+                            ContentState {
+                                hash: applied_hash,
+                                stamp,
+                                origin,
+                            },
+                        );
+                    }
                     debug!(?kind, peer = %from, "inbound matches current content; no-op");
-                    return; // already hold exactly this content
+                    return;
                 }
                 if !state.superseded_by(stamp, origin) {
                     debug!(?kind, peer = %from, stamp, %origin, "ignoring older/equal update");
@@ -922,6 +941,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn same_content_newer_stamp_advances_lww_clock() {
+        // Regression: receiving content we already hold, but stamped higher,
+        // must advance our recorded (stamp, origin). Otherwise a later update
+        // stamped between our stale stamp and a peer's newer one wins here
+        // while losing on the peer that saw the higher stamp — permanent
+        // divergence between two nodes holding the same content.
+        let h = start(Config::for_test("s")).await;
+        send_inbound_full(&h, SelectionKind::Clipboard, offer("x"), 100).await;
+        wait_applied(&h, SelectionKind::Clipboard, &offer("x")).await;
+
+        // identical bytes at a higher stamp: no clipboard write, but our
+        // recorded stamp must move from 100 to 300
+        send_inbound_full(&h, SelectionKind::Clipboard, offer("x"), 300).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // an update stamped 200 (between the two) must now lose to our 300
+        send_inbound_full(&h, SelectionKind::Clipboard, offer("y"), 200).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.clip.get(SelectionKind::Clipboard),
+            Some(offer("x")),
+            "intermediate-stamped update must lose after a same-content stamp bump"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rejects_implausibly_future_stamp() {
         // a peer with a broken clock must not poison ordering or crash us
         let h = start(Config::for_test("s")).await;
@@ -1058,5 +1103,6 @@ mod tests {
         assert!(mime_matches("*", "application/octet-stream"));
         assert!(!mime_matches("text/*", "image/png"));
         assert!(!mime_matches("text/plain", "text/html"));
+        assert!(!mime_matches("text/*", "text")); // slashless type must not match a prefix wildcard
     }
 }
