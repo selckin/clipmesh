@@ -18,6 +18,11 @@ pub const SENSITIVE_MIME: &str = "x-kde-passwordManagerHint";
 /// logical clock high and stop our own copies from ever winning again.
 const MAX_FUTURE_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Cap on a single clipboard read. The read runs inside the engine's select
+/// loop, so an unbounded read of a slow/unresponsive selection owner would
+/// freeze inbound/connect handling; this bounds that to a one-off skip.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Password managers mark secret clipboard contents with this hint.
 pub fn is_sensitive(offer: &Offer) -> bool {
     offer
@@ -135,7 +140,21 @@ impl<C: Clipboard> SyncEngine<C> {
         mut connects: mpsc::Receiver<Uuid>,
     ) {
         let mut watch = self.clipboard.watch();
-        self.prime().await;
+
+        // Prime concurrently: reading the existing clipboard can block on a slow
+        // selection owner, and must NOT stall inbound/connect handling (a node
+        // would otherwise be unreachable on the mesh until the local selection
+        // changed). Local changes are buffered (not broadcast) until priming has
+        // recorded the restored clipboard, so it isn't re-sent as fresh content.
+        let (primed_tx, mut primed_rx) = tokio::sync::oneshot::channel();
+        {
+            let me = Arc::clone(&self);
+            tokio::spawn(async move {
+                me.prime().await;
+                let _ = primed_tx.send(());
+            });
+        }
+        let mut primed = false;
 
         let window = Duration::from_millis(self.cfg.debounce_ms);
         let mut pending: Vec<SelectionKind> = Vec::new();
@@ -148,11 +167,11 @@ impl<C: Clipboard> SyncEngine<C> {
 
         loop {
             tokio::select! {
-                kind = watch.recv() => match kind {
-                    Some(kind) => {
-                        if !pending.contains(&kind) {
-                            pending.push(kind);
-                        }
+                // Priming finished (or its task died); broadcast anything that
+                // changed locally while we were priming.
+                _ = &mut primed_rx, if !primed => {
+                    primed = true;
+                    if !pending.is_empty() {
                         if self.cfg.debounce_ms == 0 {
                             for k in pending.drain(..) {
                                 self.broadcast_selection(k).await;
@@ -160,6 +179,25 @@ impl<C: Clipboard> SyncEngine<C> {
                         } else {
                             deadline.as_mut().reset(tokio::time::Instant::now() + window);
                             armed = true;
+                        }
+                    }
+                },
+                kind = watch.recv() => match kind {
+                    Some(kind) => {
+                        if !pending.contains(&kind) {
+                            pending.push(kind);
+                        }
+                        // Until priming records the restored clipboard, just
+                        // buffer — broadcasting now would re-send it as fresh.
+                        if primed {
+                            if self.cfg.debounce_ms == 0 {
+                                for k in pending.drain(..) {
+                                    self.broadcast_selection(k).await;
+                                }
+                            } else {
+                                deadline.as_mut().reset(tokio::time::Instant::now() + window);
+                                armed = true;
+                            }
                         }
                     }
                     None => {
@@ -205,14 +243,18 @@ impl<C: Clipboard> SyncEngine<C> {
                     "primed existing {kind:?} clipboard ({})",
                     describe_offer(&offer)
                 );
-                self.current.lock().unwrap().insert(
-                    kind,
-                    ContentState {
+                // or_insert, not insert: priming now runs concurrently with the
+                // main loop, so an inbound update may already have recorded this
+                // selection's state — don't clobber it with a stamp-0 baseline.
+                self.current
+                    .lock()
+                    .unwrap()
+                    .entry(kind)
+                    .or_insert(ContentState {
                         hash,
                         stamp: 0,
                         origin: self.mesh.own_id(),
-                    },
-                );
+                    });
             }
         }
     }
@@ -314,10 +356,19 @@ impl<C: Clipboard> SyncEngine<C> {
     }
 
     async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
-        let offer = match self.clipboard.read_offer(kind).await {
-            Ok(o) => o,
-            Err(e) => {
+        // Bound the read: this runs inside the select loop (and at startup), so
+        // a slow/unresponsive selection owner must not be able to freeze the
+        // engine. A real read of the size-capped clipboard takes milliseconds;
+        // exceeding this means the source isn't serving its pipe.
+        let offer = match tokio::time::timeout(READ_TIMEOUT, self.clipboard.read_offer(kind)).await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
                 warn!("couldn't read the clipboard: {e:#}");
+                return None;
+            }
+            Err(_) => {
+                warn!("clipboard read timed out after {READ_TIMEOUT:?}; skipping this {kind:?} update");
                 return None;
             }
         };
@@ -514,6 +565,99 @@ mod tests {
         cfg.unknown_mime = unknown;
         cfg.mime_rules_path = Some(dir.path().join("mimetypes"));
         dir
+    }
+
+    /// A clipboard whose `read_offer` blocks until released, modelling a
+    /// slow/unresponsive selection owner at startup. Used to prove that priming
+    /// must not gate the engine's inbound/connect handling.
+    struct GatedClipboard {
+        gate: tokio::sync::Notify,
+        watchers: Mutex<Vec<mpsc::UnboundedSender<SelectionKind>>>,
+        applied: Mutex<Option<Offer>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Clipboard for GatedClipboard {
+        fn watch(&self) -> mpsc::UnboundedReceiver<SelectionKind> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.watchers.lock().unwrap().push(tx);
+            rx
+        }
+        async fn read_offer(&self, _kind: SelectionKind) -> anyhow::Result<Offer> {
+            self.gate.notified().await; // block until the test releases priming
+            Ok(Offer::new())
+        }
+        async fn write_offer(&self, _kind: SelectionKind, offer: Offer) -> anyhow::Result<()> {
+            *self.applied.lock().unwrap() = Some(offer);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_is_handled_while_priming_is_still_blocked() {
+        // Priming reads the existing clipboard, which can block on a slow source.
+        // That must not stall the engine's handling of peer messages/connects —
+        // otherwise a node can't participate in the mesh until the local
+        // selection changes and unblocks the read.
+        let clip = Arc::new(GatedClipboard {
+            gate: tokio::sync::Notify::new(),
+            watchers: Mutex::new(Vec::new()),
+            applied: Mutex::new(None),
+        });
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (connect_tx, connect_rx) = mpsc::channel(64);
+        let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone(), connect_tx);
+        let remote_id = Uuid::new_v4();
+        let cfg = Arc::new(Config::for_test("s"));
+        let mime_rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Allow)));
+        let engine = SyncEngine::new(clip.clone(), mesh, cfg, mime_rules);
+        tokio::spawn(engine.run(in_rx, connect_rx));
+
+        // prime() is now awaiting read_offer (gated). A peer update should still
+        // be applied to the local clipboard.
+        let o = offer("from-peer");
+        in_tx
+            .send((
+                remote_id,
+                Message::Clip {
+                    kind: SelectionKind::Clipboard,
+                    hash: content_hash(&o),
+                    offer: o.clone(),
+                    stamp: now_ms() + 10_000,
+                    origin: remote_id,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let handled = timeout(Duration::from_secs(2), async {
+            while clip.applied.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        clip.gate.notify_waiters(); // let priming finish so the task winds down
+        handled.expect("inbound update was not handled while priming was blocked");
+        assert_eq!(clip.applied.lock().unwrap().as_ref(), Some(&o));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_offer_times_out_on_a_hung_read() {
+        // A read that never completes must yield None after the timeout rather
+        // than awaiting forever — otherwise it would freeze the select loop it
+        // runs in. (start_paused auto-advances time to the pending timeout.)
+        let clip = Arc::new(GatedClipboard {
+            gate: tokio::sync::Notify::new(), // never released
+            watchers: Mutex::new(Vec::new()),
+            applied: Mutex::new(None),
+        });
+        let (in_tx, _in_rx) = mpsc::channel(64);
+        let (connect_tx, _connect_rx) = mpsc::channel::<Uuid>(64);
+        let mesh = Mesh::new(Uuid::new_v4(), in_tx, connect_tx);
+        let cfg = Arc::new(Config::for_test("s"));
+        let mime_rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Allow)));
+        let engine = SyncEngine::new(clip, mesh, cfg, mime_rules);
+        assert_eq!(engine.capture_offer(SelectionKind::Clipboard).await, None);
     }
 
     struct Harness {
