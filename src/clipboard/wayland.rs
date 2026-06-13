@@ -1,7 +1,7 @@
 use crate::clipboard::watch::spawn_watcher;
 use crate::clipboard::Clipboard;
 use crate::protocol::{describe_offer, Offer, SelectionKind};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::io::Read;
 use tokio::sync::mpsc;
@@ -55,23 +55,33 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     let mut offer = Offer::new();
     let mut total = 0usize;
     for mime in types {
-        // A genuine read error aborts the whole offer: silently dropping one
-        // representation would ship a mutated offer to peers. If the
-        // clipboard changed mid-read, the watcher fires again anyway.
+        // Skip a representation we can't read rather than failing the whole
+        // offer. X11/XWayland selections advertise pseudo-targets (TARGETS,
+        // TIMESTAMP, MULTIPLE, SAVE_TARGETS, an app's TK_* atoms, ...) that
+        // are selection metadata, not content, and error on read; aborting
+        // here would stop the real image/text offered alongside them from
+        // ever syncing. A representation that changed mid-read is likewise
+        // skipped — the watcher fires again for the new content.
         let (pipe, _actual_mime) = match paste::get_contents(
             ct,
             paste::Seat::Unspecified,
             paste::MimeType::Specific(&mime),
         ) {
             Ok(x) => x,
-            Err(e) => bail!("failed to read clipboard representation {mime}: {e}"),
+            Err(e) => {
+                debug!(%mime, "skipping unreadable clipboard representation: {e}");
+                continue;
+            }
         };
         // Bound the read by the remaining budget (+1 to detect overflow) so a
         // huge or unbounded representation can't OOM the daemon before the
         // cap is consulted. total never exceeds max, so the subtraction is safe.
         let budget = max - total;
         let mut data = Vec::new();
-        pipe.take(budget as u64 + 1).read_to_end(&mut data)?;
+        if let Err(e) = pipe.take(budget as u64 + 1).read_to_end(&mut data) {
+            debug!(%mime, "skipping clipboard representation that errored mid-read: {e}");
+            continue;
+        }
         if mime.len() + data.len() > budget {
             // This representation would push the offer over the cap. Skip it
             // but keep the rest, so a small syncable payload alongside a giant
