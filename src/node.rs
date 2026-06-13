@@ -125,7 +125,11 @@ async fn bind_listener(listen: &str) -> Result<TcpListener> {
 /// long enough to be considered healthy.
 async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
     const INITIAL: Duration = Duration::from_secs(1);
-    const CAP: Duration = Duration::from_secs(60);
+    // Low cap: on a LAN, redialing a down peer every few seconds is free,
+    // and it bounds how long a returning peer waits to be reconnected (the
+    // backoff sequence is 1, 2, 4, then 5s). A large cap mainly hurts
+    // reconnection latency after a peer restart or a healed partition.
+    const CAP: Duration = Duration::from_secs(5);
     const HEALTHY: Duration = Duration::from_secs(30);
     let mut backoff = INITIAL;
     let mut dial_failures: u32 = 0;
