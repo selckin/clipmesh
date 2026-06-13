@@ -1,4 +1,5 @@
 pub mod mock;
+pub mod watch;
 pub mod wayland;
 
 use crate::protocol::{Offer, SelectionKind};

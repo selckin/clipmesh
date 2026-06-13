@@ -1,13 +1,11 @@
+use crate::clipboard::watch::spawn_watcher;
 use crate::clipboard::Clipboard;
 use crate::protocol::{describe_offer, Offer, SelectionKind};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use std::io::Read;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use wl_clipboard_rs::copy;
 use wl_clipboard_rs::paste;
 
@@ -130,84 +128,13 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
     Ok(())
 }
 
-/// Spawn `wl-paste --watch` and translate its output lines into change
-/// notifications. Restarts the subprocess if it exits, with backoff on
-/// rapid failures (e.g. no data-control support, WAYLAND_DISPLAY unset)
-/// and wl-paste's stderr forwarded to the log so the cause is visible.
-fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, kind: SelectionKind) {
-    const RESTART_MIN: Duration = Duration::from_secs(1);
-    const RESTART_MAX: Duration = Duration::from_secs(30);
-    /// A run shorter than this counts as a failure and escalates backoff.
-    const STABLE_AFTER: Duration = Duration::from_secs(5);
-    tokio::spawn(async move {
-        let mut delay = RESTART_MIN;
-        loop {
-            let started = std::time::Instant::now();
-            let mut cmd = tokio::process::Command::new("wl-paste");
-            if kind == SelectionKind::Primary {
-                cmd.arg("--primary");
-            }
-            // `wl-paste --watch` pipes the *full clipboard contents* to the
-            // command's stdin on every change. The command MUST drain that
-            // stdin: if it exits without reading (as a bare `echo` does), the
-            // write hits a closed pipe and — for payloads above the ~64 KiB
-            // pipe buffer — that broken pipe propagates back to whoever owns
-            // the selection, including our own wl-clipboard-rs serve thread,
-            // which then errors and *destroys the selection*, wiping the
-            // clipboard. That is precisely why images (>64 KiB) vanished while
-            // small text survived. `cat >/dev/null` consumes the contents
-            // first; the marker we read for change detection follows on stdout.
-            cmd.args([
-                "--watch",
-                "sh",
-                "-c",
-                "cat >/dev/null 2>&1; echo clipmesh-change",
-            ]);
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    if let Some(err) = child.stderr.take() {
-                        tokio::spawn(async move {
-                            let mut lines = BufReader::new(err).lines();
-                            while let Ok(Some(line)) = lines.next_line().await {
-                                warn!("wl-paste: {line}");
-                            }
-                        });
-                    }
-                    if let Some(out) = child.stdout.take() {
-                        let mut lines = BufReader::new(out).lines();
-                        while let Ok(Some(_)) = lines.next_line().await {
-                            if tx.send(kind).is_err() {
-                                let _ = child.kill().await;
-                                return; // engine gone; stop watching
-                            }
-                        }
-                    }
-                    let _ = child.kill().await;
-                }
-                Err(e) => {
-                    error!("failed to spawn wl-paste --watch (is wl-clipboard installed?): {e}");
-                }
-            }
-            delay = if started.elapsed() < STABLE_AFTER {
-                (delay * 2).min(RESTART_MAX)
-            } else {
-                RESTART_MIN
-            };
-            warn!(?kind, "clipboard watcher exited; restarting in {delay:?}");
-            tokio::time::sleep(delay).await;
-        }
-    });
-}
-
 #[async_trait]
 impl Clipboard for WaylandClipboard {
     fn watch(&self) -> mpsc::UnboundedReceiver<SelectionKind> {
         let (tx, rx) = mpsc::unbounded_channel();
-        spawn_watcher(tx.clone(), SelectionKind::Clipboard);
-        if self.sync_primary {
-            spawn_watcher(tx, SelectionKind::Primary);
-        }
+        // One in-process data-control listener covers both selections; see
+        // clipboard::watch. (Was a wl-paste --watch subprocess per kind.)
+        spawn_watcher(tx, self.sync_primary);
         rx
     }
 

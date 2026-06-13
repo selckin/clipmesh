@@ -17,7 +17,8 @@ Copy on one host, paste on all of them.
 
 - A Wayland compositor implementing ext-data-control-v1 or
   zwlr-data-control-v1 (niri, Sway, Hyprland, KDE Plasma; **not** GNOME).
-- `wl-clipboard` installed (`wl-paste` is used for change watching).
+  Change watching and read/write are all in-process over that protocol, so
+  no external `wl-clipboard`/`wl-paste` binary is required.
 
 ## Setup
 
