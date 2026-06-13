@@ -1,0 +1,26 @@
+# Example clipmesh MIME rules file (lives at ~/.config/clipmesh/mimetypes).
+#
+# One line per type: <mime> <allow|deny> [max-size]
+#   - allow/deny: whether that type syncs at all
+#   - max-size (optional): per-type cap, on top of max_payload_size (e.g. 4MiB)
+#
+# clipmesh manages this file for you: it creates it, appends any new type it
+# sees using the config's unknown_mime default at the end, and reloads it when
+# it changes (so edits apply on your next copy/paste). Your existing lines,
+# comments, and ordering are left untouched; a line that doesn't parse is kept
+# but commented out.
+#
+# This is just an illustrative example — yours will be generated from what you
+# actually copy. Flip the allow/deny values to taste.
+image/png allow
+image/jpeg allow
+text/html allow
+text/plain allow
+text/plain;charset=utf-8 allow
+# X11/XWayland apps offer text under these uppercase targets:
+STRING allow
+UTF8_STRING allow
+TEXT allow
+# A bulky type you'd rather not sync, or want to cap:
+image/bmp deny
+image/tiff allow 16MiB

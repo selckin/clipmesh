@@ -1,6 +1,7 @@
 use crate::clipboard::Clipboard;
 use crate::config::{Config, Direction};
 use crate::mesh::Mesh;
+use crate::mime::MimeRules;
 use crate::protocol::{content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,31 +24,6 @@ pub fn is_sensitive(offer: &Offer) -> bool {
         .get(SENSITIVE_MIME)
         .map(|v| v.trim_ascii() == b"secret")
         .unwrap_or(false)
-}
-
-/// "text/plain" exact, "text/*" prefix, "*" everything.
-pub fn mime_matches(pattern: &str, mime: &str) -> bool {
-    if pattern == "*" || pattern == mime {
-        return true;
-    }
-    match pattern.strip_suffix("/*") {
-        // split_once keeps a slashless value (e.g. bare "text") from matching
-        // a "text/*" prefix wildcard — only a real "top/sub" type can.
-        Some(prefix) => mime.split_once('/').map(|(top, _)| top) == Some(prefix),
-        None => false,
-    }
-}
-
-fn filter_offer(offer: Offer, allow: Option<&[String]>, deny: &[String]) -> Offer {
-    offer
-        .into_iter()
-        .filter(|(m, _)| !deny.iter().any(|p| mime_matches(p, m)))
-        .filter(|(m, _)| {
-            allow
-                .map(|a| a.iter().any(|p| mime_matches(p, m)))
-                .unwrap_or(true)
-        })
-        .collect()
 }
 
 fn offer_size(offer: &Offer) -> usize {
@@ -92,16 +68,20 @@ pub struct SyncEngine<C> {
     /// Hybrid logical clock: max of wall-clock ms and the highest stamp
     /// seen, so reordered or modestly skewed updates still order sanely.
     clock: Mutex<u64>,
+    /// Per-type allow/deny rules, reloaded from disk when the file changes.
+    mime_rules: Mutex<MimeRules>,
 }
 
 impl<C: Clipboard> SyncEngine<C> {
     pub fn new(clipboard: Arc<C>, mesh: Arc<Mesh>, cfg: Arc<Config>) -> Arc<SyncEngine<C>> {
+        let mime_rules = MimeRules::load(cfg.mime_rules_path.clone(), cfg.unknown_mime);
         Arc::new(SyncEngine {
             clipboard,
             mesh,
             cfg,
             current: Mutex::new(HashMap::new()),
             clock: Mutex::new(0),
+            mime_rules: Mutex::new(mime_rules),
         })
     }
 
@@ -241,12 +221,9 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
             return None;
         }
-        let offer = filter_offer(offer, self.cfg.mime_allow.as_deref(), &self.cfg.mime_deny);
+        let offer = self.apply_mime_rules(offer);
         if offer.is_empty() {
-            debug!(
-                "nothing to sync: the allow/deny rules removed every MIME type (allow={:?}, deny={:?})",
-                self.cfg.mime_allow, self.cfg.mime_deny
-            );
+            debug!("nothing to sync: every MIME type was blocked by the rules");
             return None;
         }
         let size = offer_size(&offer);
@@ -262,6 +239,31 @@ impl<C: Clipboard> SyncEngine<C> {
             return None;
         }
         Some(offer)
+    }
+
+    /// Drop representations blocked by the per-type rules — denied types, or
+    /// ones over their per-type max size. Unseen types are added to the rules
+    /// with the configured default and persisted so the user can tune them.
+    /// External edits to the rules file are picked up here first.
+    fn apply_mime_rules(&self, offer: Offer) -> Offer {
+        let mut rules = self.mime_rules.lock().unwrap();
+        rules.reload_if_changed();
+        if rules.ensure(offer.keys()) {
+            rules.persist();
+        }
+        offer
+            .into_iter()
+            .filter(|(mime, data)| {
+                let allowed = rules.allows(mime, data.len());
+                if !allowed {
+                    debug!(
+                        "dropping {mime} ({}): blocked by the MIME rules",
+                        human_bytes(data.len())
+                    );
+                }
+                allowed
+            })
+            .collect()
     }
 
     async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
@@ -443,7 +445,7 @@ impl<C: Clipboard> SyncEngine<C> {
 mod tests {
     use super::*;
     use crate::clipboard::mock::MockClipboard;
-    use crate::config::{Config, Direction};
+    use crate::config::{Config, Direction, MimePolicy};
     use crate::mesh::Mesh;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -452,6 +454,17 @@ mod tests {
         [("text/plain".to_string(), text.as_bytes().to_vec())]
             .into_iter()
             .collect()
+    }
+
+    /// Point `cfg` at a fresh MIME rules file with the given contents and
+    /// unknown-type policy. The returned TempDir must be kept alive for the
+    /// duration of the test (dropping it deletes the file).
+    fn with_rules(cfg: &mut Config, unknown: MimePolicy, lines: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mimetypes"), lines).unwrap();
+        cfg.unknown_mime = unknown;
+        cfg.mime_rules_path = Some(dir.path().join("mimetypes"));
+        dir
     }
 
     struct Harness {
@@ -699,9 +712,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn mime_deny_strips_matching_types() {
+    async fn denied_mime_types_are_stripped() {
         let mut cfg = Config::for_test("s");
-        cfg.mime_deny = vec!["image/*".to_string()];
+        let _dir = with_rules(&mut cfg, MimePolicy::Allow, "image/png deny\n");
         let mut h = start(cfg).await;
         let mut o = offer("text part");
         o.insert("image/png".to_string(), vec![0u8; 16]);
@@ -723,21 +736,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn mime_allow_restricts_broadcast_to_matching_types() {
+    async fn unknown_deny_syncs_only_allowed_types() {
         let mut cfg = Config::for_test("s");
-        cfg.mime_allow = Some(vec!["text/*".to_string()]);
+        let _dir = with_rules(&mut cfg, MimePolicy::Deny, "text/plain allow\n");
         let mut h = start(cfg).await;
-        let mut o = offer("text part");
-        o.insert("image/png".to_string(), vec![0u8; 16]);
+        let mut o = offer("text part"); // text/plain explicitly allowed
+        o.insert("image/png".to_string(), vec![0u8; 16]); // unknown -> denied
         h.clip.local_copy(SelectionKind::Clipboard, o);
         let (_, _, got) = recv_clip(&mut h).await;
         assert_eq!(got, offer("text part"));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn offer_with_no_allowed_types_is_not_broadcast() {
+    async fn offer_with_only_denied_types_is_not_broadcast() {
         let mut cfg = Config::for_test("s");
-        cfg.mime_allow = Some(vec!["text/*".to_string()]);
+        let _dir = with_rules(&mut cfg, MimePolicy::Deny, ""); // deny everything unseen
         let mut h = start(cfg).await;
         let o: Offer = [("image/png".to_string(), vec![0u8; 16])]
             .into_iter()
@@ -864,9 +877,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn inbound_mime_deny_strips_before_writing() {
+    async fn inbound_denied_types_are_stripped_before_writing() {
         let mut cfg = Config::for_test("s");
-        cfg.mime_deny = vec!["image/*".to_string()];
+        let _dir = with_rules(&mut cfg, MimePolicy::Allow, "image/png deny\n");
         let h = start(cfg).await;
         let mut o = offer("text part");
         o.insert("image/png".to_string(), vec![0u8; 16]);
@@ -1076,13 +1089,30 @@ mod tests {
         assert!(!s.superseded_by(5, Uuid::from_u128(0))); // equal stamp, lower origin loses
     }
 
-    #[test]
-    fn mime_matches_patterns() {
-        assert!(mime_matches("text/plain", "text/plain"));
-        assert!(mime_matches("text/*", "text/html"));
-        assert!(mime_matches("*", "application/octet-stream"));
-        assert!(!mime_matches("text/*", "image/png"));
-        assert!(!mime_matches("text/plain", "text/html"));
-        assert!(!mime_matches("text/*", "text")); // slashless type must not match a prefix wildcard
+    #[tokio::test(start_paused = true)]
+    async fn per_type_max_size_drops_oversized_representations() {
+        let mut cfg = Config::for_test("s");
+        let _dir = with_rules(&mut cfg, MimePolicy::Allow, "image/png allow 8B\n");
+        let mut h = start(cfg).await;
+        let mut o = offer("hi"); // text/plain (unknown -> allow, no cap)
+        o.insert("image/png".to_string(), vec![0u8; 16]); // 16 B over the 8 B cap
+        h.clip.local_copy(SelectionKind::Clipboard, o);
+        let (_, _, got) = recv_clip(&mut h).await;
+        assert_eq!(got, offer("hi"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unseen_types_are_recorded_in_the_rules_file() {
+        let mut cfg = Config::for_test("s");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        cfg.unknown_mime = MimePolicy::Deny;
+        cfg.mime_rules_path = Some(path.clone());
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        // deny-by-default: nothing syncs, but the new type is written out
+        assert_no_broadcast(&mut h).await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("text/plain deny"), "got:\n{written}");
     }
 }

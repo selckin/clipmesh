@@ -17,12 +17,27 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # psk_env = "CLIPMESH_PSK"             # name of an environment variable
 
 # Everything below is optional (defaults shown):
-# max_payload_size = "8MiB"   # skip clipboard contents larger than this
+# max_payload_size = "32MiB"  # skip clipboard contents larger than this (whole offer)
 # debounce_ms = 100           # quiet period before broadcasting
 # sync_primary = false        # also sync the middle-click primary selection
 # direction = "both"          # "both" | "send_only" | "receive_only"
 # exclude_sensitive = true    # skip password-manager-flagged contents
 # resync_on_connect = true    # push current clipboard to peers when they (re)connect
 # log_level = "info"          # overridable with RUST_LOG
-# mime_allow = ["text/*", "image/*"]  # example, NOT the default; unset = allow all types
-# mime_deny = []
+
+# Which MIME types sync is controlled per-type by a separate rules file (see
+# below). unknown_mime decides what happens to a type with no rule yet:
+# "deny" (default) means nothing syncs until you allow it; "allow" syncs
+# everything not explicitly denied.
+# unknown_mime = "deny"
+
+# Per-type allow/deny rules file. Defaults to "mimetypes" beside this config.
+# Each line is `<mime> <allow|deny> [max-size]`, e.g.:
+#     text/plain allow
+#     image/png  allow 4MiB
+#     image/bmp  deny
+# clipmesh creates the file, appends any new type it sees (using unknown_mime)
+# at the end, leaves your existing lines/comments/order alone, and reloads it
+# when it changes — edit it to choose what syncs. An optional per-type max-size
+# caps that type on top of max_payload_size.
+# mime_rules_file = "~/.config/clipmesh/mimetypes"

@@ -37,6 +37,7 @@ jobs:
           mkdir "$PKG"
           cp target/release/clipmesh clipmesh.service README.md "$PKG/"
           cp examples/config.toml "$PKG/config.example.toml"
+          cp examples/mimetypes "$PKG/mimetypes.example"
           tar -czf "$PKG.tar.gz" "$PKG"
           sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256"
 
