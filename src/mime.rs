@@ -4,9 +4,10 @@
 //! a TOML key means types with spaces or punctuation (e.g. Java dataflavors)
 //! work fine. A type with no rule falls back to the `unknown_mime` policy and is
 //! appended automatically. The whole-file last-writer-wins version lives in a
-//! managed `[clipmesh]` table. The file is format-preserving (comments and
-//! ordering survive edits via `toml_edit`), watched (see `fswatch`), and
-//! reloaded as soon as it changes.
+//! managed `[clipmesh]` table. On save the `[rules]` table is sorted by key and
+//! comments interleaved among its entries are dropped (comments above `[rules]`
+//! — the header and `[clipmesh]` — are kept). The file is watched (see
+//! `fswatch`) and reloaded as soon as it changes.
 
 use crate::config::{parse_size, MimePolicy};
 use std::fs;
@@ -25,9 +26,10 @@ const TEMPLATE: &str = "\
 #   \"<mime>\" = { rule = \"allow\", max = \"4MiB\" } # allow, with a per-type cap
 #
 # Keys are quoted, so MIME types with spaces or punctuation are fine. clipmesh
-# appends any new type it sees using the unknown_mime default and reloads this
-# file when it changes. The [clipmesh] table below is managed automatically —
-# leave it alone.
+# appends any new type it sees (using the unknown_mime default), keeps the
+# entries sorted, and reloads this file when it changes. Comments up here above
+# [rules] are kept; notes placed among the rules are dropped on save. The
+# [clipmesh] table below is managed automatically — leave it alone.
 
 [clipmesh]
 
@@ -47,8 +49,9 @@ pub struct MimeRule {
 /// `fswatch`), so the type holds no interior lock of its own — callers
 /// serialize access via the Mutex.
 pub struct MimeRules {
-    /// The TOML document, kept format-preserving so comments and ordering
-    /// survive when clipmesh appends a newly-seen type.
+    /// The TOML document. Comments and ordering above `[rules]` are preserved;
+    /// the `[rules]` table is sorted and its interleaved comments dropped on
+    /// every write (see `normalize`).
     doc: DocumentMut,
     unknown: MimePolicy,
     path: Option<PathBuf>,
@@ -64,8 +67,8 @@ pub struct MimeRules {
 
 impl MimeRules {
     /// Load rules from the file. A missing, empty, or non-TOML file is replaced
-    /// with a fresh skeleton (an old line-format file is backed up first). With
-    /// no path, the rules live only in memory.
+    /// with a fresh skeleton (an old line-format file is discarded). With no
+    /// path, the rules live only in memory.
     pub fn load(path: Option<PathBuf>, unknown: MimePolicy) -> MimeRules {
         let mut me = MimeRules {
             doc: DocumentMut::new(),
@@ -83,8 +86,8 @@ impl MimeRules {
 
     /// Read and parse the file. Returns whether a fresh skeleton should be
     /// written — true when the file is absent, empty, or not valid TOML (an old
-    /// line-format file, which is backed up first), false when it loaded or when
-    /// the read failed transiently (so we never clobber a file we couldn't read).
+    /// line-format file is discarded), false when it loaded or when the read
+    /// failed transiently (so we never clobber a file we couldn't read).
     fn read_file(&mut self) -> bool {
         let Some(path) = self.path.clone() else {
             return false;
@@ -98,10 +101,9 @@ impl MimeRules {
                 }
                 Err(e) => {
                     warn!(
-                        "MIME rules file {} isn't valid TOML ({e}); backing it up and starting fresh",
+                        "MIME rules file {} isn't valid TOML ({e}); replacing it with a fresh one",
                         path.display()
                     );
-                    self.back_up(&path);
                     true
                 }
             },
@@ -110,20 +112,6 @@ impl MimeRules {
                 warn!("couldn't read MIME rules from {}: {e}", path.display());
                 false
             }
-        }
-    }
-
-    /// Move an unreadable (non-TOML) rules file aside so a hand-curated old-format
-    /// file isn't silently destroyed when we start fresh.
-    fn back_up(&self, path: &Path) {
-        let bak = path.with_extension("bak");
-        match fs::rename(path, &bak) {
-            Ok(()) => info!("kept your previous MIME rules at {}", bak.display()),
-            Err(e) => warn!(
-                "couldn't back up {} to {}: {e}",
-                path.display(),
-                bak.display()
-            ),
         }
     }
 
@@ -150,9 +138,14 @@ impl MimeRules {
     }
 
     /// Render the current ruleset to its on-disk TOML text, so it can be sent to
-    /// peers verbatim. Identical to what `write_file` writes.
+    /// peers verbatim. Identical to what `write_file` writes: the `[rules]` table
+    /// is sorted and any comments interleaved among its entries are dropped, so
+    /// the saved/shared form is deterministic. Comments above `[rules]` (the
+    /// header and the `[clipmesh]` table) are kept.
     pub fn body(&self) -> String {
-        self.doc.to_string()
+        let mut doc = self.doc.clone();
+        normalize(&mut doc);
+        doc.to_string()
     }
 
     /// Replace the entire ruleset with `text` (a file body received from a peer),
@@ -162,6 +155,8 @@ impl MimeRules {
     pub fn replace_from(&mut self, text: String) {
         match text.parse::<DocumentMut>() {
             Ok(doc) => {
+                let label = self.path.clone().unwrap_or_else(|| PathBuf::from("<peer>"));
+                warn_invalid_rules(&doc, &label);
                 self.doc = doc;
                 self.dirty = true;
             }
@@ -294,7 +289,12 @@ impl MimeRules {
     /// if unreadable or there is no path.
     pub fn version(&self, own_id: Uuid) -> (u64, Uuid) {
         let cm = self.doc.get("clipmesh");
-        let stamp = cm.and_then(|c| c.get("version")).and_then(Item::as_integer);
+        // Reject a negative integer (e.g. a hand-edit typo): `as u64` would turn
+        // it into a huge value that no peer could ever beat, isolating the node.
+        let stamp = cm
+            .and_then(|c| c.get("version"))
+            .and_then(Item::as_integer)
+            .filter(|s| *s >= 0);
         let origin = cm
             .and_then(|c| c.get("origin"))
             .and_then(Item::as_str)
@@ -317,6 +317,7 @@ impl MimeRules {
     /// dirty.
     pub fn set_version(&mut self, stamp: u64, origin: Uuid) {
         let cm = table_mut(&mut self.doc, "clipmesh");
+        // TOML integers are i64; HLC stamps are wall-clock-ms bounded so they fit.
         cm["version"] = value(stamp as i64);
         cm["origin"] = value(origin.to_string());
         self.dirty = true;
@@ -373,24 +374,51 @@ fn table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
     item.as_table_mut().expect("just ensured it's a table")
 }
 
-/// Interpret a `[rules]` value as a rule: a `"allow"`/`"deny"` string, or a
-/// `{ rule = "...", max = "..." }` table. Returns None for anything else.
-fn parse_rule_item(item: &Item) -> Option<MimeRule> {
+/// Normalise the `[rules]` table for writing: sort entries by MIME key and drop
+/// any comments interleaved among them. Everything above `[rules]` (the header
+/// comments and the `[clipmesh]` table) is left untouched.
+fn normalize(doc: &mut DocumentMut) {
+    let Some(rules) = doc.get_mut("rules").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let mut entries: Vec<(String, Item)> = rules
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    rules.clear();
+    for (k, mut v) in entries {
+        // Drop any trailing inline comment on the value; the per-line layout is
+        // re-applied by the fresh key that `insert` creates.
+        if let Some(val) = v.as_value_mut() {
+            val.decor_mut().set_prefix(" ");
+            val.decor_mut().set_suffix("");
+        }
+        rules.insert(&k, v);
+    }
+}
+
+/// Extract the `(rule, max)` strings from a `[rules]` value: a `"allow"`/`"deny"`
+/// string, or a `{ rule = "...", max = "..." }` (inline or regular) table.
+/// Returns None if the value isn't a recognizable rule shape.
+fn rule_fields(item: &Item) -> Option<(&str, Option<&str>)> {
     if let Some(s) = item.as_str() {
-        return parse_rule(s, None);
+        return Some((s, None));
     }
     if let Some(t) = item.as_inline_table() {
         let rule = t.get("rule").and_then(Value::as_str)?;
-        let max = t.get("max").and_then(Value::as_str);
-        return parse_rule(rule, max);
+        return Some((rule, t.get("max").and_then(Value::as_str)));
     }
-    item.as_table()
-        .and_then(|t| {
-            let rule = t.get("rule").and_then(Item::as_str)?;
-            let max = t.get("max").and_then(Item::as_str);
-            Some((rule, max))
-        })
-        .and_then(|(rule, max)| parse_rule(rule, max))
+    let t = item.as_table()?;
+    let rule = t.get("rule").and_then(Item::as_str)?;
+    Some((rule, t.get("max").and_then(Item::as_str)))
+}
+
+/// Interpret a `[rules]` value as a rule. Returns None for anything that isn't a
+/// usable `allow`/`deny` rule.
+fn parse_rule_item(item: &Item) -> Option<MimeRule> {
+    let (rule, max) = rule_fields(item)?;
+    parse_rule(rule, max)
 }
 
 fn parse_rule(rule: &str, max: Option<&str>) -> Option<MimeRule> {
@@ -418,11 +446,20 @@ fn warn_invalid_rules(doc: &DocumentMut, path: &Path) {
         return;
     };
     for (mime, item) in rules.iter() {
-        if parse_rule_item(item).is_none() {
-            warn!(
+        match rule_fields(item) {
+            None => warn!(
                 "MIME rules: ignoring {mime:?} in {} — value must be \"allow\"/\"deny\" or {{ rule = ..., max = ... }}",
                 path.display()
-            );
+            ),
+            Some((rule, _)) if rule != "allow" && rule != "deny" => warn!(
+                "MIME rules: ignoring {mime:?} in {} — rule must be \"allow\" or \"deny\", got {rule:?}",
+                path.display()
+            ),
+            Some((_, Some(max))) if matches!(parse_size(max), Err(_) | Ok(0)) => warn!(
+                "MIME rules: ignoring the max-size {max:?} on {mime:?} in {} (the rule still applies)",
+                path.display()
+            ),
+            Some(_) => {}
         }
     }
 }
@@ -534,12 +571,12 @@ mod tests {
     }
 
     #[test]
-    fn ensure_appends_new_types_and_preserves_existing_entries_and_comments() {
+    fn save_sorts_rules_strips_inner_comments_and_keeps_the_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
         write(
             &path,
-            "# my notes\n[rules]\n\"image/png\" = \"allow\"  # keep this\n\"text/plain\" = \"deny\"\n",
+            "# my notes\n[rules]\n# inner note\n\"text/plain\" = \"deny\"\n\"image/png\" = \"allow\"  # keep this\n",
         );
         let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
         assert!(rules.allows("image/png", 1));
@@ -547,12 +584,28 @@ mod tests {
         assert!(rules.ensure([&s("image/gif")]));
         rules.persist();
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("# my notes"), "comment lost:\n{body}");
-        assert!(body.contains("# keep this"), "inline comment lost:\n{body}");
+        // Comments above [rules] are kept.
+        assert!(body.contains("# my notes"), "header comment lost:\n{body}");
+        // Comments interleaved among the rules are dropped.
+        assert!(
+            !body.contains("# inner note"),
+            "inner comment kept:\n{body}"
+        );
+        assert!(
+            !body.contains("# keep this"),
+            "inline comment kept:\n{body}"
+        );
+        // The new type is present and entries are sorted by key.
         assert!(
             body.contains("\"image/gif\" = \"deny\""),
             "new type missing:\n{body}"
         );
+        let (gif, png, txt) = (
+            body.find("\"image/gif\"").unwrap(),
+            body.find("\"image/png\"").unwrap(),
+            body.find("\"text/plain\"").unwrap(),
+        );
+        assert!(gif < png && png < txt, "rules not sorted:\n{body}");
         assert!(!rules.ensure([&s("image/gif")])); // already present
     }
 
@@ -568,21 +621,18 @@ mod tests {
     }
 
     #[test]
-    fn an_old_line_format_file_is_backed_up_and_reset() {
+    fn an_old_line_format_file_is_replaced_with_a_fresh_skeleton() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
         // Old format isn't valid TOML.
         write(&path, "image/png allow\ntext/plain deny\n");
         let _rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
-        // The old file is preserved next to it...
-        let bak = path.with_extension("bak");
-        assert!(bak.exists(), "old file not backed up");
-        assert_eq!(
-            std::fs::read_to_string(&bak).unwrap(),
-            "image/png allow\ntext/plain deny\n"
-        );
-        // ...and a fresh TOML skeleton replaces it.
+        // It's overwritten with a fresh TOML skeleton (no backup is kept).
         assert!(std::fs::read_to_string(&path).unwrap().contains("[rules]"));
+        assert!(
+            !path.with_extension("bak").exists(),
+            "no backup should be made"
+        );
     }
 
     #[test]
@@ -662,6 +712,10 @@ mod tests {
             "invalid TOML must not be applied"
         );
         assert!(rules.allows("image/png", 1));
+        // A subsequent valid edit must still be picked up (loaded not poisoned).
+        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
+        assert!(rules.reload_if_changed(), "valid fix must be applied");
+        assert!(!rules.allows("image/png", 1));
     }
 
     #[test]
@@ -741,13 +795,36 @@ mod tests {
     }
 
     #[test]
-    fn body_round_trips_the_file() {
+    fn normalised_layout_is_clean_and_sorted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
-        let text = "# note\n[rules]\n\"image/png\" = \"allow\"\n";
-        write(&path, text);
+        write(
+            &path,
+            "[rules]\n\"image/png\" = \"deny\"\n\"image/gif\" = \"allow\"\n",
+        );
         let rules = MimeRules::load(Some(path), MimePolicy::Deny);
-        assert_eq!(rules.body(), text);
+        assert_eq!(
+            rules.body(),
+            "[rules]\n\"image/gif\" = \"allow\"\n\"image/png\" = \"deny\"\n"
+        );
+    }
+
+    #[test]
+    fn body_keeps_the_header_and_renders_valid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "# note\n[rules]\n\"image/png\" = \"allow\"\n");
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let body = rules.body();
+        assert!(body.contains("# note"), "header lost:\n{body}");
+        assert!(
+            body.contains("\"image/png\" = \"allow\""),
+            "rule lost:\n{body}"
+        );
+        // The rendered body is valid TOML that reloads to the same rule.
+        let mut reparsed = MimeRules::load(None, MimePolicy::Deny);
+        reparsed.replace_from(body);
+        assert!(reparsed.allows("image/png", 1));
     }
 
     #[test]
@@ -808,6 +885,23 @@ mod tests {
         assert!(!rules.reload_if_changed());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), on_disk);
         assert!(!rules.ensure([&s("text/plain")])); // still present in memory
+    }
+
+    #[test]
+    fn own_write_of_an_unsorted_file_does_not_trigger_a_spurious_reload() {
+        // persist() writes the normalized (sorted) body and records it as
+        // `loaded`, so when the watcher sees our own write the content matches
+        // and no reload fires — even though the file started unsorted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "[rules]\n\"z/z\" = \"allow\"\n\"a/a\" = \"deny\"\n");
+        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert!(rules.ensure([&s("m/m")]));
+        rules.persist(); // disk is now sorted: a/a, m/m, z/z
+        assert!(
+            !rules.reload_if_changed(),
+            "our own (sorting) write must not look like an external change"
+        );
     }
 
     #[test]

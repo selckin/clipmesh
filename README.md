@@ -97,9 +97,10 @@ clipmesh manages the file for you:
   `allow` to sync everything you haven't explicitly denied.
 - Any new type clipmesh sees is appended automatically with the `unknown_mime`
   default — so to curate what syncs, copy a few things, then edit the generated
-  file and flip types to `allow`/`deny`. Your existing entries, comments, and
-  ordering are left as-is, and the managed `[clipmesh]` table (the sync version)
-  is maintained automatically.
+  file and flip types to `allow`/`deny`. On save the `[rules]` table is sorted
+  by key and any comments placed among the entries are dropped; comments above
+  `[rules]` (and the managed `[clipmesh]` table holding the sync version) are
+  kept.
 - The file is watched and reloaded as soon as it changes, so edits take effect
   right away — no restart needed. An entry with an invalid value is ignored
   (with a warning) but kept in the file rather than dropped.
@@ -109,8 +110,9 @@ clipmesh manages the file for you:
   replaces the others rather than merging per-type, so a type one host had
   curated but another never saw is dropped when the older file loses (it
   reappears, deny-by-default, the next time that type is copied). clipmesh
-  stamps the file with a managed `# clipmesh-version:` header line to order
-  edits; every sharing host grows that line on first connect. A peer that flips
+  stamps the file with a managed `[clipmesh]` table (holding `version` and
+  `origin`) to order edits; every sharing host gains that table on first
+  connect. A peer that flips
   a type to `allow` will make it sync on your host — that is the point. The
   password-manager `exclude_sensitive` filter is never shared and stays local.
   Set `share_mime_rules = false` to keep each host's rules independent.

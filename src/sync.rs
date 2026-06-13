@@ -486,9 +486,14 @@ impl<C: Clipboard> SyncEngine<C> {
             // it is also what we send.
             let (stamp, origin) = rules.version(own_id);
             if !rules.has_version_header() {
-                // Pin the current (baseline) version to disk; do NOT bump.
+                // Pin the current (baseline) version to disk; do NOT bump. If
+                // the write fails, roll back and don't push a version we didn't
+                // durably persist (consistent with on_local_rules_changed).
                 rules.set_version(stamp, origin);
-                rules.persist();
+                if !rules.persist() {
+                    rules.revert_to_loaded();
+                    return;
+                }
             }
             (stamp, origin, rules.body())
         };

@@ -41,14 +41,15 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 #     "image/bmp"  = "deny"
 # Keys are quoted TOML strings, so MIME types with spaces or punctuation are
 # fine. clipmesh creates the file, appends any new type it sees (using
-# unknown_mime), leaves your existing entries/comments/order alone, and reloads
-# it when it changes — edit it to choose what syncs. An optional per-type
-# max-size caps that type on top of max_payload_size.
+# unknown_mime), keeps the [rules] entries sorted, and reloads it when it
+# changes — edit it to choose what syncs. Comments above [rules] are kept;
+# notes among the entries are dropped on save. An optional per-type max-size
+# caps that type on top of max_payload_size.
 # mime_rules_file = "~/.config/clipmesh/mimetypes"
 
 # When share_mime_rules is on (default), clipmesh keeps the MIME-rules file in
 # sync across the mesh: edit it on one host and the others converge to it. It is
 # whole-file last-writer-wins — the most recently edited file wins outright and
 # replaces the others (it does not merge per-type), and clipmesh stamps the file
-# with a managed "# clipmesh-version:" header line to order edits. Turn it off to
-# keep each host's rules independent.
+# with a managed [clipmesh] table (version + origin) to order edits. Turn it off
+# to keep each host's rules independent.
