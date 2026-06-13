@@ -1,5 +1,6 @@
 # clipmesh example configuration
 # Copy to ~/.config/clipmesh/config.toml and edit.
+# clipmesh watches this file and restarts to apply any change.
 
 # 0.0.0.0 binds every interface; restrict to a specific LAN address (or
 # firewall the port) on hosts reachable from untrusted networks. Traffic is

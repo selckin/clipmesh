@@ -1,12 +1,13 @@
 use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::mesh::Mesh;
+use crate::mime::MimeRules;
 use crate::peer;
 use crate::sync::SyncEngine;
 use anyhow::{anyhow, Result};
 use rand::Rng;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
@@ -21,6 +22,8 @@ pub struct NodeHandle {
     pub local_addr: SocketAddr,
     pub mesh: Arc<Mesh>,
     pub engine_task: JoinHandle<()>,
+    /// Shared MIME ruleset, exposed so a file watcher can reload it on edits.
+    pub mime_rules: Arc<Mutex<MimeRules>>,
 }
 
 /// Start a node: listener + accept loop, a dial loop per configured peer,
@@ -89,13 +92,18 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
         tokio::spawn(dial_loop(peer_addr, cfg, mesh));
     }
 
-    let engine = SyncEngine::new(clipboard, mesh.clone(), cfg);
+    let mime_rules = Arc::new(Mutex::new(MimeRules::load(
+        cfg.mime_rules_path.clone(),
+        cfg.unknown_mime,
+    )));
+    let engine = SyncEngine::new(clipboard, mesh.clone(), cfg, mime_rules.clone());
     let engine_task = tokio::spawn(engine.run(inbound_rx, connect_rx));
 
     Ok(NodeHandle {
         local_addr,
         mesh,
         engine_task,
+        mime_rules,
     })
 }
 

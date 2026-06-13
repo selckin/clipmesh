@@ -6,7 +6,7 @@
 #
 # clipmesh manages this file for you: it creates it, appends any new type it
 # sees using the config's unknown_mime default at the end, and reloads it when
-# it changes (so edits apply on your next copy/paste). Your existing lines,
+# it changes (so edits apply right away). Your existing lines,
 # comments, and ordering are left untouched; a line that doesn't parse is kept
 # but commented out.
 #

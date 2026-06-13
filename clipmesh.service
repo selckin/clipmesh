@@ -5,7 +5,9 @@ PartOf=graphical-session.target
 
 [Service]
 ExecStart=%h/.cargo/bin/clipmesh
-Restart=on-failure
+# always: a config-file change makes clipmesh exit cleanly to reload, and any
+# unexpected exit should bring it back too.
+Restart=always
 RestartSec=2
 
 [Install]

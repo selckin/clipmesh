@@ -63,6 +63,18 @@ Distribute the same psk file to every host, then:
 
 See `examples/config.toml` for all options and defaults.
 
+clipmesh watches `config.toml` and restarts itself when it changes (most
+settings — listen, peers, psk, ... — can't be applied live), so editing the
+config takes effect automatically, no manual `systemctl restart` needed. A
+change that doesn't parse is logged and ignored, leaving the running daemon
+untouched.
+
+Restarting means exiting cleanly and relying on the supervisor to start a fresh
+process, so this needs the bundled systemd unit (`Restart=always`) or any
+supervisor that restarts on exit. Run outside a supervisor (e.g. in the
+foreground) and a config change just stops the daemon. Live MIME-rule reloads
+(below) happen in place and don't need a supervisor.
+
 ### MIME type rules
 
 Which clipboard types sync is decided per-type by a rules file kept next to the
@@ -83,6 +95,6 @@ clipmesh manages the file for you:
   with the `unknown_mime` default — so to curate what syncs, copy a few things,
   then edit the generated file and flip types to `allow`/`deny`. Your existing
   lines, comments, and ordering are left as-is (the file is not reordered).
-- The file is reloaded when it changes, so edits take effect on your next
-  copy/paste — no restart needed. A line that can't be parsed is kept but
+- The file is watched and reloaded as soon as it changes, so edits take effect
+  right away — no restart needed. A line that can't be parsed is kept but
   commented out rather than dropped.

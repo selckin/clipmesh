@@ -32,9 +32,22 @@ async fn main() -> Result<()> {
         cfg.sync_primary,
         cfg.max_payload_size,
     ));
+    let rules_path = cfg.mime_rules_path.clone();
+    // The config text as loaded, so the watcher only restarts on a real content
+    // change (not a bare touch). Empty on a read error — any later edit differs.
+    let original_config = std::fs::read_to_string(&config_path).unwrap_or_default();
     let handle = node::spawn_node(cfg, clipboard).await?;
+    // Watch the config and MIME-rules files (inotify): a rules edit reloads in
+    // place, a config edit that changes content and still parses restarts the
+    // daemon (most settings can't be hot-applied).
+    clipmesh::fswatch::spawn(
+        config_path,
+        original_config,
+        rules_path,
+        handle.mime_rules.clone(),
+    );
     handle.engine_task.await.context("sync engine panicked")?;
-    // The engine never stops in normal operation; exit non-zero so
-    // systemd's Restart=on-failure brings the daemon back.
+    // The engine never stops in normal operation; exit non-zero so systemd
+    // (Restart=always) brings the daemon back.
     bail!("sync engine exited unexpectedly");
 }

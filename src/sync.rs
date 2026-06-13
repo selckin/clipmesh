@@ -68,20 +68,27 @@ pub struct SyncEngine<C> {
     /// Hybrid logical clock: max of wall-clock ms and the highest stamp
     /// seen, so reordered or modestly skewed updates still order sanely.
     clock: Mutex<u64>,
-    /// Per-type allow/deny rules, reloaded from disk when the file changes.
-    mime_rules: Mutex<MimeRules>,
+    /// Per-type allow/deny rules, shared with the file watcher (`fswatch`),
+    /// which reloads them on external edits. `apply_mime_rules` reloads only
+    /// when it's about to record a new type, so the common capture path does no
+    /// file I/O.
+    mime_rules: Arc<Mutex<MimeRules>>,
 }
 
 impl<C: Clipboard> SyncEngine<C> {
-    pub fn new(clipboard: Arc<C>, mesh: Arc<Mesh>, cfg: Arc<Config>) -> Arc<SyncEngine<C>> {
-        let mime_rules = MimeRules::load(cfg.mime_rules_path.clone(), cfg.unknown_mime);
+    pub fn new(
+        clipboard: Arc<C>,
+        mesh: Arc<Mesh>,
+        cfg: Arc<Config>,
+        mime_rules: Arc<Mutex<MimeRules>>,
+    ) -> Arc<SyncEngine<C>> {
         Arc::new(SyncEngine {
             clipboard,
             mesh,
             cfg,
             current: Mutex::new(HashMap::new()),
             clock: Mutex::new(0),
-            mime_rules: Mutex::new(mime_rules),
+            mime_rules,
         })
     }
 
@@ -211,8 +218,11 @@ impl<C: Clipboard> SyncEngine<C> {
     }
 
     /// Read the selection and apply the content filters (sensitive, MIME,
-    /// size). Returns None when there is nothing syncable.
-    fn filter(&self, offer: Offer) -> Option<Offer> {
+    /// size). Returns None when there is nothing syncable. `record_unseen`
+    /// records brand-new types in the rules file — true for locally-captured
+    /// content (so the user can curate what they copy), false for inbound peer
+    /// offers (so a peer can't write to our rules file).
+    fn filter(&self, offer: Offer, record_unseen: bool) -> Option<Offer> {
         if offer.is_empty() {
             debug!("nothing to sync: the clipboard is empty");
             return None;
@@ -221,7 +231,7 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
             return None;
         }
-        let offer = self.apply_mime_rules(offer);
+        let offer = self.apply_mime_rules(offer, record_unseen);
         if offer.is_empty() {
             debug!("nothing to sync: every MIME type was blocked by the rules");
             return None;
@@ -267,13 +277,25 @@ impl<C: Clipboard> SyncEngine<C> {
     }
 
     /// Drop representations blocked by the per-type rules — denied types, or
-    /// ones over their per-type max size. Unseen types are added to the rules
-    /// with the configured default and persisted so the user can tune them.
-    /// External edits to the rules file are picked up here first.
-    fn apply_mime_rules(&self, offer: Offer) -> Offer {
-        let mut rules = self.mime_rules.lock().unwrap();
-        rules.reload_if_changed();
-        if rules.ensure(offer.keys()) {
+    /// ones over their per-type max size. When `record_unseen`, brand-new types
+    /// are added to the rules with the configured default and persisted so the
+    /// user can tune them. Live external edits are handled by the inotify
+    /// watcher (see fswatch), which shares this ruleset; the hot path only
+    /// touches disk when there's actually a new type to record (and reloads
+    /// first, so the append merges onto the user's latest edits rather than
+    /// clobbering them). Recovers a poisoned lock rather than cascading the
+    /// panic to the watcher thread.
+    fn apply_mime_rules(&self, offer: Offer, record_unseen: bool) -> Offer {
+        let mut rules = self
+            .mime_rules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if record_unseen {
+            if rules.has_unseen(offer.keys()) {
+                rules.reload_if_changed();
+                rules.ensure(offer.keys());
+            }
+            // No-op unless something is unsaved (incl. retrying a failed write).
             rules.persist();
         }
         offer
@@ -299,7 +321,8 @@ impl<C: Clipboard> SyncEngine<C> {
                 return None;
             }
         };
-        self.filter(offer)
+        // Local content: record brand-new types so the user can curate them.
+        self.filter(offer, true)
     }
 
     async fn broadcast_selection(&self, kind: SelectionKind) {
@@ -406,8 +429,9 @@ impl<C: Clipboard> SyncEngine<C> {
         self.observe(stamp);
         // Apply the receiver's own content policy: configs can differ
         // between peers, and a node must not write contents it would never
-        // have sent (e.g. password-manager secrets, or denied MIME types).
-        let Some(offer) = self.filter(offer) else {
+        // have sent (e.g. password-manager secrets, or denied MIME types). Do
+        // NOT record unseen types here — a peer must not write to our rules file.
+        let Some(offer) = self.filter(offer, false) else {
             debug!("dropping inbound {kind:?} from peer {from}: our content filters removed everything");
             return;
         };
@@ -521,7 +545,12 @@ mod tests {
         if let Some(o) = seed {
             clip.seed(SelectionKind::Clipboard, o);
         }
-        let engine = SyncEngine::new(clip.clone(), mesh.clone(), Arc::new(cfg));
+        let cfg = Arc::new(cfg);
+        let mime_rules = Arc::new(Mutex::new(MimeRules::load(
+            cfg.mime_rules_path.clone(),
+            cfg.unknown_mime,
+        )));
+        let engine = SyncEngine::new(clip.clone(), mesh.clone(), cfg, mime_rules);
         tokio::spawn(engine.run(in_rx, connect_rx));
         // wait until the engine has subscribed to the watcher
         while clip.watcher_count() == 0 {
@@ -1153,5 +1182,72 @@ mod tests {
         assert_no_broadcast(&mut h).await;
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("text/plain deny"), "got:\n{written}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn editing_an_existing_rule_is_not_picked_up_without_the_watcher() {
+        // The capture path only reloads when a NEW type appears (so the common
+        // case does no blocking file I/O). Edits to existing rules are picked up
+        // by the inotify watcher, which this harness doesn't run — so with no
+        // new type, the engine keeps the rules it loaded at start.
+        let mut cfg = Config::for_test("s");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "text/plain deny\n");
+        let path = dir.path().join("mimetypes");
+        let mut h = start(cfg).await;
+        std::fs::write(&path, "text/plain allow\n").unwrap();
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        // No watcher + no new type -> the on-disk flip is not applied here.
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recording_a_new_type_merges_concurrent_on_disk_edits() {
+        // When a brand-new type is captured, apply_mime_rules reloads-then-
+        // appends, so a concurrent on-disk edit is merged rather than clobbered
+        // by the append (verified here without a running watcher).
+        let mut cfg = Config::for_test("s");
+        let dir = with_rules(&mut cfg, MimePolicy::Deny, "text/plain deny\n");
+        let path = dir.path().join("mimetypes");
+        let mut h = start(cfg).await;
+
+        // User flips text/plain to allow on disk; no watcher fires.
+        std::fs::write(&path, "text/plain allow\n").unwrap();
+        // Copy with a NEW type (image/png), which triggers record + persist.
+        let mut o = offer("hi"); // text/plain
+        o.insert("image/png".to_string(), vec![1, 2, 3]);
+        h.clip.local_copy(SelectionKind::Clipboard, o);
+        let (_, _, got) = recv_clip(&mut h).await;
+        // text/plain (merged allow) syncs; image/png is newly deny-by-default.
+        assert_eq!(got, offer("hi"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("text/plain allow"),
+            "user edit was clobbered:\n{body}"
+        );
+        assert!(
+            body.contains("image/png deny"),
+            "new type not recorded:\n{body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_peer_types_are_not_written_to_the_rules_file() {
+        // A peer's advertised MIME types must not grow/pollute our local rules
+        // file; the inbound path applies rules but never records unseen types.
+        let mut cfg = Config::for_test("s");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        cfg.unknown_mime = MimePolicy::Deny;
+        cfg.mime_rules_path = Some(path.clone());
+        let h = start(cfg).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+        send_inbound(&h, SelectionKind::Clipboard, offer("from-peer")).await;
+        // Give the inbound a moment to be processed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "inbound peer types were written to the rules file"
+        );
     }
 }

@@ -57,11 +57,13 @@ fn run(tx: mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) {
         if tx.is_closed() {
             return;
         }
-        delay = if started.elapsed() < STABLE_AFTER {
-            (delay * 2).min(RESTART_MAX)
-        } else {
-            RESTART_MIN
-        };
+        delay = crate::backoff::next_delay(
+            delay,
+            started.elapsed(),
+            RESTART_MIN,
+            RESTART_MAX,
+            STABLE_AFTER,
+        );
         warn!("restarting the clipboard watcher in {delay:?}");
         thread::sleep(delay);
     }
