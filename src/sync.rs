@@ -1,7 +1,7 @@
 use crate::clipboard::Clipboard;
 use crate::config::{Config, Direction};
 use crate::mesh::Mesh;
-use crate::protocol::{content_hash, Message, Offer, SelectionKind};
+use crate::protocol::{content_hash, describe_offer, Message, Offer, SelectionKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -214,6 +214,7 @@ impl<C: Clipboard> SyncEngine<C> {
                 debug!(
                     ?kind,
                     size = offer_size(&offer),
+                    mimes = %describe_offer(&offer),
                     "primed existing clipboard state"
                 );
                 self.current.lock().unwrap().insert(
@@ -232,6 +233,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// size). Returns None when there is nothing syncable.
     fn filter(&self, offer: Offer) -> Option<Offer> {
         if offer.is_empty() {
+            debug!("filter: empty offer, nothing to sync");
             return None;
         }
         if self.cfg.exclude_sensitive && is_sensitive(&offer) {
@@ -240,6 +242,11 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         let offer = filter_offer(offer, self.cfg.mime_allow.as_deref(), &self.cfg.mime_deny);
         if offer.is_empty() {
+            debug!(
+                allow = ?self.cfg.mime_allow,
+                deny = ?self.cfg.mime_deny,
+                "filter: every MIME type removed by allow/deny rules; nothing to sync"
+            );
             return None;
         }
         let size = offer_size(&offer);
@@ -249,7 +256,9 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!(
                 size,
                 cap = self.cfg.max_payload_size,
-                "clipboard contents exceed max_payload_size; not syncing"
+                mimes = %describe_offer(&offer),
+                "clipboard contents exceed max_payload_size; not syncing \
+                 (raise max_payload_size to sync large images)"
             );
             return None;
         }
@@ -278,6 +287,10 @@ impl<C: Clipboard> SyncEngine<C> {
         // Already the mesh-current content (we just applied it, or the user
         // re-copied identical bytes): nothing to do.
         if self.current.lock().unwrap().get(&kind).map(|s| s.hash) == Some(hash) {
+            debug!(
+                ?kind,
+                "local change matches mesh-current content; not rebroadcasting (echo suppressed)"
+            );
             return;
         }
         let stamp = self.tick();
@@ -293,6 +306,9 @@ impl<C: Clipboard> SyncEngine<C> {
         debug!(
             ?kind,
             size = offer_size(&offer),
+            reps = offer.len(),
+            mimes = %describe_offer(&offer),
+            stamp,
             "broadcasting clipboard update"
         );
         self.mesh.broadcast(&Message::Clip {
@@ -350,7 +366,17 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!(peer = %from, "unexpected message type after handshake");
             return;
         };
+        debug!(
+            ?kind,
+            peer = %from,
+            stamp,
+            %origin,
+            reps = offer.len(),
+            mimes = %describe_offer(&offer),
+            "inbound clip received"
+        );
         if !self.may_recv(kind) {
+            debug!(?kind, peer = %from, "inbound ignored (direction/sync_primary config)");
             return;
         }
         if content_hash(&offer) != hash {
@@ -368,6 +394,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // between peers, and a node must not write contents it would never
         // have sent (e.g. password-manager secrets, or denied MIME types).
         let Some(offer) = self.filter(offer) else {
+            debug!(?kind, peer = %from, "inbound offer dropped by receiver-side content filter");
             return;
         };
         let applied_hash = content_hash(&offer);
@@ -375,15 +402,23 @@ impl<C: Clipboard> SyncEngine<C> {
             let current = self.current.lock().unwrap();
             if let Some(state) = current.get(&kind) {
                 if state.hash == applied_hash {
+                    debug!(?kind, peer = %from, "inbound matches current content; no-op");
                     return; // already hold exactly this content
                 }
                 if !state.superseded_by(stamp, origin) {
-                    debug!(?kind, peer = %from, "ignoring older/equal update");
+                    debug!(?kind, peer = %from, stamp, %origin, "ignoring older/equal update");
                     return;
                 }
             }
         }
-        debug!(?kind, peer = %from, "applying remote clipboard update");
+        debug!(
+            ?kind,
+            peer = %from,
+            stamp,
+            %origin,
+            mimes = %describe_offer(&offer),
+            "applying remote clipboard update"
+        );
         // Record as current only on a successful write, so a transient
         // failure doesn't permanently block this content from re-applying.
         // The whole handler runs to completion on the single engine task

@@ -1,5 +1,5 @@
 use crate::clipboard::Clipboard;
-use crate::protocol::{Offer, SelectionKind};
+use crate::protocol::{describe_offer, Offer, SelectionKind};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use std::io::Read;
@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use wl_clipboard_rs::copy;
 use wl_clipboard_rs::paste;
 
@@ -52,6 +52,7 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
         }
         Err(e) => return Err(e.into()),
     };
+    debug!(?kind, mimes = ?types, "clipboard offers MIME types; reading them");
     let mut offer = Offer::new();
     let mut total = 0usize;
     for mime in types {
@@ -77,16 +78,38 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
             // but keep the rest, so a small syncable payload alongside a giant
             // image (which can never sync) still propagates. warn, not debug,
             // so the user can see why a large representation isn't syncing.
-            warn!(%mime, cap = max, "clipboard representation exceeds max_payload_size; skipping it");
+            // The read stopped at the budget, so the true size is only known
+            // to exceed it — raising max_payload_size is the fix for images.
+            warn!(
+                %mime,
+                read_bytes = data.len(),
+                remaining_budget = budget,
+                cap = max,
+                "clipboard representation does not fit the remaining max_payload_size \
+                 budget; skipping it (raise max_payload_size to sync large images)"
+            );
             continue;
         }
+        debug!(%mime, bytes = data.len(), "read clipboard representation");
         total += mime.len() + data.len();
         offer.insert(mime, data);
     }
+    debug!(?kind, reps = offer.len(), total, "captured clipboard offer");
     Ok(offer)
 }
 
 fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
+    if offer.is_empty() {
+        debug!(?kind, "write_offer: nothing to write (empty offer)");
+        return Ok(());
+    }
+    debug!(
+        ?kind,
+        reps = offer.len(),
+        total = offer.values().map(|d| d.len()).sum::<usize>(),
+        mimes = %describe_offer(&offer),
+        "writing clipboard offer"
+    );
     let sources: Vec<copy::MimeSource> = offer
         .into_iter()
         .map(|(mime, data)| copy::MimeSource {
@@ -94,9 +117,6 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
             mime_type: copy::MimeType::Specific(mime),
         })
         .collect();
-    if sources.is_empty() {
-        return Ok(());
-    }
     let mut opts = copy::Options::new();
     opts.clipboard(copy_type(kind));
     // Advertise exactly the MIME types we were given. Without this,

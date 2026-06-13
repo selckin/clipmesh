@@ -45,6 +45,17 @@ pub fn content_hash(offer: &Offer) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Compact `mime=bytes, mime=bytes` rendering of an offer for log lines.
+/// Keys are already sorted (BTreeMap), so the output is stable. Build it
+/// only inside an enabled log statement — it allocates per call.
+pub fn describe_offer(offer: &Offer) -> String {
+    offer
+        .iter()
+        .map(|(mime, data)| format!("{mime}={}", data.len()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn encode(msg: &Message) -> Vec<u8> {
     bincode::serialize(msg).expect("message serialization cannot fail")
 }
@@ -109,5 +120,13 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert!(decode(&[0xff; 64]).is_err());
+    }
+
+    #[test]
+    fn describe_offer_lists_mimes_and_sizes_in_sorted_order() {
+        // BTreeMap iterates sorted, so image/png precedes text/plain
+        let o = offer(&[("text/plain", b"hi"), ("image/png", b"\x89PNG")]);
+        assert_eq!(describe_offer(&o), "image/png=4, text/plain=2");
+        assert_eq!(describe_offer(&Offer::new()), "");
     }
 }

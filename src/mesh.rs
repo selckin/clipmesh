@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 struct ConnHandle {
@@ -88,6 +88,10 @@ impl Mesh {
             .iter()
             .filter_map(|(id, conns)| conns.first().map(|c| (*id, c.tx.clone())))
             .collect();
+        debug!(
+            peers = targets.len(),
+            "broadcasting update to designated connections"
+        );
         for (peer, tx) in targets {
             if tx.try_send(msg.clone()).is_err() {
                 warn!(peer = %peer, "send queue full or closed; dropping update");
