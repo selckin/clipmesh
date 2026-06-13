@@ -226,19 +226,44 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("nothing to sync: every MIME type was blocked by the rules");
             return None;
         }
-        let size = offer_size(&offer);
-        if size > self.cfg.max_payload_size {
-            // warn, not debug: at the default log level the user would
-            // otherwise have no clue why a large copy never syncs.
-            warn!(
-                "not syncing: clipboard is {}, over the max_payload_size limit of {} \
-                 (raise max_payload_size to sync large images)",
-                human_bytes(size),
-                human_bytes(self.cfg.max_payload_size)
-            );
+        let offer = self.cap_to_payload_size(offer);
+        if offer.is_empty() {
+            debug!("nothing to sync: everything was over the max_payload_size budget");
             return None;
         }
         Some(offer)
+    }
+
+    /// Trim the offer to max_payload_size, dropping individual representations
+    /// that don't fit (smallest-first, so a small text payload survives even
+    /// when a giant image would blow the budget) instead of dropping the whole
+    /// offer. Mirrors the read-path budget and the per-type size caps.
+    fn cap_to_payload_size(&self, offer: Offer) -> Offer {
+        let max = self.cfg.max_payload_size;
+        if offer_size(&offer) <= max {
+            return offer; // common case: the whole offer fits
+        }
+        let mut reps: Vec<(String, Vec<u8>)> = offer.into_iter().collect();
+        reps.sort_by_key(|(m, d)| m.len() + d.len());
+        let mut total = 0usize;
+        let mut kept = Offer::new();
+        for (mime, data) in reps {
+            let sz = mime.len() + data.len();
+            if total.saturating_add(sz) > max {
+                // warn, not debug: at the default log level the user would
+                // otherwise have no clue why a large copy never syncs.
+                warn!(
+                    "dropping {mime} ({}): doesn't fit the {} max_payload_size budget \
+                     (raise max_payload_size to sync more)",
+                    human_bytes(data.len()),
+                    human_bytes(max)
+                );
+                continue;
+            }
+            total += sz;
+            kept.insert(mime, data);
+        }
+        kept
     }
 
     /// Drop representations blocked by the per-type rules — denied types, or
@@ -803,6 +828,20 @@ mod tests {
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, o);
         assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn payload_cap_drops_oversized_reps_but_keeps_small_ones() {
+        // a small text rep fits the budget; a big rep alongside it doesn't, so
+        // only the small one is broadcast (rather than dropping the whole offer)
+        let mut cfg = Config::for_test("s");
+        cfg.max_payload_size = 32;
+        let mut h = start(cfg).await;
+        let mut o = offer("hi"); // text/plain (10) + 2 = 12, fits
+        o.insert("image/png".to_string(), vec![0u8; 64]); // 9 + 64 = 73, doesn't
+        h.clip.local_copy(SelectionKind::Clipboard, o);
+        let (_, _, got) = recv_clip(&mut h).await;
+        assert_eq!(got, offer("hi"));
     }
 
     #[tokio::test(start_paused = true)]
