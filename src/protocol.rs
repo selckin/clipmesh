@@ -45,15 +45,33 @@ pub fn content_hash(offer: &Offer) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Compact `mime=bytes, mime=bytes` rendering of an offer for log lines.
-/// Keys are already sorted (BTreeMap), so the output is stable. Build it
-/// only inside an enabled log statement — it allocates per call.
+/// Compact `mime=size, mime=size` rendering of an offer for log lines, sizes
+/// in human units. Keys are already sorted (BTreeMap), so the output is stable.
+/// Build it only inside an enabled log statement — it allocates per call.
 pub fn describe_offer(offer: &Offer) -> String {
     offer
         .iter()
-        .map(|(mime, data)| format!("{mime}={}", data.len()))
+        .map(|(mime, data)| format!("{mime}={}", human_bytes(data.len())))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Render a byte count in human-friendly units: "269 B", "70.4 KiB", "8.0 MiB".
+pub fn human_bytes(n: usize) -> String {
+    const KIB: f64 = 1024.0;
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let units = ["KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64 / KIB;
+    let mut unit = 0;
+    // Advance while the value, rounded to the one decimal we display, would
+    // reach the next unit — so e.g. 1 MiB - 1 shows "1.0 MiB", not "1024.0 KiB".
+    while unit + 1 < units.len() && (value * 10.0).round() / 10.0 >= KIB {
+        value /= KIB;
+        unit += 1;
+    }
+    format!("{value:.1} {}", units[unit])
 }
 
 pub fn encode(msg: &Message) -> Vec<u8> {
@@ -126,7 +144,26 @@ mod tests {
     fn describe_offer_lists_mimes_and_sizes_in_sorted_order() {
         // BTreeMap iterates sorted, so image/png precedes text/plain
         let o = offer(&[("text/plain", b"hi"), ("image/png", b"\x89PNG")]);
-        assert_eq!(describe_offer(&o), "image/png=4, text/plain=2");
+        assert_eq!(describe_offer(&o), "image/png=4 B, text/plain=2 B");
         assert_eq!(describe_offer(&Offer::new()), "");
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(269), "269 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(72081), "70.4 KiB");
+        assert_eq!(human_bytes(8 * 1024 * 1024), "8.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn human_bytes_rolls_over_at_unit_boundaries() {
+        // A value just under a unit must roll to the next unit when it would
+        // otherwise round to "1024.0" of the smaller unit.
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024 - 1), "1.0 GiB");
     }
 }

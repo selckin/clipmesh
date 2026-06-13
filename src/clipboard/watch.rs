@@ -50,9 +50,9 @@ fn run(tx: mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) {
         match watch_once(&tx, sync_primary) {
             Ok(StopReason::ReceiverGone) => return, // engine gone; stop watching
             Ok(StopReason::Finished) => {
-                warn!("clipboard data-control device finished; reconnecting")
+                warn!("compositor closed the clipboard watcher; reconnecting")
             }
-            Err(e) => error!("clipboard watcher error: {e:#}"),
+            Err(e) => error!("clipboard watcher failed: {e:#}"),
         }
         if tx.is_closed() {
             return;
@@ -62,7 +62,7 @@ fn run(tx: mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) {
         } else {
             RESTART_MIN
         };
-        warn!("clipboard watcher restarting in {delay:?}");
+        warn!("restarting the clipboard watcher in {delay:?}");
         thread::sleep(delay);
     }
 }
@@ -88,18 +88,24 @@ fn watch_once(tx: &mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) -> 
 
     // Prefer ext-data-control-v1; fall back to zwlr (bind up to v2 so the
     // primary selection, added in zwlr v2, is available). Match whatever
-    // wl-clipboard-rs's read/write side uses.
-    let manager = if let Ok(m) = globals.bind::<ExtDataControlManagerV1, _, _>(&qh, 1..=1, ()) {
-        info!("clipboard watcher using ext-data-control-v1");
-        Manager::Ext(m)
-    } else if let Ok(m) = globals.bind::<ZwlrDataControlManagerV1, _, _>(&qh, 1..=2, ()) {
-        info!("clipboard watcher using zwlr-data-control-unstable-v1");
-        Manager::Zwlr(m)
-    } else {
-        bail!(
-            "compositor provides no data-control protocol (need ext-data-control-v1 or \
-             zwlr-data-control-unstable-v1); GNOME/Mutter is unsupported"
-        );
+    // wl-clipboard-rs's read/write side uses. Keep both bind errors so the
+    // failure says *why* (e.g. version mismatch) rather than only "unsupported".
+    let manager = match globals.bind::<ExtDataControlManagerV1, _, _>(&qh, 1..=1, ()) {
+        Ok(m) => {
+            info!("clipboard watcher connected (ext-data-control-v1)");
+            Manager::Ext(m)
+        }
+        Err(ext_err) => match globals.bind::<ZwlrDataControlManagerV1, _, _>(&qh, 1..=2, ()) {
+            Ok(m) => {
+                info!("clipboard watcher connected (zwlr-data-control-unstable-v1)");
+                Manager::Zwlr(m)
+            }
+            Err(zwlr_err) => bail!(
+                "compositor provides no usable data-control protocol (need \
+                 ext-data-control-v1 or zwlr-data-control-unstable-v1); GNOME/Mutter \
+                 is unsupported. ext: {ext_err}; zwlr: {zwlr_err}"
+            ),
+        },
     };
 
     // Keep the device alive for the lifetime of this connection.

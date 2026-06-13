@@ -52,9 +52,13 @@ impl Mesh {
             conns.push(ConnHandle { id, tx });
             conns.len() == 1
         };
-        info!(peer = %remote, conn = id, "connection registered");
-        if first_connection && self.connect_tx.try_send(remote).is_err() {
-            warn!(peer = %remote, "connect-event queue full; resync skipped");
+        if first_connection {
+            info!("peer {remote} connected (connection {id})");
+            if self.connect_tx.try_send(remote).is_err() {
+                warn!("couldn't queue a resync for peer {remote}: the event queue is full");
+            }
+        } else {
+            debug!("opened an additional connection {id} to peer {remote}");
         }
         id
     }
@@ -67,7 +71,7 @@ impl Mesh {
             conns.retain(|c| c.id != conn_id);
             if conns.is_empty() {
                 peers.remove(&remote);
-                info!(peer = %remote, "peer disconnected");
+                info!("peer {remote} disconnected");
             }
         }
     }
@@ -88,13 +92,10 @@ impl Mesh {
             .iter()
             .filter_map(|(id, conns)| conns.first().map(|c| (*id, c.tx.clone())))
             .collect();
-        debug!(
-            peers = targets.len(),
-            "broadcasting update to designated connections"
-        );
+        debug!("broadcasting clipboard update to {} peer(s)", targets.len());
         for (peer, tx) in targets {
             if tx.try_send(msg.clone()).is_err() {
-                warn!(peer = %peer, "send queue full or closed; dropping update");
+                warn!("dropped update to peer {peer}: its send queue is full or closed");
             }
         }
     }
@@ -111,10 +112,12 @@ impl Mesh {
         match target {
             Some(tx) => {
                 if tx.try_send(msg.clone()).is_err() {
-                    warn!(peer = %peer, "send queue full or closed; dropping targeted message");
+                    warn!(
+                        "dropped targeted message to peer {peer}: its send queue is full or closed"
+                    );
                 }
             }
-            None => warn!(peer = %peer, "no connection for targeted message"),
+            None => warn!("can't send targeted message: no connection to peer {peer}"),
         }
     }
 

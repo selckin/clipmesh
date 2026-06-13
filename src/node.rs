@@ -33,7 +33,7 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
 
     let listener = bind_listener(&cfg.listen).await?;
     let local_addr = listener.local_addr()?;
-    info!(%node_id, %local_addr, "clipmesh node started");
+    info!("node started as {node_id}, listening on {local_addr}");
 
     // accept loop
     {
@@ -47,7 +47,7 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         let Ok(permit) = permits.clone().try_acquire_owned() else {
-                            warn!(%addr, "too many inbound connections; dropping");
+                            warn!("refused connection from {addr}: too many inbound connections already open");
                             continue;
                         };
                         let _ = stream.set_nodelay(true);
@@ -66,15 +66,15 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
                             {
                                 // our own dialer already reports self-connections
                                 if e.downcast_ref::<peer::SelfConnection>().is_some() {
-                                    debug!(%addr, "inbound self-connection closed");
+                                    debug!("closed inbound connection from {addr}: it was this node dialing itself");
                                 } else {
-                                    warn!(%addr, "inbound connection ended: {e:#}");
+                                    warn!("inbound connection from {addr} ended: {e:#}");
                                 }
                             }
                         });
                     }
                     Err(e) => {
-                        warn!("accept failed: {e}");
+                        warn!("failed to accept an incoming connection: {e}");
                         sleep(Duration::from_millis(100)).await;
                     }
                 }
@@ -138,7 +138,7 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
             Ok(stream) => {
                 dial_failures = 0;
                 let _ = stream.set_nodelay(true);
-                info!(%addr, "connected");
+                info!("connected to {addr}");
                 let started = Instant::now();
                 match peer::run_connection(
                     stream,
@@ -149,12 +149,12 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                 )
                 .await
                 {
-                    Ok(()) => info!(%addr, "connection closed"),
+                    Ok(()) => info!("connection to {addr} closed"),
                     Err(e) if e.downcast_ref::<peer::SelfConnection>().is_some() => {
-                        warn!(%addr, "peer address is this node itself; not dialing it again");
+                        warn!("{addr} is this node itself; giving up dialing it");
                         return;
                     }
-                    Err(e) => warn!(%addr, "connection ended: {e:#}"),
+                    Err(e) => warn!("connection to {addr} ended: {e:#}"),
                 }
                 if started.elapsed() >= HEALTHY {
                     backoff = INITIAL;
@@ -164,9 +164,9 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                 // first failure of a streak at warn so a dead peer is
                 // visible at the default log level; repeats at debug
                 if dial_failures == 0 {
-                    warn!(%addr, "dial failed: {e} (retrying with backoff)");
+                    warn!("can't reach {addr}: {e} — will keep retrying");
                 } else {
-                    debug!(%addr, "dial failed: {e}");
+                    debug!("still can't reach {addr}: {e}");
                 }
                 dial_failures += 1;
             }

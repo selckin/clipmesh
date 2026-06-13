@@ -20,7 +20,13 @@ async fn main() -> Result<()> {
         Err(_) => tracing_subscriber::EnvFilter::try_new(&cfg.log_level)
             .with_context(|| format!("invalid log_level {:?} in config", cfg.log_level))?,
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // No timestamp (the systemd journal already stamps every line) and no
+    // module-path target, so journalctl output stays short and readable.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .without_time()
+        .with_target(false)
+        .init();
 
     let clipboard = Arc::new(WaylandClipboard::new(
         cfg.sync_primary,
