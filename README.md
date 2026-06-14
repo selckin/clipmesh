@@ -118,16 +118,19 @@ clipmesh manages the file for you:
 - The file is watched and reloaded as soon as it changes, so edits take effect
   right away — no restart needed. An entry with an invalid value is ignored
   (with a warning) but kept in the file rather than dropped.
-- You can add a rule from the command line instead of opening the file:
+- You can manage rules from the command line instead of opening the file:
 
       clipmesh --allow "<glob>"     # add an allow rule
       clipmesh --deny  "<glob>"     # add a deny rule
+      clipmesh --rules              # list the rules and flag overlaps
 
-  This writes the rule (a literal type or a glob) and exits; a running daemon
-  picks the change up through its watcher (and reshares it if `share_mime_rules`
-  is on). Any existing entries the new glob now covers are removed and printed
-  back so you can re-add the ones you want to keep as exceptions. Pass
-  `--config <path>` to target a non-default config.
+  An `--allow`/`--deny` writes the rule (a literal type or a glob) and exits; a
+  running daemon picks the change up through its watcher (and reshares it if
+  `share_mime_rules` is on). Any existing entries the new glob now covers are
+  removed and printed back so you can re-add the ones you want to keep as
+  exceptions. `--rules` is read-only: it prints the rules and, for each, any
+  other glob that also matches its key — marking redundant duplicates and
+  precedence conflicts. Pass `--config <path>` to target a non-default config.
 - With `share_mime_rules` (on by default), the rules file is kept in sync
   across the mesh: edit it on one host and the others converge to it. It is
   whole-file last-writer-wins — the most recently edited file wins outright and

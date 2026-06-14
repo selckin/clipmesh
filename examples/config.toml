@@ -45,7 +45,8 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # specific matching key wins. clipmesh creates the file, appends any new type it
 # sees (using unknown_mime, unless a glob already covers it), keeps the [rules]
 # entries sorted, and reloads it when it changes — edit it to choose what syncs,
-# or run `clipmesh --allow/--deny "<glob>"`. Comments above [rules] are kept;
+# or run `clipmesh --allow/--deny "<glob>"` (and `clipmesh --rules` to list
+# them and flag overlapping globs). Comments above [rules] are kept;
 # notes among the entries are dropped on save. An optional per-type max-size
 # caps that type on top of max_payload_size.
 # mime_rules_file = "~/.config/clipmesh/mimetypes"

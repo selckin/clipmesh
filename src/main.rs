@@ -1,30 +1,40 @@
 use anyhow::{bail, Context, Result};
 use clipmesh::clipboard::wayland::WaylandClipboard;
-use clipmesh::config::Config;
-use clipmesh::mime::MimeRules;
+use clipmesh::config::{Config, MimePolicy};
+use clipmesh::mime::{MimeRules, Relation, Verdict};
 use clipmesh::node;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const USAGE: &str = "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob>]";
+const USAGE: &str = "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob> | --rules]";
+
+/// A one-shot CLI action (none = run the daemon).
+enum CliAction {
+    Edit { allow: bool, pattern: String },
+    PrintRules,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // clipmesh [--config <path>] [--allow <glob> | --deny <glob>]
     let mut config_path: Option<PathBuf> = None;
-    let mut rule_edit: Option<(bool, String)> = None;
+    let mut action: Option<CliAction> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        // Each flag may appear once, and the actions are mutually exclusive — a
+        // repeat (or two actions) is a usage error rather than silently last-wins.
         match arg.as_str() {
-            // Each flag may appear once; a repeat (or both --allow and --deny) is
-            // a usage error rather than silently last-wins.
             "--config" if config_path.is_some() => bail!(USAGE),
             "--config" => config_path = Some(PathBuf::from(args.next().context(USAGE)?)),
-            "--allow" | "--deny" if rule_edit.is_some() => bail!(USAGE),
+            "--allow" | "--deny" | "--rules" if action.is_some() => bail!(USAGE),
             "--allow" | "--deny" => {
                 let pattern = args.next().context(USAGE)?;
-                rule_edit = Some((arg == "--allow", pattern));
+                action = Some(CliAction::Edit {
+                    allow: arg == "--allow",
+                    pattern,
+                });
             }
+            "--rules" => action = Some(CliAction::PrintRules),
             _ => bail!(USAGE),
         }
     }
@@ -32,10 +42,14 @@ async fn main() -> Result<()> {
         PathBuf::from(shellexpand::tilde("~/.config/clipmesh/config.toml").into_owned())
     });
 
-    // --allow/--deny is a one-shot rules-file edit, not the daemon: apply it and
-    // exit. A running daemon picks up the change through its file watcher.
-    if let Some((allow, pattern)) = rule_edit {
-        return apply_rule_edit(&config_path, allow, &pattern);
+    // The CLI actions are one-shot (not the daemon): apply and exit. A running
+    // daemon picks up an edit through its file watcher.
+    match action {
+        Some(CliAction::Edit { allow, pattern }) => {
+            return apply_rule_edit(&config_path, allow, &pattern)
+        }
+        Some(CliAction::PrintRules) => return print_rules(&config_path),
+        None => {}
     }
 
     let cfg = Arc::new(Config::load(&config_path)?);
@@ -89,14 +103,7 @@ fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()>
     if pattern.trim().is_empty() {
         bail!("the --allow/--deny pattern must not be empty");
     }
-    // Surface MimeRules/Config warnings (this runs before main()'s subscriber):
-    // e.g. a write error, or a file about to be reset, must reach the user.
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .without_time()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    init_cli_logging();
 
     let cfg = Config::load(config_path)?;
     let path = cfg
@@ -139,4 +146,135 @@ fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()>
         println!("\nRe-add any you want to keep as exceptions.");
     }
     Ok(())
+}
+
+/// Print the current MIME rules and, for each, any other glob that also matches
+/// its key (redundant duplicates and precedence conflicts). Read-only — never
+/// creates or rewrites the file.
+fn print_rules(config_path: &Path) -> Result<()> {
+    init_cli_logging();
+    let cfg = Config::load(config_path)?;
+    let path = cfg
+        .mime_rules_path
+        .clone()
+        .context("no MIME rules file is configured")?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => {
+            println!("The MIME rules file {} is empty.", path.display());
+            return Ok(());
+        }
+        // Validate up front so a corrupt file reports a clear error instead of
+        // MimeRules::load silently healing it into a fresh skeleton (a write).
+        Ok(text) => {
+            text.parse::<toml_edit::DocumentMut>()
+                .with_context(|| format!("{} isn't valid TOML", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("No MIME rules file yet at {}", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    // The file exists and is valid TOML, so this reads it without writing.
+    let rules = MimeRules::load(Some(path.clone()), cfg.unknown_mime);
+    let report = rules.rules_report();
+    let default = match cfg.unknown_mime {
+        MimePolicy::Allow => "✅ allow",
+        MimePolicy::Deny => "⛔ deny",
+    };
+    println!(
+        "{} rule(s) in {}   (unmatched types: {default})\n",
+        report.len(),
+        path.display(),
+    );
+    // Colour the glob wildcards, but only on a real terminal (and honouring
+    // NO_COLOR), so piped/redirected output stays plain.
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    // Align the key column to the widest key (by *visible* width, ignoring any
+    // colour escapes we add).
+    let key_w = report
+        .iter()
+        .map(|e| e.key.chars().count())
+        .max()
+        .unwrap_or(0);
+    for entry in &report {
+        let cap = entry
+            .max
+            .as_deref()
+            .map(|m| format!("   ≤ {m}"))
+            .unwrap_or_default();
+        let pad = " ".repeat(key_w.saturating_sub(entry.key.chars().count()));
+        let line = format!(
+            "{}  {}{pad}{cap}",
+            verdict_emoji(entry.verdict),
+            colorize_globs(&entry.key, color),
+        );
+        println!("{}", line.trim_end());
+        for o in &entry.overlaps {
+            let relation = match o.relation {
+                Relation::Redundant => "redundant, already covered by",
+                Relation::Overrides => "overrides",
+                Relation::OverriddenBy => "overridden by (more specific)",
+                Relation::DecidesInstead => "decided instead by",
+            };
+            println!(
+                "     ↳ {relation} {} {}",
+                verdict_icon(o.verdict),
+                colorize_globs(&o.key, color),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Emoji + left-padded word for a verdict, used by the `--rules` listing so the
+/// key column aligns (the words pad to the width of "invalid").
+fn verdict_emoji(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Allow => "✅ allow  ",
+        Verdict::Deny => "⛔ deny   ",
+        Verdict::Invalid => "⚠️  invalid",
+    }
+}
+
+/// Just the emoji for a verdict, for inline overlap references.
+fn verdict_icon(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Allow => "✅",
+        Verdict::Deny => "⛔",
+        Verdict::Invalid => "⚠️",
+    }
+}
+
+/// Highlight the glob wildcards (`*`/`?`) in a key with colour, so globs stand
+/// out from literal keys. Returns the key unchanged when `color` is false.
+fn colorize_globs(key: &str, color: bool) -> String {
+    const WILDCARD: &str = "\x1b[1;33m"; // bold yellow
+    const RESET: &str = "\x1b[0m";
+    if !color || !key.bytes().any(|b| b == b'*' || b == b'?') {
+        return key.to_string();
+    }
+    let mut out = String::new();
+    for c in key.chars() {
+        if c == '*' || c == '?' {
+            out.push_str(WILDCARD);
+            out.push(c);
+            out.push_str(RESET);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A minimal stderr subscriber for the one-shot CLI paths, which run before
+/// `main()` installs the daemon's configured subscriber — so a `MimeRules`
+/// warning (a write error, a file about to be reset) still reaches the user.
+fn init_cli_logging() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .without_time()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }

@@ -19,8 +19,9 @@
 # reloads it when it changes (so edits apply right away). It keeps the [rules]
 # entries sorted and drops notes placed among them; comments up here above
 # [rules] are kept. The [clipmesh] table is added and managed automatically —
-# leave it alone. You can also add rules without opening the file:
+# leave it alone. You can also manage rules without opening the file:
 #   clipmesh --allow "*/svg+xml"   clipmesh --deny "JAVA_DATATRANSFER*"
+#   clipmesh --rules   # list the rules and flag overlapping globs
 #
 # This is just an illustrative example — yours is generated from what you
 # actually copy. Flip the allow/deny values to taste.

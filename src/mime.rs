@@ -49,6 +49,48 @@ pub struct MimeRule {
     pub max_size: Option<usize>,
 }
 
+/// One entry in the `--rules` overlap report.
+/// What a rule (or an overlapping rule) decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Allow,
+    Deny,
+    /// The value isn't a usable rule (a typo); it falls back to `unknown_mime`.
+    Invalid,
+}
+
+/// How an overlapping glob relates to the entry it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// Same verdict — the glob already covers this entry, which is redundant.
+    Redundant,
+    /// Different verdict; this entry is more specific and wins.
+    Overrides,
+    /// Different verdict; the glob is more specific and wins.
+    OverriddenBy,
+    /// This entry's value is invalid, so the glob decides its key instead.
+    DecidesInstead,
+}
+
+/// Another glob whose pattern also matches an entry's key.
+pub struct Overlap {
+    /// The other glob's key, unquoted (e.g. `image/*`).
+    pub key: String,
+    pub verdict: Verdict,
+    pub relation: Relation,
+}
+
+/// One entry in the `--rules` report.
+pub struct RuleReport {
+    /// The entry's key, unquoted (e.g. `image/png`).
+    pub key: String,
+    pub verdict: Verdict,
+    /// The per-type size cap as written (e.g. `16MiB`), if any.
+    pub max: Option<String>,
+    /// Other globs that also match this entry's key (empty if none).
+    pub overlaps: Vec<Overlap>,
+}
+
 /// The live ruleset. Two threads share it through an external
 /// `Arc<Mutex<MimeRules>>` (the sync engine, and the inotify watcher in
 /// `fswatch`), so the type holds no interior lock of its own — callers
@@ -305,6 +347,56 @@ impl MimeRules {
         removed
     }
 
+    /// Build a read-only report of the rules (sorted by key) and, for each, any
+    /// *other* glob whose pattern also matches that entry's key — flagging
+    /// redundant duplicates (same verdict) and precedence conflicts (different
+    /// verdict, resolved by [`specificity`]). Used by the `--rules` CLI.
+    pub fn rules_report(&self) -> Vec<RuleReport> {
+        let Some(rules) = self.rules_table() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<(&str, &Item)> = rules.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut out = Vec::with_capacity(entries.len());
+        for &(key, item) in &entries {
+            let (verdict, max) = describe_value(item);
+            let mine = parse_rule_item(item);
+            let mut overlaps = Vec::new();
+            for &(okey, oitem) in &entries {
+                // Only a *different* glob can also match this key.
+                if okey == key || !okey.bytes().any(|b| b == b'*' || b == b'?') {
+                    continue;
+                }
+                if !glob_match(okey, key) {
+                    continue;
+                }
+                let Some(theirs) = parse_rule_item(oitem) else {
+                    continue; // an invalid glob decides nothing
+                };
+                let relation = match mine {
+                    None => Relation::DecidesInstead,
+                    Some(m) if m.allow == theirs.allow => Relation::Redundant,
+                    Some(m) if specificity(key, m.allow) > specificity(okey, theirs.allow) => {
+                        Relation::Overrides
+                    }
+                    Some(_) => Relation::OverriddenBy,
+                };
+                overlaps.push(Overlap {
+                    key: okey.to_string(),
+                    verdict: describe_value(oitem).0,
+                    relation,
+                });
+            }
+            out.push(RuleReport {
+                key: key.to_string(),
+                verdict,
+                max,
+                overlaps,
+            });
+        }
+        out
+    }
+
     /// Whether there are in-memory rule changes not yet written to disk.
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -507,14 +599,39 @@ fn specificity(key: &str, allow: bool) -> Specificity<'_> {
 /// entries. Falls back to a default (possibly bare) key if that ever fails, which
 /// it won't for the strings `Value` produces.
 fn quoted_key(k: &str) -> Key {
-    let repr = Value::from(k).to_string();
-    let mut key = match Key::parse(repr.trim()) {
+    let mut key = match Key::parse(&quoted_key_repr(k)) {
         Ok(mut keys) if keys.len() == 1 => keys.remove(0),
         _ => return Key::new(k),
     };
     *key.leaf_decor_mut() = Decor::default();
     *key.dotted_decor_mut() = Decor::default();
     key
+}
+
+/// `k` rendered as a quoted TOML key string (e.g. `"image/png"`). A TOML string
+/// value uses the same quoting/escaping as a quoted key, so we borrow its
+/// encoder.
+fn quoted_key_repr(k: &str) -> String {
+    Value::from(k).to_string().trim().to_string()
+}
+
+/// Classify a `[rules]` value for the report: its verdict, and the size cap as
+/// written (only when the cap is a usable size).
+fn describe_value(item: &Item) -> (Verdict, Option<String>) {
+    match rule_fields(item) {
+        None => (Verdict::Invalid, None),
+        Some((rule, max)) => {
+            let verdict = match rule {
+                "allow" => Verdict::Allow,
+                "deny" => Verdict::Deny,
+                _ => Verdict::Invalid,
+            };
+            let max = max
+                .filter(|m| matches!(parse_size(m), Ok(n) if n > 0))
+                .map(str::to_string);
+            (verdict, max)
+        }
+    }
 }
 
 /// Render one `[rules]` entry as a clean, copy-pasteable `"key" = value` line
@@ -1289,6 +1406,51 @@ mod tests {
         );
         assert!(!body.contains("JAVA_X"), "covered exact entry removed");
         assert!(!rules.allows("JAVA_DATATRANSFER_COOKIE_x", 1));
+    }
+
+    #[test]
+    fn rules_report_flags_redundant_overrides_and_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(
+            &path,
+            "[rules]\n\
+             \"*;charset=utf-16*\" = \"deny\"\n\
+             \"text/plain;charset=utf-16\" = \"deny\"\n\
+             \"text/uri-list;charset=utf-16\" = \"allow\"\n\
+             \"image/*\" = \"deny\"\n\
+             \"image/png\" = \"allow\"\n\
+             \"text/html\" = \"nope\"\n",
+        );
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let report = rules.rules_report();
+        let find = |k: &str| {
+            report
+                .iter()
+                .find(|r| r.key == k)
+                .unwrap_or_else(|| panic!("no report entry for {k}"))
+        };
+
+        // same verdict, covered by the broad glob -> redundant
+        let r = find("text/plain;charset=utf-16");
+        assert_eq!(r.verdict, Verdict::Deny);
+        assert_eq!(r.overlaps.len(), 1);
+        assert_eq!(r.overlaps[0].relation, Relation::Redundant);
+        assert_eq!(r.overlaps[0].key, "*;charset=utf-16*");
+        assert_eq!(r.overlaps[0].verdict, Verdict::Deny);
+
+        // different verdict, this (more specific) rule wins -> overrides
+        let r = find("text/uri-list;charset=utf-16");
+        assert_eq!(r.verdict, Verdict::Allow);
+        assert_eq!(r.overlaps[0].relation, Relation::Overrides);
+        assert_eq!(find("image/png").overlaps[0].relation, Relation::Overrides);
+
+        // a broad glob nothing else covers has no overlaps
+        assert!(find("image/*").overlaps.is_empty());
+        assert!(find("*;charset=utf-16*").overlaps.is_empty());
+
+        // an unusable value is flagged
+        assert_eq!(find("text/html").verdict, Verdict::Invalid);
     }
 
     #[test]
