@@ -5,12 +5,18 @@
 # 0.0.0.0 binds every interface; restrict to a specific LAN address (or
 # firewall the port) on hosts reachable from untrusted networks. Traffic is
 # Noise-encrypted, so peers without the psk can neither read nor inject.
-listen = "0.0.0.0:48100"
+listen = "0.0.0.0"
+
+# Port to listen on (default 48100). Peers in the list below that omit their own
+# port reuse this one, so the common all-same-port setup needs only the
+# hostnames. Put the port here, not in `listen` above.
+port = 48100
 
 # List every other node directly. clipmesh connects peers point-to-point and
 # does not forward between them, so leaving a node out here means copies won't
-# reach it, even via a shared third node.
-peers = ["host-b:48100", "host-c:48100"]
+# reach it, even via a shared third node. Add ":port" to a peer to override the
+# shared port above for that one.
+peers = ["host-b", "host-c"]
 
 # Exactly one of psk, psk_file, psk_env:
 psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret

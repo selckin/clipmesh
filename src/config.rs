@@ -23,7 +23,11 @@ pub enum MimePolicy {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    /// Bind address (host or IP, no port); combined with `port`.
     listen: String,
+    /// Port to listen on, and the default for peers that omit their own.
+    #[serde(default = "default_port")]
+    port: u16,
     #[serde(default)]
     peers: Vec<String>,
     psk: Option<String>,
@@ -53,6 +57,9 @@ struct RawConfig {
     mime_rules_file: Option<String>,
 }
 
+fn default_port() -> u16 {
+    48100
+}
 fn default_max_payload() -> String {
     "32MiB".into()
 }
@@ -119,6 +126,41 @@ pub fn parse_size(s: &str) -> Result<usize> {
         .with_context(|| format!("size overflows: {s:?}"))
 }
 
+/// The port portion of a `host:port` address, or `None` if it has none.
+/// Handles `host:port`, `1.2.3.4:port`, and bracketed `[v6]:port`; a bare
+/// hostname/IPv4 or an unbracketed IPv6 literal (e.g. `::1`) has no port.
+fn port_of(addr: &str) -> Option<&str> {
+    if addr.starts_with('[') {
+        // bracketed IPv6: the port is whatever follows the closing `]:`
+        return addr
+            .rsplit_once(']')?
+            .1
+            .strip_prefix(':')
+            .filter(|p| !p.is_empty());
+    }
+    let (head, last) = addr.rsplit_once(':')?;
+    // More than one colon and unbracketed means a bare IPv6 literal, not a port.
+    if head.contains(':') {
+        None
+    } else {
+        Some(last).filter(|p| !p.is_empty())
+    }
+}
+
+/// Append `default_port` to an address that lacks one (bracketing a bare IPv6
+/// literal so the result stays a valid `host:port`). Addresses that already
+/// carry a port are returned unchanged.
+fn with_default_port(addr: &str, default_port: &str) -> String {
+    if port_of(addr).is_some() {
+        return addr.to_string();
+    }
+    if !addr.starts_with('[') && addr.contains(':') {
+        format!("[{addr}]:{default_port}")
+    } else {
+        format!("{addr}:{default_port}")
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = fs::read_to_string(path)
@@ -152,9 +194,28 @@ impl Config {
         if secret.is_empty() {
             bail!("preshared secret is empty");
         }
+        // `listen` is the bind address and `port` the port to listen on. A port
+        // left inside `listen` would silently shadow `port` (and the port peers
+        // inherit), turning a half-migrated config into a mesh that never forms,
+        // so reject it with a pointer to the right field.
+        if let Some(p) = port_of(&raw.listen) {
+            bail!(
+                "listen must not include a port (found {p:?} in {:?}); \
+                 set the port with the separate `port` field instead",
+                raw.listen
+            );
+        }
+        // Combine them, and let any peer without its own port reuse the port.
+        let port = raw.port.to_string();
+        let listen = with_default_port(&raw.listen, &port);
+        let peers = raw
+            .peers
+            .iter()
+            .map(|p| with_default_port(p, &port))
+            .collect();
         Ok(Config {
-            listen: raw.listen,
-            peers: raw.peers,
+            listen,
+            peers,
             psk: *blake3::hash(secret.as_bytes()).as_bytes(),
             max_payload_size: match parse_size(&raw.max_payload_size)? {
                 0 => bail!("max_payload_size must be greater than 0"),
@@ -206,14 +267,15 @@ mod tests {
     #[test]
     fn zero_max_payload_size_is_rejected() {
         // A 0 cap would silently drop every representation; reject it loudly.
-        let toml = "listen = \"x:1\"\npsk = \"s\"\nmax_payload_size = \"0B\"\n";
+        let toml = "listen = \"x\"\npsk = \"s\"\nmax_payload_size = \"0B\"\n";
         assert!(Config::from_toml(toml).is_err());
     }
 
     #[test]
     fn parses_full_config() {
         let toml = r#"
-listen = "0.0.0.0:48100"
+listen = "0.0.0.0"
+port = 48100
 peers = ["host-b:48100", "host-c:48100"]
 psk = "supersecret"
 max_payload_size = "2MiB"
@@ -227,7 +289,7 @@ unknown_mime = "allow"
 mime_rules_file = "/tmp/clipmesh-test/mimetypes"
 "#;
         let cfg = Config::from_toml(toml).unwrap();
-        assert_eq!(cfg.listen, "0.0.0.0:48100");
+        assert_eq!(cfg.listen, "0.0.0.0:48100"); // listen + port combined
         assert_eq!(cfg.peers, vec!["host-b:48100", "host-c:48100"]);
         assert_eq!(cfg.psk, *blake3::hash(b"supersecret").as_bytes());
         assert_eq!(cfg.max_payload_size, 2 * 1024 * 1024);
@@ -246,8 +308,9 @@ mime_rules_file = "/tmp/clipmesh-test/mimetypes"
 
     #[test]
     fn applies_defaults() {
-        let cfg = Config::from_toml("listen = \"0.0.0.0:1\"\npsk = \"s\"\n").unwrap();
+        let cfg = Config::from_toml("listen = \"0.0.0.0\"\npsk = \"s\"\n").unwrap();
         assert!(cfg.peers.is_empty());
+        assert_eq!(cfg.listen, "0.0.0.0:48100"); // port defaults to 48100
         assert_eq!(cfg.max_payload_size, 32 * 1024 * 1024);
         assert_eq!(cfg.debounce_ms, 100);
         assert!(!cfg.sync_primary);
@@ -262,25 +325,25 @@ mime_rules_file = "/tmp/clipmesh-test/mimetypes"
 
     #[test]
     fn requires_exactly_one_psk_source() {
-        assert!(Config::from_toml("listen = \"x:1\"\n").is_err());
-        assert!(Config::from_toml("listen = \"x:1\"\npsk = \"a\"\npsk_env = \"B\"\n").is_err());
+        assert!(Config::from_toml("listen = \"x\"\n").is_err());
+        assert!(Config::from_toml("listen = \"x\"\npsk = \"a\"\npsk_env = \"B\"\n").is_err());
     }
 
     #[test]
     fn rejects_empty_secret() {
-        assert!(Config::from_toml("listen = \"x:1\"\npsk = \"\"\n").is_err());
+        assert!(Config::from_toml("listen = \"x\"\npsk = \"\"\n").is_err());
     }
 
     #[test]
     fn rejects_unknown_fields() {
-        assert!(Config::from_toml("listen = \"x:1\"\npsk = \"s\"\ntypo_field = 1\n").is_err());
+        assert!(Config::from_toml("listen = \"x\"\npsk = \"s\"\ntypo_field = 1\n").is_err());
     }
 
     #[test]
     fn reads_psk_from_file_trimmed() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "filesecret").unwrap(); // trailing newline must be trimmed
-        let toml = format!("listen = \"x:1\"\npsk_file = \"{}\"\n", f.path().display());
+        let toml = format!("listen = \"x\"\npsk_file = \"{}\"\n", f.path().display());
         let cfg = Config::from_toml(&toml).unwrap();
         assert_eq!(cfg.psk, *blake3::hash(b"filesecret").as_bytes());
     }
@@ -288,21 +351,77 @@ mime_rules_file = "/tmp/clipmesh-test/mimetypes"
     #[test]
     fn reads_psk_from_env() {
         std::env::set_var("CLIPMESH_TEST_PSK", "envsecret");
-        let cfg = Config::from_toml("listen = \"x:1\"\npsk_env = \"CLIPMESH_TEST_PSK\"\n").unwrap();
+        let cfg = Config::from_toml("listen = \"x\"\npsk_env = \"CLIPMESH_TEST_PSK\"\n").unwrap();
         assert_eq!(cfg.psk, *blake3::hash(b"envsecret").as_bytes());
     }
 
     #[test]
     fn share_mime_rules_defaults_on_and_parses() {
         // default on
-        let cfg = Config::from_toml("listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
         assert!(cfg.share_mime_rules);
         // explicit off
         let cfg =
-            Config::from_toml("listen = \"x:1\"\npsk = \"s\"\nshare_mime_rules = false\n").unwrap();
+            Config::from_toml("listen = \"x\"\npsk = \"s\"\nshare_mime_rules = false\n").unwrap();
         assert!(!cfg.share_mime_rules);
         // tests opt out by default so existing verbatim-file tests are unaffected
         assert!(!Config::for_test("s").share_mime_rules);
+    }
+
+    #[test]
+    fn listen_and_port_combine_into_a_bind_address() {
+        let cfg = Config::from_toml("listen = \"0.0.0.0\"\nport = 51000\npsk = \"s\"\n").unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:51000");
+    }
+
+    #[test]
+    fn port_defaults_when_omitted() {
+        let cfg = Config::from_toml("listen = \"0.0.0.0\"\npsk = \"s\"\n").unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:48100");
+    }
+
+    #[test]
+    fn ipv6_listen_address_is_bracketed_with_the_port() {
+        let cfg = Config::from_toml("listen = \"::\"\nport = 48100\npsk = \"s\"\n").unwrap();
+        assert_eq!(cfg.listen, "[::]:48100");
+    }
+
+    #[test]
+    fn listen_with_a_port_is_rejected() {
+        // The port lives in its own field now; a port inside `listen` would
+        // silently shadow it, so it must be rejected loudly.
+        let err = Config::from_toml("listen = \"0.0.0.0:9000\"\nport = 48100\npsk = \"s\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("listen must not include a port"), "got: {msg}");
+    }
+
+    #[test]
+    fn peer_without_port_inherits_listen_port() {
+        // A node listed without a port reuses the port we listen on; an
+        // explicit port is left untouched.
+        let toml =
+            "listen = \"0.0.0.0\"\nport = 48100\npsk = \"s\"\npeers = [\"host-b\", \"host-c:51000\"]\n";
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(cfg.peers, vec!["host-b:48100", "host-c:51000"]);
+    }
+
+    #[test]
+    fn bracketed_ipv6_peer_without_port_inherits_listen_port() {
+        // `[::1]` is the realistic way to write a portless bracketed IPv6 peer.
+        let toml = "listen = \"::\"\nport = 48100\npsk = \"s\"\npeers = [\"[::1]\"]\n";
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(cfg.peers, vec!["[::1]:48100"]);
+    }
+
+    #[test]
+    fn bare_ipv6_peer_is_bracketed_with_listen_port() {
+        // A bare IPv6 literal must be bracketed before a port can be appended;
+        // an already-bracketed peer with a port is kept verbatim.
+        let toml =
+            "listen = \"::\"\nport = 48100\npsk = \"s\"\npeers = [\"::1\", \"[fe80::2]:5000\"]\n";
+        let cfg = Config::from_toml(toml).unwrap();
+        assert_eq!(cfg.peers, vec!["[::1]:48100", "[fe80::2]:5000"]);
     }
 
     #[test]

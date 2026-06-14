@@ -247,7 +247,7 @@ mod tests {
     fn config_change_action_restarts_only_for_a_changed_usable_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let original = "listen = \"x:1\"\npsk = \"s\"\n";
+        let original = "listen = \"x\"\npsk = \"s\"\n";
 
         // Same content (e.g. a bare `touch`): no restart, even though it parses.
         std::fs::write(&path, original).unwrap();
@@ -257,7 +257,7 @@ mod tests {
         );
 
         // Changed and still parses: restart to apply it.
-        std::fs::write(&path, "listen = \"y:2\"\npsk = \"s\"\n").unwrap();
+        std::fs::write(&path, "listen = \"y\"\npsk = \"s\"\n").unwrap();
         assert_eq!(config_change_action(&path, original), ConfigChange::Restart);
 
         // Changed but doesn't parse: keep running, so a typo can't put us into a
@@ -280,7 +280,7 @@ mod tests {
     fn editing_the_rules_file_pings_the_engine() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
         let rules_path = dir.path().join("mimetypes");
         std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
         let rules = Arc::new(Mutex::new(MimeRules::load(
@@ -316,7 +316,7 @@ mod tests {
         // write) must NOT ping — otherwise our writes would re-broadcast forever.
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
         let rules_path = dir.path().join("mimetypes");
         std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
         let rules = Arc::new(Mutex::new(MimeRules::load(
@@ -364,7 +364,7 @@ mod tests {
     fn editing_the_rules_file_reloads_it() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "listen = \"x:1\"\npsk = \"s\"\n").unwrap();
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
         let rules_path = dir.path().join("mimetypes");
         std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
         let rules = Arc::new(Mutex::new(MimeRules::load(
