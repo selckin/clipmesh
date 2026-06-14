@@ -2,17 +2,22 @@
 //! under `[rules]` is `"<mime>" = "allow" | "deny"`, or a table with a per-type
 //! size cap: `"<mime>" = { rule = "allow", max = "4MiB" }`. Quoting the MIME as
 //! a TOML key means types with spaces or punctuation (e.g. Java dataflavors)
-//! work fine. A type with no rule falls back to the `unknown_mime` policy and is
-//! appended automatically. The whole-file last-writer-wins version lives in a
+//! work fine. A key may be a glob (`*` matches any run, `?` one character), e.g.
+//! `"JAVA_DATATRANSFER*" = "deny"`; matching is case-insensitive (ASCII), and `*`
+//! and `?` are always wildcards (no escape). When more than one key matches a
+//! type the most specific wins (see [`specificity`]). A type matched by no key
+//! falls back to the `unknown_mime` policy and is appended automatically. The
+//! whole-file last-writer-wins version lives in a
 //! managed `[clipmesh]` table. On save the `[rules]` table is sorted by key and
 //! comments interleaved among its entries are dropped (comments above `[rules]`
 //! — the header and `[clipmesh]` — are kept). The file is watched (see
 //! `fswatch`) and reloaded as soon as it changes.
 
 use crate::config::{parse_size, MimePolicy};
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml_edit::{value, DocumentMut, Item, Table, Value};
+use toml_edit::{value, Decor, DocumentMut, Item, Key, Table, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -236,23 +241,68 @@ impl MimeRules {
         } else {
             "deny"
         };
-        let rules = table_mut(&mut self.doc, "rules");
         let mut added = false;
         for m in mimes {
-            if !rules.contains_key(m) {
-                rules[m.as_str()] = value(action);
-                debug!("new MIME type {m}: defaulting to {action} (unknown_mime)");
-                added = true;
+            // Already covered by an exact key or a matching glob -> leave it.
+            if self.any_match(m) {
+                continue;
             }
+            table_mut(&mut self.doc, "rules")[m.as_str()] = value(action);
+            debug!("new MIME type {m}: defaulting to {action} (unknown_mime)");
+            added = true;
         }
         self.dirty |= added;
         added
     }
 
-    /// Whether any of `mimes` lacks a rule (and so would be recorded by
+    /// Whether any of `mimes` is matched by no rule (and so would be recorded by
     /// `ensure`). Lets the caller skip touching disk when nothing is new.
     pub fn has_unseen<'a>(&self, mimes: impl IntoIterator<Item = &'a String>) -> bool {
-        mimes.into_iter().any(|m| !self.has_rule_key(m))
+        mimes.into_iter().any(|m| !self.any_match(m))
+    }
+
+    /// Remove every `[rules]` entry whose key the glob `pattern` matches
+    /// (case-insensitive), except an entry equal to `pattern` itself. Returns the
+    /// removed entries rendered as copy-pasteable `"key" = value` lines. Used by
+    /// the `--allow`/`--deny` CLI to collapse entries under a new glob.
+    pub fn remove_matching(&mut self, pattern: &str) -> Vec<String> {
+        let Some(rules) = self.doc.get_mut("rules").and_then(Item::as_table_mut) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<String> = rules
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .filter(|k| !k.eq_ignore_ascii_case(pattern) && glob_match(pattern, k))
+            .collect();
+        keys.sort(); // echo the removed entries in the same order as the sorted file
+        let mut removed = Vec::new();
+        for k in keys {
+            if let Some(item) = rules.remove(&k) {
+                removed.push(render_entry(&k, &item));
+            }
+        }
+        if !removed.is_empty() {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// Add or replace a single `allow`/`deny` rule for `key` (which may be a
+    /// glob). Used by the `--allow`/`--deny` CLI.
+    pub fn set_rule(&mut self, key: &str, allow: bool) {
+        table_mut(&mut self.doc, "rules")[key] = value(if allow { "allow" } else { "deny" });
+        self.dirty = true;
+    }
+
+    /// Apply an `--allow`/`--deny` glob: drop the entries it now covers, then set
+    /// the rule itself (so an existing key equal to `pattern` is flipped in place,
+    /// not removed-and-re-added). Returns the removed entries as copy-pasteable
+    /// lines. Caller `persist`s. `pattern` is assumed non-empty (the CLI rejects
+    /// empty input before calling).
+    pub fn apply_glob(&mut self, allow: bool, pattern: &str) -> Vec<String> {
+        let removed = self.remove_matching(pattern);
+        self.set_rule(pattern, allow);
+        removed
     }
 
     /// Whether there are in-memory rule changes not yet written to disk.
@@ -345,14 +395,33 @@ impl MimeRules {
         }
     }
 
+    /// The rule that decides `mime`: among all keys that match it (exact or glob,
+    /// case-insensitive), the most specific one wins — see [`specificity`]. An
+    /// exact key, having the most literal characters and no wildcards, always
+    /// beats a glob.
     fn find_rule(&self, mime: &str) -> Option<MimeRule> {
-        parse_rule_item(self.rules_table()?.get(mime)?)
+        let mut best: Option<(Specificity<'_>, MimeRule)> = None;
+        for (key, item) in self.rules_table()?.iter() {
+            if !glob_match(key, mime) {
+                continue;
+            }
+            let Some(rule) = parse_rule_item(item) else {
+                continue;
+            };
+            let spec = specificity(key, rule.allow);
+            if best.as_ref().map_or(true, |(b, _)| spec > *b) {
+                best = Some((spec, rule));
+            }
+        }
+        best.map(|(_, r)| r)
     }
 
-    /// Whether `[rules]` already has a key for `mime` — even one with an invalid
-    /// value (a typo), so `ensure` doesn't append a duplicate default for it.
-    fn has_rule_key(&self, mime: &str) -> bool {
-        self.rules_table().is_some_and(|t| t.contains_key(mime))
+    /// Whether any rule key matches `mime` (exact or glob, case-insensitive),
+    /// regardless of whether its value is a valid rule — so `ensure` doesn't
+    /// append a default for a type already covered by a key (even a typo'd one).
+    fn any_match(&self, mime: &str) -> bool {
+        self.rules_table()
+            .is_some_and(|t| t.iter().any(|(k, _)| glob_match(k, mime)))
     }
 
     fn rules_table(&self) -> Option<&Table> {
@@ -374,6 +443,100 @@ fn table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
     item.as_table_mut().expect("just ensured it's a table")
 }
 
+/// Case-insensitive glob match of `pattern` against `text`: `*` matches any run
+/// (including empty), `?` matches exactly one character, everything else is a
+/// literal. A pattern with no wildcards is therefore an exact (case-insensitive)
+/// match. `*` and `?` are always wildcards — there is no escape, so a key whose
+/// literal text contains `*`/`?` can't be matched verbatim (MIME types never do).
+/// Case folding is ASCII-only (MIME types are ASCII), so non-ASCII bytes compare
+/// case-sensitively.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // Fast path: a wildcard-free pattern (every exact key) is just a
+    // case-insensitive compare — no Vec<char> allocation. This is the hot path,
+    // since `find_rule`/`any_match` run it against every rule key per type.
+    if !pattern.bytes().any(|b| b == b'*' || b == b'?') {
+        return pattern.eq_ignore_ascii_case(text);
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Last '*' we passed and the text position to retry from, for backtracking.
+    let (mut star, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Mismatch after a '*': let the '*' swallow one more char and retry.
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    // Trailing '*'s match the empty remainder.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// A rule's precedence when several match a type. Compared as a tuple, *larger
+/// wins*: more literal characters first (an exact key beats a glob), then fewer
+/// wildcards, then `deny` over `allow`, then the lexicographically smaller key
+/// (a stable, arbitrary final tie-break so the result is deterministic). The key
+/// is borrowed (`&str`), so building a `Specificity` per lookup never allocates.
+type Specificity<'a> = (usize, Reverse<usize>, bool, Reverse<&'a str>);
+
+fn specificity(key: &str, allow: bool) -> Specificity<'_> {
+    let wildcards = key.bytes().filter(|&b| b == b'*' || b == b'?').count();
+    let literals = key.chars().count() - wildcards;
+    (literals, Reverse(wildcards), !allow, Reverse(key))
+}
+
+/// A `Key` for `k` that always renders quoted, even when `k` is a valid bare key
+/// (so `STRING`/`TEXT`/... are written as `"STRING"`/`"TEXT"`, consistent with
+/// the punctuated keys). We render `k` as a TOML string value — always quoted and
+/// correctly escaped — and parse that back as the key's representation, then drop
+/// the parser's decor so the table still applies its own newline/indent between
+/// entries. Falls back to a default (possibly bare) key if that ever fails, which
+/// it won't for the strings `Value` produces.
+fn quoted_key(k: &str) -> Key {
+    let repr = Value::from(k).to_string();
+    let mut key = match Key::parse(repr.trim()) {
+        Ok(mut keys) if keys.len() == 1 => keys.remove(0),
+        _ => return Key::new(k),
+    };
+    *key.leaf_decor_mut() = Decor::default();
+    *key.dotted_decor_mut() = Decor::default();
+    key
+}
+
+/// Render one `[rules]` entry as a clean, copy-pasteable `"key" = value` line
+/// (no surrounding comments or blank lines), for the `--allow`/`--deny` CLI to
+/// echo the entries it removed.
+fn render_entry(key: &str, item: &Item) -> String {
+    let mut item = item.clone();
+    // A rule hand-written as a `[rules."x"]` block is an `Item::Table`, which
+    // renders to nothing when dropped into a single-key table — convert it to
+    // the inline `{ rule = ..., max = ... }` form so the echoed line isn't blank.
+    if let Item::Table(t) = item {
+        item = Item::Value(Value::InlineTable(t.into_inline_table()));
+    }
+    if let Some(val) = item.as_value_mut() {
+        val.decor_mut().set_prefix(" ");
+        val.decor_mut().set_suffix("");
+    }
+    let mut table = Table::new();
+    table.insert_formatted(&quoted_key(key), item);
+    table.to_string().trim().to_string()
+}
+
 /// Normalise the `[rules]` table for writing: sort entries by MIME key and drop
 /// any comments interleaved among them. Everything above `[rules]` (the header
 /// comments and the `[clipmesh]` table) is left untouched.
@@ -389,12 +552,13 @@ fn normalize(doc: &mut DocumentMut) {
     rules.clear();
     for (k, mut v) in entries {
         // Drop any trailing inline comment on the value; the per-line layout is
-        // re-applied by the fresh key that `insert` creates.
+        // re-applied by the fresh key that `insert_formatted` creates.
         if let Some(val) = v.as_value_mut() {
             val.decor_mut().set_prefix(" ");
             val.decor_mut().set_suffix("");
         }
-        rules.insert(&k, v);
+        // Quote every key (even bare-valid ones like STRING) for a consistent file.
+        rules.insert_formatted(&quoted_key(&k), v);
     }
 }
 
@@ -918,5 +1082,264 @@ mod tests {
             "version bump must be rolled back"
         );
         assert!(!rules.allows("image/png", 1));
+    }
+
+    #[test]
+    fn glob_match_handles_star_question_and_case() {
+        assert!(glob_match("text/plain", "text/plain")); // exact
+        assert!(glob_match("TEXT/PLAIN", "text/plain")); // case-insensitive
+        assert!(glob_match("JAVA*", "JAVA_DATATRANSFER_COOKIE_abc")); // trailing *
+        assert!(glob_match(
+            "*;charset=utf-16*",
+            "text/plain;charset=utf-16le"
+        )); // *...*
+        assert!(glob_match("*/utf8*", "application/utf8-data")); // needs a literal /utf8
+        assert!(!glob_match("*/utf8*", "image/x-utf8-thing")); // /x-utf8 is not /utf8
+        assert!(glob_match("image/???", "image/png")); // ? = one char each
+        assert!(!glob_match("image/???", "image/jpeg")); // wrong length
+        assert!(glob_match("JAVA*", "java_lowercase_is_matched")); // literal case folds too
+        assert!(!glob_match("text/*", "image/png")); // prefix mismatch
+        assert!(glob_match("*", "anything at all")); // bare * matches all
+    }
+
+    #[test]
+    fn glob_match_handles_empty_and_boundary_patterns() {
+        assert!(glob_match("", "")); // empty pattern matches only empty text
+        assert!(!glob_match("", "x"));
+        assert!(!glob_match("a?", "a")); // trailing ? needs a character
+        assert!(!glob_match("?", "")); // ? needs a character
+        assert!(glob_match("**", "abc")); // adjacent stars
+        assert!(glob_match("a**b", "aXYZb")); // double star mid-pattern
+        assert!(!glob_match("a*a", "a")); // a trailing literal a star can't fill
+        assert!(glob_match("a*a", "aba"));
+        assert!(glob_match("*x", "x")); // leading star may match empty
+    }
+
+    #[test]
+    fn globs_decide_types_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(
+            &path,
+            "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n\"*;charset=utf-16BE\" = \"deny\"\n",
+        );
+        let rules = MimeRules::load(Some(path), MimePolicy::Allow);
+        assert!(!rules.allows("JAVA_DATATRANSFER_COOKIE_9147594d", 1));
+        // pattern's case differs from the type's — must still match
+        assert!(!rules.allows("text/plain;charset=utf-16be", 1));
+        assert!(rules.allows("text/plain", 1)); // no glob matches -> unknown=allow
+    }
+
+    #[test]
+    fn an_exact_rule_beats_a_matching_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        // glob denies the family; an exact key carves out an allow exception
+        write(
+            &path,
+            "[rules]\n\"*;charset=utf-16*\" = \"deny\"\n\"text/uri-list;charset=utf-16\" = \"allow\"\n",
+        );
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        assert!(
+            rules.allows("text/uri-list;charset=utf-16", 1),
+            "exact key must win over the glob"
+        );
+        assert!(
+            !rules.allows("text/plain;charset=utf-16le", 1),
+            "only-the-glob matches -> deny"
+        );
+    }
+
+    #[test]
+    fn the_more_specific_glob_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        // "text/plain*" has 10 literals; "*plain*" has 5, so the former wins overlap
+        write(
+            &path,
+            "[rules]\n\"text/plain*\" = \"deny\"\n\"*plain*\" = \"allow\"\n",
+        );
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        assert!(
+            !rules.allows("text/plain;charset=utf-8", 1),
+            "text/plain* (10 literals) wins over *plain* (5)"
+        );
+        assert!(
+            rules.allows("application/plain-text", 1),
+            "only *plain* matches"
+        );
+    }
+
+    #[test]
+    fn deny_breaks_a_specificity_tie() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        // both globs: 3 literals and 1 wildcard each -> a genuine tie -> deny wins
+        write(
+            &path,
+            "[rules]\n\"a/x*\" = \"allow\"\n\"a/*y\" = \"deny\"\n",
+        );
+        let rules = MimeRules::load(Some(path), MimePolicy::Allow);
+        assert!(
+            !rules.allows("a/xy", 1),
+            "tie on specificity -> deny is chosen"
+        );
+    }
+
+    #[test]
+    fn a_glob_suppresses_appending_covered_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n");
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let covered = s("JAVA_DATATRANSFER_COOKIE_f9e96042");
+        assert!(!rules.has_unseen([&covered]), "the glob already covers it");
+        assert!(!rules.ensure([&covered]), "so nothing is appended");
+        let uncovered = s("text/plain");
+        assert!(rules.has_unseen([&uncovered]));
+        assert!(
+            rules.ensure([&uncovered]),
+            "an unmatched type is still appended"
+        );
+    }
+
+    #[test]
+    fn remove_matching_collapses_entries_and_echoes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(
+            &path,
+            "[rules]\n\
+             \"text/uri-list;charset=utf-16\" = \"deny\"\n\
+             \"text/uri-list;charset=utf-16be\" = \"deny\"\n\
+             \"text/uri-list;charset=utf-8\" = \"allow\"\n",
+        );
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let removed = rules.remove_matching("*;charset=utf-16*");
+        assert_eq!(
+            removed,
+            vec![
+                "\"text/uri-list;charset=utf-16\" = \"deny\"".to_string(),
+                "\"text/uri-list;charset=utf-16be\" = \"deny\"".to_string(),
+            ],
+            "only the utf-16 entries are removed, rendered copy-pasteably"
+        );
+        rules.set_rule("*;charset=utf-16*", false);
+        rules.persist();
+        // utf-8 survived; utf-16 entries collapsed into the glob
+        assert!(rules.allows("text/uri-list;charset=utf-8", 1));
+        assert!(!rules.allows("text/uri-list;charset=utf-16", 1));
+        let body = rules.body();
+        assert!(body.contains("\"*;charset=utf-16*\" = \"deny\""));
+        assert!(
+            !body.contains("utf-16be"),
+            "the specific utf-16 entries are gone"
+        );
+    }
+
+    #[test]
+    fn remove_matching_does_not_list_the_pattern_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(
+            &path,
+            "[rules]\n\"JAVA*\" = \"deny\"\n\"JAVA_X\" = \"allow\"\n",
+        );
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let removed = rules.remove_matching("JAVA*");
+        // Keys are always quoted on output (even bare-valid ones); the equal-key
+        // "JAVA*" glob is excluded from removal.
+        assert_eq!(
+            removed,
+            vec!["\"JAVA_X\" = \"allow\"".to_string()],
+            "the equal-key glob is updated in place, not reported as removed"
+        );
+    }
+
+    #[test]
+    fn set_rule_adds_and_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        rules.set_rule("image/png", true); // replace
+        rules.set_rule("image/*", false); // add a glob
+        assert!(rules.allows("image/png", 1), "exact replace took effect");
+        assert!(!rules.allows("image/gif", 1), "the new glob denies others");
+    }
+
+    #[test]
+    fn apply_glob_flips_an_existing_glob_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(
+            &path,
+            "[rules]\n\"JAVA*\" = \"allow\"\n\"JAVA_X\" = \"allow\"\n",
+        );
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let removed = rules.apply_glob(false, "JAVA*");
+        // The equal "JAVA*" key is flipped in place (not removed); only the
+        // now-covered "JAVA_X" is dropped and echoed.
+        assert_eq!(removed, vec!["\"JAVA_X\" = \"allow\"".to_string()]);
+        rules.persist();
+        let body = rules.body();
+        assert!(
+            body.contains("\"JAVA*\" = \"deny\""),
+            "glob flipped to deny"
+        );
+        assert!(!body.contains("JAVA_X"), "covered exact entry removed");
+        assert!(!rules.allows("JAVA_DATATRANSFER_COOKIE_x", 1));
+    }
+
+    #[test]
+    fn bare_valid_keys_are_quoted_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        // STRING/TEXT are valid bare TOML keys; toml_edit would leave them unquoted.
+        write(&path, "[rules]\nSTRING = \"allow\"\nTEXT = \"deny\"\n");
+        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let body = rules.body();
+        assert!(
+            body.contains("\"STRING\" = \"allow\""),
+            "STRING must be quoted"
+        );
+        assert!(body.contains("\"TEXT\" = \"deny\""), "TEXT must be quoted");
+        assert!(
+            !body.contains("\nSTRING ") && !body.contains("\nTEXT "),
+            "no bare keys remain"
+        );
+    }
+
+    #[test]
+    fn ensure_does_not_re_append_a_type_seen_in_a_different_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "[rules]\n\"TEXT/PLAIN\" = \"deny\"\n");
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let seen = s("text/plain"); // same type, different case
+        assert!(
+            !rules.has_unseen([&seen]),
+            "a case-variant of an existing key is already covered"
+        );
+        assert!(!rules.ensure([&seen]), "so no duplicate entry is appended");
+        assert_eq!(rules.rule_count(), 1, "still exactly one rule");
+    }
+
+    #[test]
+    fn remove_matching_renders_a_subtable_rule_not_a_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        // A per-type cap hand-written as a [rules."x"] block rather than inline.
+        write(
+            &path,
+            "[rules]\n[rules.\"image/tiff\"]\nrule = \"allow\"\nmax = \"16MiB\"\n",
+        );
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let removed = rules.remove_matching("image/*");
+        assert_eq!(
+            removed,
+            vec!["\"image/tiff\" = { rule = \"allow\", max = \"16MiB\" }".to_string()],
+            "a sub-table rule echoes as a non-blank inline line"
+        );
     }
 }

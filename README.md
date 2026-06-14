@@ -90,6 +90,20 @@ The MIME is a quoted TOML key, so types with spaces, `;`, `=` or other
 punctuation (e.g. Java dataflavors) work. The optional `max` caps that one type,
 on top of the global `max_payload_size`.
 
+A key may also be a **glob**: `*` matches any run of characters and `?` matches
+exactly one, so `"JAVA_DATATRANSFER*" = "deny"` covers a whole family at once and
+`"*;charset=utf-16*" = "deny"` covers every UTF-16 variant. `*` and `?` are
+always wildcards (there's no escape, so a key can't match a literal `*`/`?` — MIME
+types never contain them). Matching is **case-insensitive** (ASCII). When more
+than one key matches a type the most specific
+wins — an exact key beats a glob, and among globs the one with more literal
+(non-wildcard) characters wins (ties break toward `deny`). So a broad
+`"*;charset=utf-16*" = "deny"` alongside an exact
+`"text/uri-list;charset=utf-8" = "allow"` denies the UTF-16 variants while still
+allowing UTF-8. A type already covered by a matching glob is not appended again,
+so one glob keeps churn-y families (e.g. per-paste Java dataflavor cookies) out
+of the file.
+
 clipmesh manages the file for you:
 
 - The `unknown_mime` config option decides what happens to a type with no rule
@@ -104,6 +118,16 @@ clipmesh manages the file for you:
 - The file is watched and reloaded as soon as it changes, so edits take effect
   right away — no restart needed. An entry with an invalid value is ignored
   (with a warning) but kept in the file rather than dropped.
+- You can add a rule from the command line instead of opening the file:
+
+      clipmesh --allow "<glob>"     # add an allow rule
+      clipmesh --deny  "<glob>"     # add a deny rule
+
+  This writes the rule (a literal type or a glob) and exits; a running daemon
+  picks the change up through its watcher (and reshares it if `share_mime_rules`
+  is on). Any existing entries the new glob now covers are removed and printed
+  back so you can re-add the ones you want to keep as exceptions. Pass
+  `--config <path>` to target a non-default config.
 - With `share_mime_rules` (on by default), the rules file is kept in sync
   across the mesh: edit it on one host and the others converge to it. It is
   whole-file last-writer-wins — the most recently edited file wins outright and

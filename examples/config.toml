@@ -40,9 +40,12 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 #     "image/png"  = { rule = "allow", max = "4MiB" }
 #     "image/bmp"  = "deny"
 # Keys are quoted TOML strings, so MIME types with spaces or punctuation are
-# fine. clipmesh creates the file, appends any new type it sees (using
-# unknown_mime), keeps the [rules] entries sorted, and reloads it when it
-# changes — edit it to choose what syncs. Comments above [rules] are kept;
+# fine. A key may also be a glob ('*' = any run, '?' = one char, no escape), e.g.
+# "JAVA_DATATRANSFER*" = "deny"; matching is case-insensitive (ASCII) and the most
+# specific matching key wins. clipmesh creates the file, appends any new type it
+# sees (using unknown_mime, unless a glob already covers it), keeps the [rules]
+# entries sorted, and reloads it when it changes — edit it to choose what syncs,
+# or run `clipmesh --allow/--deny "<glob>"`. Comments above [rules] are kept;
 # notes among the entries are dropped on save. An optional per-type max-size
 # caps that type on top of max_payload_size.
 # mime_rules_file = "~/.config/clipmesh/mimetypes"

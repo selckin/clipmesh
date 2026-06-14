@@ -7,12 +7,20 @@
 #                                               # (on top of max_payload_size)
 #
 # Keys are quoted TOML strings, so MIME types with spaces, ';', '=' or other
-# punctuation (e.g. Java dataflavors) are fine. clipmesh manages this file: it
-# creates it, appends any new type it sees using the config's unknown_mime
-# default, and reloads it when it changes (so edits apply right away). It keeps
-# the [rules] entries sorted and drops notes placed among them; comments up here
-# above [rules] are kept. The [clipmesh] table is added and managed
-# automatically — leave it alone.
+# punctuation (e.g. Java dataflavors) are fine. A key may also be a glob: '*'
+# matches any run of characters, '?' matches exactly one (always wildcards, no
+# escape) — e.g. "JAVA_DATATRANSFER*" or "*;charset=utf-16*". Matching is
+# case-insensitive (ASCII), and when several keys match a type the most specific
+# wins (an exact key beats a glob; among globs, more literal characters win, ties
+# break to deny).
+#
+# clipmesh manages this file: it creates it, appends any new type it sees (using
+# the config's unknown_mime default, unless a glob already covers it), and
+# reloads it when it changes (so edits apply right away). It keeps the [rules]
+# entries sorted and drops notes placed among them; comments up here above
+# [rules] are kept. The [clipmesh] table is added and managed automatically —
+# leave it alone. You can also add rules without opening the file:
+#   clipmesh --allow "*/svg+xml"   clipmesh --deny "JAVA_DATATRANSFER*"
 #
 # This is just an illustrative example — yours is generated from what you
 # actually copy. Flip the allow/deny values to taste.
@@ -28,3 +36,5 @@
 "TEXT" = "allow"
 "image/bmp" = "deny"
 "image/tiff" = { rule = "allow", max = "16MiB" }
+"JAVA_DATATRANSFER*" = "deny"
+"*;charset=utf-16*" = "deny"
