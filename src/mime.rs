@@ -155,7 +155,7 @@ impl MimeRules {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if path_is_symlink(&path) {
+                if crate::fsutil::is_symlink(&path) {
                     warn!(
                         "MIME-rules file {} is a symlink whose target is missing; \
                          starting from an empty ruleset, then writing a fresh skeleton \
@@ -164,7 +164,6 @@ impl MimeRules {
                         path.display()
                     );
                 }
-                let _ = e; // a missing file isn't itself an error here
                 true
             }
             Err(e) => {
@@ -755,14 +754,6 @@ fn warn_invalid_rules(doc: &DocumentMut, path: &Path) {
             Some(_) => {}
         }
     }
-}
-
-/// True if `path` is a symlink. Combined with a NotFound read, the link is
-/// dangling (its target doesn't exist).
-fn path_is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

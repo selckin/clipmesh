@@ -165,7 +165,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
-            Err(e) if path_is_symlink(path) => {
+            Err(e) if crate::fsutil::is_symlink(path) => {
                 let target = fs::read_link(path)
                     .map(|t| t.display().to_string())
                     .unwrap_or_else(|_| "?".to_string());
@@ -273,14 +273,6 @@ impl Config {
     }
 }
 
-/// True if `path` is a symlink. After a failed read this means the link is
-/// dangling — its target is missing or unreadable.
-fn path_is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,8 +285,14 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).unwrap();
         let err = Config::load(&link).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("symlink"), "message should mention the symlink: {msg}");
-        assert!(msg.contains("missing.toml"), "message should name the target: {msg}");
+        assert!(
+            msg.contains("symlink"),
+            "message should mention the symlink: {msg}"
+        );
+        assert!(
+            msg.contains("missing.toml"),
+            "message should name the target: {msg}"
+        );
     }
 
     #[test]

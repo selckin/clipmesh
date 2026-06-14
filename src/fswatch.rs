@@ -5,14 +5,17 @@
 //!
 //! The parent directories are watched (rather than the files directly) so that
 //! editors which save by writing a temp file and renaming it into place are
-//! handled; events are dispatched by file name.
+//! handled; events are dispatched by file name. When a watched file is a
+//! symlink, its resolved target's directory is watched too, so edits made
+//! through the link (e.g. into a dotfiles repo) are seen.
 
 use crate::config::Config;
+use crate::fsutil::is_symlink;
 use crate::mime::MimeRules;
 use anyhow::{Context, Result};
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -44,44 +47,34 @@ enum Site {
     Target,
 }
 
-/// A directory plus the file name to match within it.
-struct SitePath {
-    dir: PathBuf,
-    name: OsString,
+/// Resolving a watched file's symlink target yields one of three states.
+enum TargetSite {
+    /// The path is not a symlink — there is no separate target to watch.
+    NotSymlink,
+    /// A symlink whose resolved target directory exists; watch this path (the
+    /// file itself may be currently absent, so a recreate self-heals).
+    Watch(PathBuf),
+    /// A symlink whose resolved target has no directory to watch; carries the
+    /// intended target for logging. Recovers when the link is repaired.
+    Broken(PathBuf),
 }
 
-/// One registered watch: the `(dir, name)` events are matched against, tagged
-/// with which file and site it represents, plus its inotify descriptor.
+/// One registered watch. `path` is the watched file — its directory
+/// (`watch_dir(path)`) is what inotify watches and `path.file_name()` is what
+/// events are matched against; `wd` is that directory's descriptor. Storing the
+/// single path keeps the directory and the name from ever disagreeing.
 struct Entry {
     target: Target,
     site: Site,
-    dir: PathBuf,
-    name: OsString,
+    path: PathBuf,
     wd: WatchDescriptor,
 }
 
-/// True if `path` is itself a symlink (does not follow it). A genuinely-absent
-/// path is simply "not a symlink"; any *other* stat failure (EACCES, EIO, ...)
-/// is also treated as non-symlink but logged, so a transient fault that hides a
-/// real symlink (and thus skips its target watch) leaves a greppable trace
-/// rather than vanishing silently.
-fn is_symlink(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(m) => m.file_type().is_symlink(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            debug!("can't lstat {} ({e}); treating it as a non-symlink", path.display());
-            false
-        }
-    }
-}
-
-/// The link site for a path: its own parent directory and file name — exactly
-/// what the watcher has always watched.
-fn link_site(path: &Path) -> SitePath {
-    SitePath {
-        dir: watch_dir(path),
-        name: path.file_name().unwrap_or_default().to_os_string(),
+impl Entry {
+    /// Does an event with descriptor `wd` and file name `name` target this
+    /// entry? (Same directory watch, same file name.)
+    fn matches(&self, wd: &WatchDescriptor, name: &OsStr) -> bool {
+        self.wd == *wd && self.path.file_name() == Some(name)
     }
 }
 
@@ -105,24 +98,30 @@ fn resolve_link_target(path: &Path) -> PathBuf {
     current
 }
 
-/// The target site for a path:
-/// - `Ok(None)` when it is not a symlink,
-/// - `Ok(Some(site))` when it is a symlink whose target *directory* exists
-///   (watch that directory even if the file itself is currently absent),
-/// - `Err(intended)` when the resolved target has no directory to watch.
-fn target_site(path: &Path) -> std::result::Result<Option<SitePath>, PathBuf> {
+/// Resolve a path's symlink target into a [`TargetSite`]: `NotSymlink` for a
+/// plain file; `Watch` for a symlink whose target *directory* exists (watch it
+/// even if the file itself is currently absent); `Broken` for a symlink with no
+/// watchable target directory.
+fn target_site(path: &Path) -> TargetSite {
     if !is_symlink(path) {
-        return Ok(None);
+        return TargetSite::NotSymlink;
     }
     let resolved = resolve_link_target(path);
-    let dir = watch_dir(&resolved);
-    if dir.is_dir() {
-        Ok(Some(SitePath {
-            dir,
-            name: resolved.file_name().unwrap_or_default().to_os_string(),
-        }))
-    } else {
-        Err(resolved)
+    // Watch the target's directory if it resolves to one. `is_dir()` alone
+    // would fold a transient stat failure (EACCES/EIO) into "broken" silently;
+    // distinguish a genuinely-missing dir from a stat error and log the latter
+    // (it self-heals on the next link-site event), mirroring `is_symlink`.
+    match fs::metadata(watch_dir(&resolved)) {
+        Ok(m) if m.is_dir() => TargetSite::Watch(resolved),
+        Ok(_) => TargetSite::Broken(resolved),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TargetSite::Broken(resolved),
+        Err(e) => {
+            debug!(
+                "can't stat the target directory of {} ({e}); treating it as broken for now",
+                path.display()
+            );
+            TargetSite::Broken(resolved)
+        }
     }
 }
 
@@ -198,7 +197,9 @@ fn ensure_watch(
     dir: &Path,
     mask: WatchMask,
 ) -> Result<WatchDescriptor> {
-    let merged = masks.entry(dir.to_path_buf()).or_insert_with(WatchMask::empty);
+    let merged = masks
+        .entry(dir.to_path_buf())
+        .or_insert_with(WatchMask::empty);
     *merged |= mask;
     inotify
         .watches()
@@ -220,35 +221,34 @@ fn add_file_watches(
     let link_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE;
     let target_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
 
-    let link = link_site(path);
-    let wd = ensure_watch(inotify, masks, &link.dir, link_mask)?;
+    let link_dir = watch_dir(path);
+    let wd = ensure_watch(inotify, masks, &link_dir, link_mask)?;
     entries.push(Entry {
         target,
         site: Site::Link,
-        dir: link.dir,
-        name: link.name,
+        path: path.to_path_buf(),
         wd,
     });
 
     match target_site(path) {
-        Ok(Some(site)) => {
-            let wd = ensure_watch(inotify, masks, &site.dir, target_mask)?;
+        TargetSite::Watch(target_path) => {
+            let dir = watch_dir(&target_path);
+            let wd = ensure_watch(inotify, masks, &dir, target_mask)?;
             info!(
                 "{} {} is a symlink; also watching its target directory {}",
                 target.label(),
                 path.display(),
-                site.dir.display()
+                dir.display()
             );
             entries.push(Entry {
                 target,
                 site: Site::Target,
-                dir: site.dir,
-                name: site.name,
+                path: target_path,
                 wd,
             });
         }
-        Ok(None) => {}
-        Err(intended) => warn!(
+        TargetSite::NotSymlink => {}
+        TargetSite::Broken(intended) => warn!(
             "{} {} is a broken symlink (target {} has no directory to watch); \
              it will be picked up if the link is repaired",
             target.label(),
@@ -270,9 +270,10 @@ fn reconcile_target(
     target: Target,
     path: &Path,
 ) {
-    let desired = match target_site(path) {
-        Ok(opt) => opt,
-        Err(intended) => {
+    let desired: Option<PathBuf> = match target_site(path) {
+        TargetSite::NotSymlink => None,
+        TargetSite::Watch(target_path) => Some(target_path),
+        TargetSite::Broken(intended) => {
             warn!(
                 "{} {} is now a broken symlink (target {} has no directory to watch)",
                 target.label(),
@@ -286,28 +287,27 @@ fn reconcile_target(
     let pos = entries
         .iter()
         .position(|e| e.target == target && e.site == Site::Target);
-    let current = pos.map(|i| (entries[i].dir.clone(), entries[i].name.clone()));
-    let want = desired.as_ref().map(|s| (s.dir.clone(), s.name.clone()));
-    if current == want {
+    let current = pos.map(|i| entries[i].path.clone());
+    if current == desired {
         return;
     }
 
     let old = pos.map(|i| entries.remove(i));
-    if let Some(site) = desired {
+    if let Some(target_path) = desired {
+        let dir = watch_dir(&target_path);
         let target_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
-        match ensure_watch(inotify, masks, &site.dir, target_mask) {
+        match ensure_watch(inotify, masks, &dir, target_mask) {
             Ok(wd) => {
                 info!(
                     "{} {} symlink target changed; now watching {}",
                     target.label(),
                     path.display(),
-                    site.dir.display()
+                    dir.display()
                 );
                 entries.push(Entry {
                     target,
                     site: Site::Target,
-                    dir: site.dir,
-                    name: site.name,
+                    path: target_path,
                     wd,
                 });
             }
@@ -323,10 +323,13 @@ fn reconcile_target(
         // auto-removes the watch via IN_IGNORED); log anything else at debug
         // so an unexpected failure (a watch-bookkeeping smell) stays greppable.
         if !entries.iter().any(|e| e.wd == old.wd) {
+            // Drop the directory's mask bookkeeping too, so `masks` doesn't grow
+            // unbounded as a symlink is repointed across directories over time.
+            masks.remove(&watch_dir(&old.path));
             if let Err(e) = inotify.watches().remove(old.wd) {
                 debug!(
                     "removing the stale watch for {} failed ({e}); likely already auto-removed",
-                    old.dir.display()
+                    old.path.display()
                 );
             }
         }
@@ -351,11 +354,17 @@ fn run(
     let mut inotify = Inotify::init().context("initializing inotify")?;
 
     // Per-directory registered mask (so re-adding a dir registers the union)
-    // and the table of (dir, name) → which file/site, matched against events.
+    // and the table of (wd, name) → which file/site, matched against events.
     let mut masks: HashMap<PathBuf, WatchMask> = HashMap::new();
     let mut entries: Vec<Entry> = Vec::new();
 
-    add_file_watches(&mut inotify, &mut masks, &mut entries, Target::Config, config_path)?;
+    add_file_watches(
+        &mut inotify,
+        &mut masks,
+        &mut entries,
+        Target::Config,
+        config_path,
+    )?;
     if let Some(rp) = rules_path {
         add_file_watches(&mut inotify, &mut masks, &mut entries, Target::Rules, rp)?;
     }
@@ -387,7 +396,7 @@ fn run(
             }
             let Some(name) = event.name else { continue };
             for entry in &entries {
-                if entry.wd != event.wd || entry.name.as_os_str() != name {
+                if !entry.matches(&event.wd, name) {
                     continue;
                 }
                 let is_write = event
@@ -400,9 +409,8 @@ fn run(
                 // `entry.site`): a just-created symlink was registered as a
                 // Link-site regular-file watch, so its symlink-ness is only
                 // knowable now — don't "simplify" this to `entry.site`.
-                let act = is_write
-                    || (event.mask.contains(EventMask::CREATE)
-                        && is_symlink(&entry.dir.join(&entry.name)));
+                let act =
+                    is_write || (event.mask.contains(EventMask::CREATE) && is_symlink(&entry.path));
                 if !act {
                     continue;
                 }
@@ -422,7 +430,13 @@ fn run(
         }
 
         if reresolve_config {
-            reconcile_target(&mut inotify, &mut masks, &mut entries, Target::Config, config_path);
+            reconcile_target(
+                &mut inotify,
+                &mut masks,
+                &mut entries,
+                Target::Config,
+                config_path,
+            );
         }
         if reresolve_rules {
             if let Some(rp) = rules_path {
@@ -543,9 +557,11 @@ mod tests {
         std::fs::write(real_dir.join("mimetypes"), "x").unwrap();
         let link = dir.path().join("mimetypes");
         std::os::unix::fs::symlink(real_dir.join("mimetypes"), &link).unwrap();
-        let site = target_site(&link).unwrap().expect("a symlink yields a target site");
-        assert_eq!(site.dir, real_dir);
-        assert_eq!(site.name, std::ffi::OsStr::new("mimetypes"));
+        let TargetSite::Watch(p) = target_site(&link) else {
+            panic!("a symlink yields a watchable target site");
+        };
+        assert_eq!(watch_dir(&p), real_dir);
+        assert_eq!(p.file_name(), Some(std::ffi::OsStr::new("mimetypes")));
     }
 
     #[test]
@@ -556,24 +572,31 @@ mod tests {
         // Target file does NOT exist yet, but its directory does.
         let link = dir.path().join("config.toml");
         std::os::unix::fs::symlink(real_dir.join("config.toml"), &link).unwrap();
-        let site = target_site(&link).unwrap().expect("dir exists → watch it");
-        assert_eq!(site.dir, real_dir);
+        let TargetSite::Watch(p) = target_site(&link) else {
+            panic!("dir exists → expected a watchable target site");
+        };
+        assert_eq!(watch_dir(&p), real_dir);
     }
 
     #[test]
-    fn target_site_is_none_for_a_regular_file() {
+    fn target_site_is_notsymlink_for_a_regular_file() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("config.toml");
         std::fs::write(&f, "x").unwrap();
-        assert!(target_site(&f).unwrap().is_none());
+        assert!(matches!(target_site(&f), TargetSite::NotSymlink));
     }
 
     #[test]
-    fn target_site_errors_when_the_target_dir_is_missing() {
+    fn target_site_is_broken_when_the_target_dir_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("config.toml");
-        std::os::unix::fs::symlink(dir.path().join("nope/config.toml"), &link).unwrap();
-        assert!(target_site(&link).is_err());
+        let missing = dir.path().join("nope/config.toml");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        // Broken carries the resolved intended target, used for the warning log.
+        let TargetSite::Broken(intended) = target_site(&link) else {
+            panic!("a symlink whose target dir is missing must be Broken");
+        };
+        assert_eq!(intended, missing);
     }
 
     #[test]
