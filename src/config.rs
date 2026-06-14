@@ -163,8 +163,22 @@ fn with_default_port(addr: &str, default_port: &str) -> String {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if path_is_symlink(path) => {
+                let target = fs::read_link(path)
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                bail!(
+                    "config {} is a symlink to {}, which can't be read ({e})",
+                    path.display(),
+                    target
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading config {}", path.display()));
+            }
+        };
         let mut cfg = Config::from_toml(&text)?;
         // Default the rules file to live beside the config (e.g.
         // ~/.config/clipmesh/mimetypes) unless the user set an explicit path.
@@ -259,10 +273,29 @@ impl Config {
     }
 }
 
+/// True if `path` is a symlink. After a failed read this means the link is
+/// dangling — its target is missing or unreadable.
+fn path_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn load_reports_a_broken_config_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).unwrap();
+        let err = Config::load(&link).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("symlink"), "message should mention the symlink: {msg}");
+        assert!(msg.contains("missing.toml"), "message should name the target: {msg}");
+    }
 
     #[test]
     fn zero_max_payload_size_is_rejected() {

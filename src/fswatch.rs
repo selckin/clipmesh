@@ -10,12 +10,121 @@
 use crate::config::Config;
 use crate::mime::MimeRules;
 use anyhow::{Context, Result};
-use inotify::{EventMask, Inotify, WatchMask};
+use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Which watched file an event pertains to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Config,
+    Rules,
+}
+
+impl Target {
+    fn label(self) -> &'static str {
+        match self {
+            Target::Config => "config file",
+            Target::Rules => "MIME-rules file",
+        }
+    }
+}
+
+/// Where a watch sits: the path itself (`Link`) or the resolved symlink
+/// target (`Target`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Site {
+    Link,
+    Target,
+}
+
+/// A directory plus the file name to match within it.
+struct SitePath {
+    dir: PathBuf,
+    name: OsString,
+}
+
+/// One registered watch: the `(dir, name)` events are matched against, tagged
+/// with which file and site it represents, plus its inotify descriptor.
+struct Entry {
+    target: Target,
+    site: Site,
+    dir: PathBuf,
+    name: OsString,
+    wd: WatchDescriptor,
+}
+
+/// True if `path` is itself a symlink (does not follow it). A genuinely-absent
+/// path is simply "not a symlink"; any *other* stat failure (EACCES, EIO, ...)
+/// is also treated as non-symlink but logged, so a transient fault that hides a
+/// real symlink (and thus skips its target watch) leaves a greppable trace
+/// rather than vanishing silently.
+fn is_symlink(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_symlink(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            debug!("can't lstat {} ({e}); treating it as a non-symlink", path.display());
+            false
+        }
+    }
+}
+
+/// The link site for a path: its own parent directory and file name — exactly
+/// what the watcher has always watched.
+fn link_site(path: &Path) -> SitePath {
+    SitePath {
+        dir: watch_dir(path),
+        name: path.file_name().unwrap_or_default().to_os_string(),
+    }
+}
+
+/// Follow a symlink to the file it ultimately names, resolving each relative
+/// hop against the directory of the link being followed (stow's default links
+/// are relative). Stops at the first non-symlink or unreadable component and
+/// returns the deepest path reached, which may or may not exist.
+fn resolve_link_target(path: &Path) -> PathBuf {
+    const MAX_HOPS: usize = 8;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        match fs::read_link(&current) {
+            Ok(target) if target.is_absolute() => current = target,
+            Ok(target) => {
+                let base = current.parent().unwrap_or_else(|| Path::new("."));
+                current = base.join(target);
+            }
+            Err(_) => break,
+        }
+    }
+    current
+}
+
+/// The target site for a path:
+/// - `Ok(None)` when it is not a symlink,
+/// - `Ok(Some(site))` when it is a symlink whose target *directory* exists
+///   (watch that directory even if the file itself is currently absent),
+/// - `Err(intended)` when the resolved target has no directory to watch.
+fn target_site(path: &Path) -> std::result::Result<Option<SitePath>, PathBuf> {
+    if !is_symlink(path) {
+        return Ok(None);
+    }
+    let resolved = resolve_link_target(path);
+    let dir = watch_dir(&resolved);
+    if dir.is_dir() {
+        Ok(Some(SitePath {
+            dir,
+            name: resolved.file_name().unwrap_or_default().to_os_string(),
+        }))
+    } else {
+        Err(resolved)
+    }
+}
 
 /// Spawn the watcher thread. A failure to set it up isn't fatal — the daemon
 /// keeps running, just without auto-reload/restart until the watcher recovers.
@@ -80,8 +189,158 @@ fn watch_forever(
     }
 }
 
+/// Add (or widen) the watch on `dir` to include `mask`, registering the UNION
+/// of every mask requested for it — `inotify_add_watch` replaces rather than
+/// ORs a mask, and one directory can host several files. Returns its descriptor.
+fn ensure_watch(
+    inotify: &mut Inotify,
+    masks: &mut HashMap<PathBuf, WatchMask>,
+    dir: &Path,
+    mask: WatchMask,
+) -> Result<WatchDescriptor> {
+    let merged = masks.entry(dir.to_path_buf()).or_insert_with(WatchMask::empty);
+    *merged |= mask;
+    inotify
+        .watches()
+        .add(dir, *merged)
+        .with_context(|| format!("watching {}", dir.display()))
+}
+
+/// Register the link-site watch (always) and, for a symlink, the target-site
+/// watch for one file. A broken symlink logs and adds no target watch.
+fn add_file_watches(
+    inotify: &mut Inotify,
+    masks: &mut HashMap<PathBuf, WatchMask>,
+    entries: &mut Vec<Entry>,
+    target: Target,
+    path: &Path,
+) -> Result<()> {
+    // CREATE is needed at the link site to notice a symlink created by
+    // symlink(2) (e.g. stow's `ln -sf`), which emits no CLOSE_WRITE/MOVED_TO.
+    let link_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE;
+    let target_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
+
+    let link = link_site(path);
+    let wd = ensure_watch(inotify, masks, &link.dir, link_mask)?;
+    entries.push(Entry {
+        target,
+        site: Site::Link,
+        dir: link.dir,
+        name: link.name,
+        wd,
+    });
+
+    match target_site(path) {
+        Ok(Some(site)) => {
+            let wd = ensure_watch(inotify, masks, &site.dir, target_mask)?;
+            info!(
+                "{} {} is a symlink; also watching its target directory {}",
+                target.label(),
+                path.display(),
+                site.dir.display()
+            );
+            entries.push(Entry {
+                target,
+                site: Site::Target,
+                dir: site.dir,
+                name: site.name,
+                wd,
+            });
+        }
+        Ok(None) => {}
+        Err(intended) => warn!(
+            "{} {} is a broken symlink (target {} has no directory to watch); \
+             it will be picked up if the link is repaired",
+            target.label(),
+            path.display(),
+            intended.display()
+        ),
+    }
+    Ok(())
+}
+
+/// Re-resolve a file's target site after its link fired (the symlink may have
+/// been (re)created or repointed) and update the target-site entry to match:
+/// add the new directory's watch, drop the old entry, and remove the old kernel
+/// watch when nothing else references it.
+fn reconcile_target(
+    inotify: &mut Inotify,
+    masks: &mut HashMap<PathBuf, WatchMask>,
+    entries: &mut Vec<Entry>,
+    target: Target,
+    path: &Path,
+) {
+    let desired = match target_site(path) {
+        Ok(opt) => opt,
+        Err(intended) => {
+            warn!(
+                "{} {} is now a broken symlink (target {} has no directory to watch)",
+                target.label(),
+                path.display(),
+                intended.display()
+            );
+            None
+        }
+    };
+
+    let pos = entries
+        .iter()
+        .position(|e| e.target == target && e.site == Site::Target);
+    let current = pos.map(|i| (entries[i].dir.clone(), entries[i].name.clone()));
+    let want = desired.as_ref().map(|s| (s.dir.clone(), s.name.clone()));
+    if current == want {
+        return;
+    }
+
+    let old = pos.map(|i| entries.remove(i));
+    if let Some(site) = desired {
+        let target_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
+        match ensure_watch(inotify, masks, &site.dir, target_mask) {
+            Ok(wd) => {
+                info!(
+                    "{} {} symlink target changed; now watching {}",
+                    target.label(),
+                    path.display(),
+                    site.dir.display()
+                );
+                entries.push(Entry {
+                    target,
+                    site: Site::Target,
+                    dir: site.dir,
+                    name: site.name,
+                    wd,
+                });
+            }
+            Err(e) => warn!(
+                "couldn't watch the new symlink target directory for {}: {e:#}",
+                path.display()
+            ),
+        }
+    }
+    if let Some(old) = old {
+        // Remove the old kernel watch only if no remaining entry uses it.
+        // EINVAL is expected when the directory was deleted (the kernel
+        // auto-removes the watch via IN_IGNORED); log anything else at debug
+        // so an unexpected failure (a watch-bookkeeping smell) stays greppable.
+        if !entries.iter().any(|e| e.wd == old.wd) {
+            if let Err(e) = inotify.watches().remove(old.wd) {
+                debug!(
+                    "removing the stale watch for {} failed ({e}); likely already auto-removed",
+                    old.dir.display()
+                );
+            }
+        }
+    }
+}
+
 /// The inotify loop. Calls `on_config_change` when the config file changes and
 /// reloads `rules` when the rules file changes. Returns only on error.
+///
+/// Each watched file is followed through a symlink: the link's own directory
+/// AND (for a symlink) the resolved target's directory are watched, and events
+/// are matched against a `(wd, name)` table. A bare CREATE only drives a read
+/// when the entry is a symlink — a regular file's CREATE fires before its
+/// contents are written.
 fn run(
     config_path: &Path,
     rules_path: Option<&Path>,
@@ -91,29 +350,14 @@ fn run(
 ) -> Result<()> {
     let mut inotify = Inotify::init().context("initializing inotify")?;
 
-    let config_name = config_path.file_name();
-    let rules_name = rules_path.and_then(Path::file_name);
+    // Per-directory registered mask (so re-adding a dir registers the union)
+    // and the table of (dir, name) → which file/site, matched against events.
+    let mut masks: HashMap<PathBuf, WatchMask> = HashMap::new();
+    let mut entries: Vec<Entry> = Vec::new();
 
-    // Watch each distinct parent directory (commonly just one — both files
-    // live in ~/.config/clipmesh).
-    let mut dirs: Vec<PathBuf> = vec![watch_dir(config_path)];
+    add_file_watches(&mut inotify, &mut masks, &mut entries, Target::Config, config_path)?;
     if let Some(rp) = rules_path {
-        let d = watch_dir(rp);
-        if !dirs.contains(&d) {
-            dirs.push(d);
-        }
-    }
-    // Trigger only on events that signal a COMPLETE write: CLOSE_WRITE (in-place
-    // edits) and MOVED_TO (atomic temp-file-rename saves). Deliberately NOT
-    // CREATE: it fires the instant a file is created — before the editor has
-    // written its contents — so reacting to it reads an empty/partial file. A
-    // freshly-created file still fires CLOSE_WRITE once the editor closes it.
-    let mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
-    for dir in &dirs {
-        inotify
-            .watches()
-            .add(dir, mask)
-            .with_context(|| format!("watching {}", dir.display()))?;
+        add_file_watches(&mut inotify, &mut masks, &mut entries, Target::Rules, rp)?;
     }
     info!("watching config and MIME-rule files for changes");
 
@@ -126,24 +370,66 @@ fn run(
             .context("reading inotify events")?;
         let mut config_changed = false;
         let mut rules_changed = false;
+        let mut reresolve_config = false;
+        let mut reresolve_rules = false;
+
         for event in events {
             if event.mask.contains(EventMask::Q_OVERFLOW) {
-                // The kernel dropped events under load; we don't know what we
-                // missed, so re-check both files. The rules reload is cheap and
-                // idempotent, and the config check only restarts if the file's
-                // contents actually changed (so this can't spuriously restart).
+                // The kernel dropped events under load; re-check (and re-resolve)
+                // both files. The rules reload is idempotent and the config check
+                // only restarts on a real, parseable content change.
                 warn!("inotify event queue overflowed; re-checking config and MIME rules");
-                rules_changed = true;
                 config_changed = true;
+                rules_changed = true;
+                reresolve_config = true;
+                reresolve_rules = true;
                 continue;
             }
             let Some(name) = event.name else { continue };
-            if Some(name) == config_name {
-                config_changed = true;
-            } else if rules_name.is_some() && Some(name) == rules_name {
-                rules_changed = true;
+            for entry in &entries {
+                if entry.wd != event.wd || entry.name.as_os_str() != name {
+                    continue;
+                }
+                let is_write = event
+                    .mask
+                    .intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO);
+                // A complete write drives a read. A bare CREATE only matters when
+                // the entry is a symlink — a regular file's CREATE fires before
+                // its contents are written, so reading it would see an empty or
+                // partial file. `is_symlink` re-stats the path live (not
+                // `entry.site`): a just-created symlink was registered as a
+                // Link-site regular-file watch, so its symlink-ness is only
+                // knowable now — don't "simplify" this to `entry.site`.
+                let act = is_write
+                    || (event.mask.contains(EventMask::CREATE)
+                        && is_symlink(&entry.dir.join(&entry.name)));
+                if !act {
+                    continue;
+                }
+                match entry.target {
+                    Target::Config => config_changed = true,
+                    Target::Rules => rules_changed = true,
+                }
+                // A change at the link site may mean the symlink itself was
+                // (re)created/repointed; re-resolve its target watch below.
+                if entry.site == Site::Link {
+                    match entry.target {
+                        Target::Config => reresolve_config = true,
+                        Target::Rules => reresolve_rules = true,
+                    }
+                }
             }
         }
+
+        if reresolve_config {
+            reconcile_target(&mut inotify, &mut masks, &mut entries, Target::Config, config_path);
+        }
+        if reresolve_rules {
+            if let Some(rp) = rules_path {
+                reconcile_target(&mut inotify, &mut masks, &mut entries, Target::Rules, rp);
+            }
+        }
+
         // Reload rules before (possibly) restarting on a config change, so a
         // simultaneous edit to both still takes effect.
         if rules_changed {
@@ -235,6 +521,306 @@ mod tests {
     use super::*;
     use crate::config::MimePolicy;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn resolve_link_target_follows_a_relative_symlink_against_its_own_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real = real_dir.join("config.toml");
+        std::fs::write(&real, "x").unwrap();
+        // Relative link, like GNU Stow: config.toml -> dotfiles/config.toml
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/config.toml", &link).unwrap();
+        assert_eq!(resolve_link_target(&link), real);
+    }
+
+    #[test]
+    fn target_site_resolves_a_symlinked_file_to_its_real_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("mimetypes"), "x").unwrap();
+        let link = dir.path().join("mimetypes");
+        std::os::unix::fs::symlink(real_dir.join("mimetypes"), &link).unwrap();
+        let site = target_site(&link).unwrap().expect("a symlink yields a target site");
+        assert_eq!(site.dir, real_dir);
+        assert_eq!(site.name, std::ffi::OsStr::new("mimetypes"));
+    }
+
+    #[test]
+    fn target_site_watches_an_existing_dir_even_when_the_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir(&real_dir).unwrap();
+        // Target file does NOT exist yet, but its directory does.
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(real_dir.join("config.toml"), &link).unwrap();
+        let site = target_site(&link).unwrap().expect("dir exists → watch it");
+        assert_eq!(site.dir, real_dir);
+    }
+
+    #[test]
+    fn target_site_is_none_for_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("config.toml");
+        std::fs::write(&f, "x").unwrap();
+        assert!(target_site(&f).unwrap().is_none());
+    }
+
+    #[test]
+    fn target_site_errors_when_the_target_dir_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(dir.path().join("nope/config.toml"), &link).unwrap();
+        assert!(target_site(&link).is_err());
+    }
+
+    #[test]
+    fn editing_a_symlinked_rules_target_pings_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+
+        // The real rules file lives in a separate dir; a symlink points to it.
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let real_rules = dotfiles.join("mimetypes");
+        std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
+        let rules_link = dir.path().join("mimetypes");
+        std::os::unix::fs::symlink(&real_rules, &rules_link).unwrap();
+
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(rules_link.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let rules_w = rules.clone();
+        let cfg_w = config_path.clone();
+        let link_w = rules_link.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&cfg_w, Some(&link_w), &rules_w, &mut noop, &tx_w);
+        });
+
+        // Edit the REAL file (in the dotfiles dir), not the symlink path.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
+            if rx.try_recv().is_ok() {
+                return; // ping received — the symlink target dir is watched
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("editing the symlink target did not ping the engine");
+    }
+
+    #[test]
+    fn a_bare_create_of_a_regular_rules_file_does_not_ping_until_written() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+        let rules_path = dir.path().join("mimetypes");
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(rules_path.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let rules_w = rules.clone();
+        let cfg_w = config_path.clone();
+        let rp_w = rules_path.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&cfg_w, Some(&rp_w), &rules_w, &mut noop, &tx_w);
+        });
+
+        // 1. Establish the watch is live: rewrite until a ping lands, then drain.
+        let live = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < live, "watcher never went live");
+            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        while rx.try_recv().is_ok() {}
+
+        // 2. Delete, then create-and-HOLD: a bare CREATE with no close yet.
+        std::fs::remove_file(&rules_path).unwrap();
+        let mut f = std::fs::File::create(&rules_path).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            rx.try_recv().is_err(),
+            "a bare CREATE of a regular file must not ping (empty-file guard)"
+        );
+
+        // 3. Write content + close → CLOSE_WRITE must ping.
+        write!(f, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
+        drop(f);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if rx.try_recv().is_ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the CLOSE_WRITE after writing content should have pinged");
+    }
+
+    #[test]
+    fn repointing_the_rules_symlink_follows_to_the_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+
+        let a_dir = dir.path().join("a");
+        let b_dir = dir.path().join("b");
+        std::fs::create_dir(&a_dir).unwrap();
+        std::fs::create_dir(&b_dir).unwrap();
+        let a = a_dir.join("mimetypes");
+        let b = b_dir.join("mimetypes");
+        std::fs::write(&a, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
+        std::fs::write(&b, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
+
+        let link = dir.path().join("mimetypes");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(link.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let rules_w = rules.clone();
+        let cfg_w = config_path.clone();
+        let link_w = link.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&cfg_w, Some(&link_w), &rules_w, &mut noop, &tx_w);
+        });
+
+        // Let the watch go live on A (edit A until a ping lands), then drain.
+        let live = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < live, "watcher never went live on A");
+            std::fs::write(&a, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Repoint the symlink to B (ln -sf = unlink + symlink → CREATE at link site).
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        thread::sleep(Duration::from_millis(300)); // let reconcile + repoint reload settle
+        while rx.try_recv().is_ok() {}
+
+        // Now edits to B must ping — only possible if B's dir is being watched.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            std::fs::write(&b, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
+            if rx.try_recv().is_ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("edits to the repointed target B were not picked up");
+    }
+
+    #[test]
+    fn editing_a_symlinked_config_target_triggers_on_config_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+
+        // The real config lives in a separate dir; a symlink points to it.
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let real_config = dotfiles.join("config.toml");
+        std::fs::write(&real_config, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+        let config_link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real_config, &config_link).unwrap();
+
+        // No rules file — keep the test focused on the config path.
+        let rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Deny)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        // The real daemon would exit(0) here; the test signals instead so it can
+        // assert the config change was actually observed through the symlink.
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_w = fired.clone();
+        let rules_w = rules.clone();
+        let link_w = config_link.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut on_change = move || fired_w.store(true, Ordering::SeqCst);
+            let _ = run(&link_w, None, &rules_w, &mut on_change, &tx_w);
+        });
+
+        // Edit the REAL config file (in the dotfiles dir), not the symlink path.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            std::fs::write(&real_config, "listen = \"y\"\npsk = \"s\"\n").unwrap();
+            if fired.load(Ordering::SeqCst) {
+                return; // on_config_change fired — the config symlink target is watched
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("editing the symlinked config target did not trigger on_config_change");
+    }
+
+    #[test]
+    fn a_repaired_broken_rules_symlink_is_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+
+        // The symlink points into a dotfiles dir that does NOT exist yet, so it
+        // is broken at startup: load() reads an empty ruleset and the watcher
+        // adds no target entry (only the link site).
+        let dotfiles = dir.path().join("dotfiles");
+        let real_rules = dotfiles.join("mimetypes");
+        let link = dir.path().join("mimetypes");
+        std::os::unix::fs::symlink(&real_rules, &link).unwrap();
+
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(link.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let rules_w = rules.clone();
+        let cfg_w = config_path.clone();
+        let link_w = link.clone();
+        let tx_w = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&cfg_w, Some(&link_w), &rules_w, &mut noop, &tx_w);
+        });
+
+        // Repair: create the target's dir + file, then re-point the link in a
+        // retry loop. Each re-point (unlink + symlink) fires a link-site CREATE
+        // that re-resolves the now-watchable target (the `pos == None` branch of
+        // reconcile_target, adding the first target entry) and reloads the rules.
+        std::fs::create_dir(&dotfiles).unwrap();
+        std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&real_rules, &link).unwrap();
+            if rx.try_recv().is_ok() {
+                return; // re-resolved + reloaded after repair — self-heal works
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the repaired broken symlink was not picked up");
+    }
 
     #[test]
     fn watch_dir_uses_the_parent_or_falls_back_to_dot() {

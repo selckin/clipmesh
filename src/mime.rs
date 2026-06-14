@@ -154,7 +154,19 @@ impl MimeRules {
                     true
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if path_is_symlink(&path) {
+                    warn!(
+                        "MIME-rules file {} is a symlink whose target is missing; \
+                         starting from an empty ruleset, then writing a fresh skeleton \
+                         through the link (which recreates the target if its directory \
+                         exists)",
+                        path.display()
+                    );
+                }
+                let _ = e; // a missing file isn't itself an error here
+                true
+            }
             Err(e) => {
                 warn!("couldn't read MIME rules from {}: {e}", path.display());
                 false
@@ -745,12 +757,37 @@ fn warn_invalid_rules(doc: &DocumentMut, path: &Path) {
     }
 }
 
+/// True if `path` is a symlink. Combined with a NotFound read, the link is
+/// dangling (its target doesn't exist).
+fn path_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(x: &str) -> String {
         x.to_string()
+    }
+
+    #[test]
+    fn a_broken_rules_symlink_loads_empty_and_materializes_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-mimetypes"); // does not exist yet
+        let link = dir.path().join("mimetypes");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let rules = MimeRules::load(Some(link.clone()), MimePolicy::Deny);
+        // Deny-by-default empty ruleset, and the fresh skeleton is written
+        // through the (previously broken) symlink, creating the target.
+        assert!(!rules.allows("image/png", 1));
+        assert!(
+            target.exists(),
+            "a fresh skeleton should be materialized at the symlink target"
+        );
     }
 
     fn write(path: &Path, contents: &str) {
