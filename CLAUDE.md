@@ -1,0 +1,50 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+clipmesh is a Rust daemon that syncs Wayland clipboards across a LAN mesh of hosts over Noise-encrypted TCP. Copy on one host, paste on all. See `README.md` for user-facing behavior and configuration.
+
+## Commands
+
+```bash
+cargo build                 # debug build
+cargo build --release       # release build (CI gate)
+cargo test                  # all tests (lib unit tests + tests/two_nodes.rs)
+cargo test --lib fswatch    # one module's tests
+cargo test --lib config::tests::load_reports_a_broken_config_symlink   # one test
+cargo test --test two_nodes # the integration test only
+cargo clippy --all-targets -- -D warnings   # lint (CI gate; warnings are errors)
+cargo fmt --check           # format check (CI gate)
+cargo run -- --config ./examples/config.toml   # run the daemon
+```
+
+MSRV is Rust 1.80 (`Cargo.toml` `rust-version`). The binary is normally the long-running daemon, but a few flags are one-shot and exit: `--allow <glob>`, `--deny <glob>`, `--rules` (edit/inspect the MIME-rules file), plus `--config <path>`.
+
+Running the **real** clipboard backend needs a live Wayland compositor implementing `ext-data-control-v1`/`zwlr-data-control-v1`. All automated tests use the mock clipboard instead, so they run headless in CI; the Wayland path is verified manually.
+
+## Architecture
+
+A node is assembled in `node::spawn_node` (called from `main`): it binds a listener + accept loop (bounded by a `Semaphore`), spawns one `dial_loop` per configured peer, builds the shared `MimeRules`, and starts the `SyncEngine`. Peers form a **full mesh** — every node dials every other; clipmesh never forwards between peers, so each node must list all others directly.
+
+The stack, bottom to top:
+
+- **`transport.rs`** — Noise `NNpsk0` (`Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`) keyed by the preshared key. `handshake` splits a stream into `SendHalf`/`RecvHalf` sharing a *stateless* transport (independent per-direction nonces) so the two halves run in separate tasks. Records are chunked to Noise's 64 KiB cap.
+- **`protocol.rs`** — wire messages `Message::{Hello, Clip, Rules}`, encoded with **bincode**. `Offer = BTreeMap<String, Vec<u8>>` (one clipboard state's MIME representations; sorted keys make `content_hash` (BLAKE3) deterministic).
+- **`peer.rs`** — `run_connection`: Noise handshake + `Hello` exchange (checks `PROTOCOL_VERSION` and rejects a self-connection via the `SelfConnection` marker error, which dial loops treat as permanent), then reader/writer tasks. `AbortGuard` tears the connection's child tasks down on cancel.
+- **`mesh.rs`** — `Mesh`: live peer table keyed by remote node ID. Duplicate connections to one peer are expected (both nodes dial each other); index 0 of each peer's group is the designated sender, the rest are receive-only warm standbys. First connection to a peer fires `connect_tx`, which the engine turns into a resync.
+- **`sync.rs`** — `SyncEngine`, the brain. Its `run` loop selects over the local clipboard watch, inbound mesh messages, peer-connect events, and rules-changed pings. Handles echo suppression (compare incoming vs. current hash per selection), debounce, `Direction` (send/receive/both), payload caps, and content filtering. **Ordering everywhere — live updates and reconnect resync alike — is the hybrid logical clock `(stamp, origin)`** (`ContentState`); higher stamp wins, `origin` (node ID) breaks ties. Password-manager contents (`x-kde-passwordManagerHint = secret`) are dropped before broadcast.
+- **`clipboard/`** — the `Clipboard` trait (`watch`/`read_offer`/`write_offer`). `wayland.rs` is the real in-process backend; `watch.rs` is its change listener (runs on a dedicated thread because Wayland dispatch blocks); `mock.rs` backs every test.
+- **`mime.rs`** — `MimeRules`: a **program-managed** TOML file (via `toml_edit`). Per-type allow/deny with case-insensitive globs (most-specific match wins, deny-by-default). clipmesh auto-appends unknown types, sorts on save, and stamps a `[clipmesh]` version table so the file can be shared mesh-wide under whole-file last-writer-wins (`share_mime_rules`). `reload_if_changed` compares **content, not mtime**, so clipmesh's own writes don't trigger a reload→rebroadcast loop.
+- **`config.rs` / `fswatch.rs`** — `Config::load` parses TOML and defaults `mime_rules_path` to sit beside the config. `fswatch` is an inotify watcher (dedicated thread) over both files, and is symlink-aware (follows a symlinked config/rules file to its real target). A **config** change makes the process exit cleanly so a supervisor restarts it (most settings can't hot-apply — this requires the systemd unit or any restart-on-exit supervisor); a **rules** change reloads in place.
+- **`backoff.rs`** — the shared exponential-backoff-with-jitter helper used by the dial loop, the fswatch reconnect loop, and the clipboard-watch reconnect.
+
+### Cross-cutting invariants
+
+- **bincode is not self-describing.** Any change to `Message` or its fields must bump `protocol::PROTOCOL_VERSION`; mismatched nodes are refused at handshake rather than failing to decode later.
+- **tokio async** carries networking and the engine; **blocking work runs on dedicated `std::thread`s** (inotify in `fswatch`, Wayland dispatch in `clipboard::watch`) and reports back over mpsc channels.
+- Shared state crosses the async/thread boundary as `Arc<Mutex<...>>` (e.g. `MimeRules` is shared between `SyncEngine` and `fswatch`).
+
+## Conventions
+
+- This repo uses a spec → plan → implementation workflow; design docs live under `docs/superpowers/specs/` and `docs/superpowers/plans/` (dated, one per feature). Read the matching spec before changing a subsystem it covers.
+- CI (`.github/workflows/`) uses only first-party `actions/*` and installs the toolchain via plain `rustup` — do not introduce third-party GitHub Actions.
