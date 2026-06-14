@@ -30,15 +30,16 @@ use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1:
 
 /// Spawn the watcher on a dedicated OS thread (wayland-client's
 /// `blocking_dispatch` is blocking, so it can't live on the tokio runtime).
-/// A single connection observes both the regular and primary selections.
-pub fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) {
-    thread::spawn(move || run(tx, sync_primary));
+/// A single connection handles both the regular and primary selections;
+/// PRIMARY events are forwarded to `tx` only when `watch_primary` is true.
+pub fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, watch_primary: bool) {
+    thread::spawn(move || run(tx, watch_primary));
 }
 
 /// Reconnect loop: the same backoff the old subprocess watcher used, so a
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
-fn run(tx: mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) {
+fn run(tx: mpsc::UnboundedSender<SelectionKind>, watch_primary: bool) {
     const RESTART_MIN: Duration = Duration::from_secs(1);
     const RESTART_MAX: Duration = Duration::from_secs(30);
     /// A run shorter than this counts as a failure and escalates backoff.
@@ -47,7 +48,7 @@ fn run(tx: mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) {
     let mut delay = RESTART_MIN;
     loop {
         let started = Instant::now();
-        match watch_once(&tx, sync_primary) {
+        match watch_once(&tx, watch_primary) {
             Ok(StopReason::ReceiverGone) => return, // engine gone; stop watching
             Ok(StopReason::Finished) => {
                 warn!("compositor closed the clipboard watcher; reconnecting")
@@ -76,7 +77,10 @@ enum StopReason {
     Finished,
 }
 
-fn watch_once(tx: &mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) -> Result<StopReason> {
+fn watch_once(
+    tx: &mpsc::UnboundedSender<SelectionKind>,
+    watch_primary: bool,
+) -> Result<StopReason> {
     let conn = Connection::connect_to_env().context("connecting to the Wayland display")?;
     let (globals, mut queue) =
         registry_queue_init::<State>(&conn).context("initializing the Wayland registry")?;
@@ -118,7 +122,7 @@ fn watch_once(tx: &mpsc::UnboundedSender<SelectionKind>, sync_primary: bool) -> 
 
     let mut state = State {
         tx: tx.clone(),
-        sync_primary,
+        watch_primary,
         dead: false,
         finished: false,
     };
@@ -155,14 +159,14 @@ enum Device {
 
 struct State {
     tx: mpsc::UnboundedSender<SelectionKind>,
-    sync_primary: bool,
+    watch_primary: bool,
     dead: bool,
     finished: bool,
 }
 
 impl State {
     fn notify(&mut self, kind: SelectionKind) {
-        if kind == SelectionKind::Primary && !self.sync_primary {
+        if kind == SelectionKind::Primary && !self.watch_primary {
             return;
         }
         if self.tx.send(kind).is_err() {

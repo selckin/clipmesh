@@ -14,6 +14,7 @@ pub struct MockClipboard {
     watchers: Mutex<Vec<mpsc::UnboundedSender<SelectionKind>>>,
     writes: AtomicUsize,
     fail_writes: std::sync::atomic::AtomicBool,
+    fail_reads: std::sync::atomic::AtomicBool,
 }
 
 impl MockClipboard {
@@ -24,6 +25,7 @@ impl MockClipboard {
             watchers: Mutex::new(Vec::new()),
             writes: AtomicUsize::new(0),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            fail_reads: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -31,6 +33,11 @@ impl MockClipboard {
     /// compositor errors).
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Make subsequent read_offer calls fail (simulates a transient read error).
+    pub fn set_fail_reads(&self, fail: bool) {
+        self.fail_reads.store(fail, Ordering::SeqCst);
     }
 
     /// Seed existing clipboard content without notifying watchers, modelling
@@ -76,6 +83,9 @@ impl Clipboard for MockClipboard {
     }
 
     async fn read_offer(&self, kind: SelectionKind) -> Result<Offer> {
+        if self.fail_reads.load(Ordering::SeqCst) {
+            anyhow::bail!("simulated clipboard read failure");
+        }
         Ok(self.get(kind).unwrap_or_default())
     }
 

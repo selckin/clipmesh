@@ -19,6 +19,33 @@ pub enum MimePolicy {
     Deny,
 }
 
+/// Whether to mirror one local selection into the other on this host. A
+/// purely *local* coupling, distinct from the cross-host `sync_primary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkSelections {
+    /// No local mirroring (default).
+    #[default]
+    Off,
+    /// Mirror CLIPBOARD changes into PRIMARY.
+    ClipboardToPrimary,
+    /// Mirror PRIMARY changes into CLIPBOARD.
+    PrimaryToClipboard,
+    /// Both directions.
+    Both,
+}
+
+impl LinkSelections {
+    /// True when CLIPBOARD changes should be mirrored into PRIMARY.
+    pub fn clip_to_primary(self) -> bool {
+        matches!(self, Self::ClipboardToPrimary | Self::Both)
+    }
+    /// True when PRIMARY changes should be mirrored into CLIPBOARD.
+    pub fn primary_to_clip(self) -> bool {
+        matches!(self, Self::PrimaryToClipboard | Self::Both)
+    }
+}
+
 /// Raw on-disk shape; resolved into `Config`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +66,8 @@ struct RawConfig {
     debounce_ms: u64,
     #[serde(default)]
     sync_primary: bool,
+    #[serde(default)]
+    link_selections: LinkSelections,
     #[serde(default = "default_direction")]
     direction: Direction,
     #[serde(default = "default_true")]
@@ -91,6 +120,8 @@ pub struct Config {
     pub max_payload_size: usize,
     pub debounce_ms: u64,
     pub sync_primary: bool,
+    /// Local clipboard↔primary mirroring (distinct from `sync_primary`).
+    pub link_selections: LinkSelections,
     pub direction: Direction,
     pub exclude_sensitive: bool,
     /// Push current clipboard state to peers when they (re)connect;
@@ -168,6 +199,15 @@ fn with_default_port(addr: &str, default_port: &str) -> String {
 }
 
 impl Config {
+    /// Whether the PRIMARY selection must be observed by the clipboard watcher:
+    /// either it is mesh-synced (`sync_primary`), or the local bridge needs
+    /// PRIMARY changes so it can mirror them into CLIPBOARD
+    /// (`primary_to_clipboard`/`both`). Single source of truth for both the
+    /// backend wiring (`main`) and the engine's `watched_kinds`.
+    pub fn watch_primary(&self) -> bool {
+        self.sync_primary || self.link_selections.primary_to_clip()
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
@@ -243,6 +283,7 @@ impl Config {
             },
             debounce_ms: raw.debounce_ms,
             sync_primary: raw.sync_primary,
+            link_selections: raw.link_selections,
             direction: raw.direction,
             exclude_sensitive: raw.exclude_sensitive,
             resync_on_connect: raw.resync_on_connect,
@@ -265,6 +306,7 @@ impl Config {
             max_payload_size: 32 * 1024 * 1024,
             debounce_ms: 0,
             sync_primary: false,
+            link_selections: LinkSelections::Off,
             direction: Direction::Both,
             exclude_sensitive: true,
             resync_on_connect: true,
@@ -334,6 +376,7 @@ resync_on_connect = false
 log_level = "debug"
 unknown_mime = "allow"
 mime_rules_file = "/tmp/clipmesh-test/mimetypes"
+link_selections = "both"
 "#;
         let cfg = Config::from_toml(toml).unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:48100"); // listen + port combined
@@ -351,6 +394,7 @@ mime_rules_file = "/tmp/clipmesh-test/mimetypes"
             cfg.mime_rules_path,
             Some(PathBuf::from("/tmp/clipmesh-test/mimetypes"))
         );
+        assert_eq!(cfg.link_selections, LinkSelections::Both);
     }
 
     #[test]
@@ -469,6 +513,51 @@ mime_rules_file = "/tmp/clipmesh-test/mimetypes"
             "listen = \"::\"\nport = 48100\npsk = \"s\"\npeers = [\"::1\", \"[fe80::2]:5000\"]\n";
         let cfg = Config::from_toml(toml).unwrap();
         assert_eq!(cfg.peers, vec!["[::1]:48100", "[fe80::2]:5000"]);
+    }
+
+    #[test]
+    fn link_selections_defaults_off_and_parses_all_values() {
+        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
+        assert_eq!(cfg.link_selections, LinkSelections::Off);
+        for (word, expected) in [
+            ("off", LinkSelections::Off),
+            ("clipboard_to_primary", LinkSelections::ClipboardToPrimary),
+            ("primary_to_clipboard", LinkSelections::PrimaryToClipboard),
+            ("both", LinkSelections::Both),
+        ] {
+            let toml = format!("listen = \"x\"\npsk = \"s\"\nlink_selections = \"{word}\"\n");
+            let cfg = Config::from_toml(&toml).unwrap();
+            assert_eq!(cfg.link_selections, expected, "parsing {word}");
+        }
+    }
+
+    #[test]
+    fn link_selections_direction_helpers() {
+        assert!(!LinkSelections::Off.clip_to_primary());
+        assert!(!LinkSelections::Off.primary_to_clip());
+        assert!(LinkSelections::ClipboardToPrimary.clip_to_primary());
+        assert!(!LinkSelections::ClipboardToPrimary.primary_to_clip());
+        assert!(!LinkSelections::PrimaryToClipboard.clip_to_primary());
+        assert!(LinkSelections::PrimaryToClipboard.primary_to_clip());
+        assert!(LinkSelections::Both.clip_to_primary());
+        assert!(LinkSelections::Both.primary_to_clip());
+    }
+
+    #[test]
+    fn watch_primary_tracks_sync_primary_and_the_primary_bridge() {
+        let mut cfg = Config::for_test("s");
+        assert!(!cfg.watch_primary()); // default: neither
+        cfg.sync_primary = true;
+        assert!(cfg.watch_primary()); // mesh-synced
+        cfg.sync_primary = false;
+        cfg.link_selections = LinkSelections::PrimaryToClipboard;
+        assert!(cfg.watch_primary()); // bridge needs PRIMARY observed
+        cfg.link_selections = LinkSelections::Both;
+        assert!(cfg.watch_primary());
+        // clipboard_to_primary alone never needs PRIMARY watched (it only
+        // *writes* PRIMARY); CLIPBOARD is always observed.
+        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        assert!(!cfg.watch_primary());
     }
 
     #[test]

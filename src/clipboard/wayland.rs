@@ -15,14 +15,14 @@ use wl_clipboard_rs::paste;
 /// in-process over that protocol; no external wl-clipboard/wl-paste binary
 /// is required.
 pub struct WaylandClipboard {
-    sync_primary: bool,
+    watch_primary: bool,
     max_payload: usize,
 }
 
 impl WaylandClipboard {
-    pub fn new(sync_primary: bool, max_payload: usize) -> WaylandClipboard {
+    pub fn new(watch_primary: bool, max_payload: usize) -> WaylandClipboard {
         WaylandClipboard {
-            sync_primary,
+            watch_primary,
             max_payload,
         }
     }
@@ -180,7 +180,7 @@ impl Clipboard for WaylandClipboard {
         let (tx, rx) = mpsc::unbounded_channel();
         // One in-process data-control listener covers both selections; see
         // clipboard::watch. (Was a wl-paste --watch subprocess per kind.)
-        spawn_watcher(tx, self.sync_primary);
+        spawn_watcher(tx, self.watch_primary);
         rx
     }
 
