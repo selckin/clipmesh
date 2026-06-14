@@ -47,6 +47,9 @@ struct RawConfig {
     resync_on_connect: bool,
     #[serde(default = "default_true")]
     share_mime_rules: bool,
+    /// Log a one-line summary for every detected copy and received update.
+    #[serde(default)]
+    verbose: bool,
     #[serde(default = "default_log_level")]
     log_level: String,
     /// Allow or deny a MIME type that has no rule yet (default deny).
@@ -96,6 +99,9 @@ pub struct Config {
     /// Share the per-type MIME-rules file across the mesh (whole-file
     /// last-writer-wins). Default on. Independent of `direction`.
     pub share_mime_rules: bool,
+    /// Log a one-line summary for every detected copy and every received
+    /// update (at `info` level). Off by default.
+    pub verbose: bool,
     pub log_level: String,
     /// Allow or deny a MIME type that is not yet listed in the rules file.
     pub unknown_mime: MimePolicy,
@@ -241,6 +247,7 @@ impl Config {
             exclude_sensitive: raw.exclude_sensitive,
             resync_on_connect: raw.resync_on_connect,
             share_mime_rules: raw.share_mime_rules,
+            verbose: raw.verbose,
             log_level: raw.log_level,
             unknown_mime: raw.unknown_mime,
             mime_rules_path: raw
@@ -264,6 +271,7 @@ impl Config {
             // Off in tests: existing tests assert verbatim file contents and
             // must not get a version header written. Sharing tests opt in.
             share_mime_rules: false,
+            verbose: false,
             log_level: "info".into(),
             // Permissive default for tests; rule-specific tests set their own
             // policy and a rules file path.
@@ -277,6 +285,14 @@ impl Config {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn verbose_defaults_off_and_parses_when_set() {
+        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
+        assert!(!cfg.verbose);
+        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\nverbose = true\n").unwrap();
+        assert!(cfg.verbose);
+    }
 
     #[test]
     fn load_reports_a_broken_config_symlink() {

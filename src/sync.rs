@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub const SENSITIVE_MIME: &str = "x-kde-passwordManagerHint";
@@ -390,38 +390,61 @@ impl<C: Clipboard> SyncEngine<C> {
             .collect()
     }
 
-    async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
-        // Bound the read: this runs inside the select loop (and at startup), so
-        // a slow/unresponsive selection owner must not be able to freeze the
-        // engine. A real read of the size-capped clipboard takes milliseconds;
-        // exceeding this means the source isn't serving its pipe.
-        let offer = match tokio::time::timeout(READ_TIMEOUT, self.clipboard.read_offer(kind)).await
-        {
-            Ok(Ok(o)) => o,
+    /// Read the selection with a bounded timeout (no filtering). Split out of
+    /// `capture_offer` so the broadcast path can describe what was copied (for
+    /// the verbose summary) before the content filters narrow it.
+    ///
+    /// Bound the read: this runs inside the select loop (and at startup), so a
+    /// slow/unresponsive selection owner must not be able to freeze the engine.
+    /// A real read of the size-capped clipboard takes milliseconds; exceeding
+    /// this means the source isn't serving its pipe.
+    async fn read_selection(&self, kind: SelectionKind) -> Option<Offer> {
+        match tokio::time::timeout(READ_TIMEOUT, self.clipboard.read_offer(kind)).await {
+            Ok(Ok(o)) => Some(o),
             Ok(Err(e)) => {
                 warn!("couldn't read the clipboard: {e:#}");
-                return None;
+                None
             }
             Err(_) => {
                 warn!("clipboard read timed out after {READ_TIMEOUT:?}; skipping this {kind:?} update");
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
+        let offer = self.read_selection(kind).await?;
         // Local content: record brand-new types so the user can curate them.
         self.filter(offer, true)
     }
 
     async fn broadcast_selection(&self, kind: SelectionKind) {
         if !self.may_send(kind) {
+            if self.cfg.verbose {
+                info!("copied {kind:?}: not sent (this node does not send)");
+            }
             return;
         }
-        let Some(offer) = self.capture_offer(kind).await else {
+        let Some(raw) = self.read_selection(kind).await else {
+            return;
+        };
+        // Describe what was copied before the filters narrow it, computed once.
+        // The bracketed list means "what was copied" in every outcome below
+        // (consistent with the received-update summary).
+        let copied = self.cfg.verbose.then(|| describe_offer(&raw));
+        let Some(offer) = self.filter(raw, true) else {
+            if let Some(copied) = &copied {
+                info!("copied {kind:?} [{copied}]: not sent (nothing passed the content filters)");
+            }
             return;
         };
         let hash = content_hash(&offer);
         // Already the mesh-current content (we just applied it, or the user
         // re-copied identical bytes): nothing to do.
         if self.current.lock().unwrap().get(&kind).map(|s| s.hash) == Some(hash) {
+            if let Some(copied) = &copied {
+                info!("copied {kind:?} [{copied}]: not sent (already on the mesh)");
+            }
             debug!("ignoring local {kind:?} change: identical to what's already on the mesh (echo suppressed)");
             return;
         }
@@ -435,6 +458,9 @@ impl<C: Clipboard> SyncEngine<C> {
                 origin,
             },
         );
+        if let Some(copied) = &copied {
+            info!("copied {kind:?} [{copied}]: broadcast (stamp {stamp})");
+        }
         debug!(
             "broadcasting {kind:?} update ({}, stamp {stamp})",
             describe_offer(&offer)
@@ -580,23 +606,45 @@ impl<C: Clipboard> SyncEngine<C> {
         stamp: u64,
         origin: Uuid,
     ) {
+        // Describe before the offer is filtered/moved, for the verbose summary.
+        let received = self.cfg.verbose.then(|| describe_offer(&offer));
+        let outcome = self
+            .apply_inbound_clip(from, kind, hash, offer, stamp, origin)
+            .await;
+        if let Some(received) = received {
+            info!("received {kind:?} from peer {from} [{received}], stamp {stamp}: {outcome}");
+        }
+    }
+
+    /// Decide and apply one inbound clip, returning a short outcome for the
+    /// verbose per-message summary. Keeps the detailed debug lines (the
+    /// non-verbose view) and the hard-error warnings.
+    async fn apply_inbound_clip(
+        &self,
+        from: Uuid,
+        kind: SelectionKind,
+        hash: [u8; 32],
+        offer: Offer,
+        stamp: u64,
+        origin: Uuid,
+    ) -> &'static str {
         debug!(
             "received {kind:?} update from peer {from} ({}, stamp {stamp})",
             describe_offer(&offer)
         );
         if !self.may_recv(kind) {
             debug!("ignoring inbound {kind:?} from peer {from}: blocked by direction/sync_primary config");
-            return;
+            return "dropped (blocked by direction/sync_primary config)";
         }
         if content_hash(&offer) != hash {
             warn!("dropping update from peer {from}: content hash doesn't match (corrupted or tampered)");
-            return;
+            return "rejected (content hash mismatch)";
         }
         // Drop implausibly-future stamps before they reach the clock, so one
         // peer with a broken clock can't poison ordering for this node.
         if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
             warn!("rejecting update from peer {from}: timestamp {stamp} is implausibly far in the future (peer clock skew?)");
-            return;
+            return "rejected (timestamp too far in the future)";
         }
         self.observe(stamp);
         // Apply the receiver's own content policy: configs can differ
@@ -605,7 +653,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // NOT record unseen types here — a peer must not write to our rules file.
         let Some(offer) = self.filter(offer, false) else {
             debug!("dropping inbound {kind:?} from peer {from}: our content filters removed everything");
-            return;
+            return "dropped (content filters removed everything)";
         };
         let applied_hash = content_hash(&offer);
         {
@@ -629,11 +677,11 @@ impl<C: Clipboard> SyncEngine<C> {
                         );
                     }
                     debug!("inbound {kind:?} from peer {from} is already our current content; nothing to do");
-                    return;
+                    return "already our current content";
                 }
                 if !state.superseded_by(stamp, origin) {
                     debug!("ignoring an older {kind:?} update from peer {from} (stamp {stamp}); we already hold newer content");
-                    return;
+                    return "ignored (older than our content)";
                 }
             }
         }
@@ -656,8 +704,12 @@ impl<C: Clipboard> SyncEngine<C> {
                         origin,
                     },
                 );
+                "applied"
             }
-            Err(e) => warn!("couldn't write to the clipboard: {e:#}"),
+            Err(e) => {
+                warn!("couldn't write to the clipboard: {e:#}");
+                "clipboard write failed"
+            }
         }
     }
 
@@ -943,6 +995,87 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_inbound_clip_reports_each_outcome() {
+        // A standalone engine (not driven by run()), so we can call the inbound
+        // handler directly and assert the one-line verbose summary's outcome.
+        fn engine(cfg: Config) -> Arc<SyncEngine<MockClipboard>> {
+            let clip = MockClipboard::new();
+            let (in_tx, _in_rx) = mpsc::channel(64);
+            let (connect_tx, _connect_rx) = mpsc::channel(64);
+            let mesh = Mesh::new(Uuid::new_v4(), in_tx, connect_tx);
+            let mime_rules = Arc::new(Mutex::new(MimeRules::load(
+                cfg.mime_rules_path.clone(),
+                cfg.unknown_mime,
+            )));
+            let (rules_tx, _rules_rx) = mpsc::channel(8);
+            SyncEngine::new(clip, mesh, Arc::new(cfg), mime_rules, rules_tx)
+        }
+        let kind = SelectionKind::Clipboard;
+        let from = Uuid::new_v4();
+
+        // Default (allow) engine, verbose on so the logging wrapper runs too.
+        let mut cfg = Config::for_test("s");
+        cfg.verbose = true;
+        let e = engine(cfg);
+
+        let a = offer("hello");
+        let ha = content_hash(&a);
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, ha, a.clone(), 1000, from)
+                .await,
+            "applied"
+        );
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, ha, a, 1000, from).await,
+            "already our current content"
+        );
+        let b = offer("older");
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, content_hash(&b), b, 1, from)
+                .await,
+            "ignored (older than our content)"
+        );
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, [0u8; 32], offer("x"), 2000, from)
+                .await,
+            "rejected (content hash mismatch)"
+        );
+        let f = offer("future");
+        let future = now_ms() + MAX_FUTURE_SKEW_MS + 60_000;
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, content_hash(&f), f, future, from)
+                .await,
+            "rejected (timestamp too far in the future)"
+        );
+        // Exercise the verbose logging wrapper end-to-end (must not panic).
+        let g = offer("newer");
+        e.on_inbound_clip(from, kind, content_hash(&g), g, 5000, from)
+            .await;
+
+        // Send-only engine: inbound is dropped by the direction policy.
+        let mut cfg = Config::for_test("s");
+        cfg.direction = Direction::SendOnly;
+        let e = engine(cfg);
+        let c = offer("blocked");
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, content_hash(&c), c, 1000, from)
+                .await,
+            "dropped (blocked by direction/sync_primary config)"
+        );
+
+        // Deny-everything rules: the content filters remove all of it.
+        let mut cfg = Config::for_test("s");
+        let _dir = with_rules(&mut cfg, MimePolicy::Deny, &[]);
+        let e = engine(cfg);
+        let d = offer("denied");
+        assert_eq!(
+            e.apply_inbound_clip(from, kind, content_hash(&d), d, 1000, from)
+                .await,
+            "dropped (content filters removed everything)"
+        );
     }
 
     /// The stamp of the next clipboard broadcast/resync message. Skips rules

@@ -32,6 +32,9 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # resync_on_connect = true    # push current clipboard to peers when they (re)connect
 # share_mime_rules = true    # share the MIME-rules file across the mesh (below)
 # log_level = "info"          # overridable with RUST_LOG
+# verbose = false             # log a one-line summary (at info level, so needs
+#                             # log_level >= info) per detected copy and received
+#                             # update: the mimetypes plus whether it synced
 
 # Which MIME types sync is controlled per-type by a separate rules file (see
 # below). unknown_mime decides what happens to a type with no rule yet:
