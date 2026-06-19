@@ -61,6 +61,18 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # they are stripped.
 # synthesize_text_plain = false
 
+# After a local copy, re-offer the selection so clipmesh owns it. The clipboard
+# then survives the source app exiting (clipboard-manager behavior), and — with
+# synthesize_text_plain above — the re-offered set includes the synthesized
+# text/plain, so X11-sourced content pastes on THIS host too (not just peers).
+# Applies to every watched selection (clipboard, and primary when sync_primary or
+# a primary bridge is on). Off by default. Engages on copies made while clipmesh
+# runs, not on content already present when it starts. While exclude_sensitive is
+# on (the default), password-manager-flagged content is not re-owned (so it can't
+# outlive the manager clearing the clipboard); with exclude_sensitive = false it
+# would be.
+# take_ownership = false
+
 # Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside this
 # config. Each entry under [rules] is, e.g.:
 #     [rules]

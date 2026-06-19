@@ -207,13 +207,14 @@ pub struct SyncEngine<C> {
     /// the loop, not inside the sync filter). fswatch holds a clone too.
     rules_changed_tx: mpsc::Sender<()>,
     /// Raw-content hash of the last value THIS ENGINE wrote to each selection
-    /// that did not originate as a local user change — i.e. an inbound mesh
-    /// apply, or content restored at startup (recorded by `prime`). The
-    /// bridge consumes a matching entry (one-shot) to recognize the watcher
-    /// echo of such a write and skip it, so engine-originated content is never
-    /// re-bridged or re-broadcast. Holds *raw* hashes, distinct from `current`
-    /// (filtered, mesh-ordering state); a separate map because the lifecycle
-    /// (one-shot echo suppressor vs. durable LWW state) is genuinely different.
+    /// that did not originate as a local user change — an inbound mesh apply,
+    /// content restored at startup (`prime`), or an ownership rewrite
+    /// (`take_ownership_of`). `process_local_change` consumes a matching entry
+    /// (one-shot) to recognize the watcher echo of such a write and skip it, so
+    /// engine-originated content is never re-broadcast, re-bridged, or re-owned.
+    /// Holds *raw* hashes, distinct from `current` (filtered, mesh-ordering
+    /// state); a separate map because the lifecycle (one-shot echo suppressor
+    /// vs. durable LWW state) is genuinely different.
     self_written: Mutex<HashMap<SelectionKind, [u8; 32]>>,
 }
 
@@ -488,6 +489,14 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("nothing to sync: the clipboard is empty");
             return None;
         }
+        // Check sensitivity before synthesizing — synthesis never changes the
+        // verdict (it adds no password-manager hint), so this skips needless work
+        // on secret content and keeps the stage order consistent with
+        // `take_ownership_of`.
+        if self.excludes_sensitive(&offer) {
+            debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
+            return None;
+        }
         // Capture side only (record_unseen): optionally back-fill text/plain from
         // a legacy UTF8_STRING/STRING/TEXT atom before the rules and cap apply, so
         // the synthesized reps are curated and budgeted like any other type.
@@ -496,10 +505,6 @@ impl<C: Clipboard> SyncEngine<C> {
         } else {
             offer
         };
-        if self.excludes_sensitive(&offer) {
-            debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
-            return None;
-        }
         let offer = self.apply_mime_rules(offer, record_unseen);
         if offer.is_empty() {
             debug!("nothing to sync: every MIME type was blocked by the rules");
@@ -644,10 +649,10 @@ impl<C: Clipboard> SyncEngine<C> {
     /// into the partner selection per `link_selections`. `raw` is the same read
     /// the broadcast used. The partner's resulting watch event flows through the
     /// normal path, so — if the partner is itself mesh-synced — a *local* change
-    /// is fed to the mesh like any other. Bridges only changes the user makes
-    /// locally: content this engine itself placed (an inbound mesh apply, or
-    /// content restored at startup) is recognized via `self_written` and skipped,
-    /// so received content is never re-mirrored or re-broadcast under our origin.
+    /// is fed to the mesh like any other. Content the engine itself placed (an
+    /// inbound apply, restored-at-startup baseline, or an ownership rewrite) is
+    /// already filtered out by the `self_written` check in `process_local_change`
+    /// before this runs, so only genuine local changes reach the bridge.
     ///
     /// Never holds a lock across an await. The full raw offer is mirrored on
     /// purpose: unlike the mesh path it bypasses the MIME/size filters, so
@@ -660,14 +665,6 @@ impl<C: Clipboard> SyncEngine<C> {
             return; // clearing one selection must not wipe the partner
         }
         let h = content_hash(&raw);
-        // One-shot: if this exact content is what *we* last wrote to `kind`
-        // (an inbound apply or restored-at-startup baseline), this watch event
-        // is its echo, not a fresh user copy — consume the marker and skip.
-        // Removing it (always) means a later genuine re-copy of the same bytes
-        // is NOT suppressed, and a stale marker can never accumulate.
-        if self.self_written.lock().unwrap().remove(&kind) == Some(h) {
-            return;
-        }
         if self.excludes_sensitive(&raw) {
             return; // never hop a password-manager secret between selections
         }
@@ -701,13 +698,13 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
-    /// Drain one pending selection change: read it once, broadcast it to the
-    /// mesh, then run the local selection bridge over the same read.
+    /// Drain one pending selection change: read it once, then propagate it to
+    /// each active local sink — the mesh broadcast, the selection bridge, and the
+    /// ownership rewrite.
     async fn process_local_change(&self, kind: SelectionKind) {
-        // Skip the read entirely when neither the mesh nor the bridge will act
-        // (e.g. a PRIMARY change with sync_primary off and no bridge from it),
+        // Skip the read entirely when nothing will act on this selection,
         // preserving the verbose "not sent" diagnostic.
-        if !self.may_send(kind) && self.bridge_partner(kind).is_none() {
+        if !self.has_local_sink(kind) {
             if self.cfg.verbose {
                 info!("copied {kind:?}: not sent (this node does not send)");
             }
@@ -716,13 +713,86 @@ impl<C: Clipboard> SyncEngine<C> {
         let Some(raw) = self.read_selection(kind).await else {
             return;
         };
-        // Only clone the offer when the bridge will actually consume it; with
-        // the default (no bridge) the read is handed straight to the broadcast.
+        // Recognize and skip the engine's own writes — an inbound apply, content
+        // restored by prime, or an ownership rewrite. The watcher re-reports
+        // them, but they aren't fresh user copies, so they must not be broadcast,
+        // bridged, or re-owned. The marker is drained whenever one is present (so
+        // a stale one can't accumulate), and the offer is hashed ONLY when a
+        // marker exists — the common genuine-copy path does no hashing here.
+        let is_echo = match self.self_written.lock().unwrap().remove(&kind) {
+            Some(h) => h == content_hash(&raw),
+            None => false,
+        };
+        if is_echo {
+            return;
+        }
+        // Propagate to each active sink, moving `raw` into the last consumer so
+        // only the earlier ones clone.
+        let own = self.cfg.take_ownership;
         if self.bridge_partner(kind).is_some() {
             self.broadcast_selection(kind, raw.clone()).await;
-            self.bridge_from(kind, raw).await;
+            if own {
+                self.bridge_from(kind, raw.clone()).await;
+                self.take_ownership_of(kind, raw).await;
+            } else {
+                self.bridge_from(kind, raw).await;
+            }
+        } else if own {
+            self.broadcast_selection(kind, raw.clone()).await;
+            self.take_ownership_of(kind, raw).await;
         } else {
             self.broadcast_selection(kind, raw).await;
+        }
+    }
+
+    /// Whether any local sink would act on a change to `kind`: the mesh (if this
+    /// node sends it), the selection bridge, or the ownership rewrite. When none
+    /// would, `process_local_change` skips the read entirely.
+    fn has_local_sink(&self, kind: SelectionKind) -> bool {
+        self.may_send(kind) || self.bridge_partner(kind).is_some() || self.cfg.take_ownership
+    }
+
+    /// Re-offer `raw` so clipmesh owns the `kind` selection (its content then
+    /// survives the source app exiting), optionally back-filling text/plain when
+    /// `synthesize_text_plain` is on so it pastes locally too. The written content
+    /// is recorded in `self_written` *before* the write, so the resulting watch
+    /// event is recognized as ours and skipped — no re-broadcast, re-bridge, or
+    /// rewrite loop. Never persists a password-manager secret.
+    async fn take_ownership_of(&self, kind: SelectionKind, raw: Offer) {
+        if raw.is_empty() {
+            return; // nothing to own; never clobber an empty selection
+        }
+        if self.excludes_sensitive(&raw) {
+            debug!("not taking ownership of {kind:?}: flagged sensitive");
+            return;
+        }
+        let owned = if self.cfg.synthesize_text_plain {
+            synthesize_text_plain(raw)
+        } else {
+            raw
+        };
+        // Cap to max_payload_size so the written offer round-trips through the
+        // read-back budget: assemble_offer caps every read at the same limit, so
+        // an over-budget rewrite (synthesis can add ~2x the atom's bytes) would
+        // be re-read smaller, miss its own self_written marker, and churn
+        // (re-broadcast + re-own). Unlike the mesh path the per-type MIME rules
+        // are intentionally NOT applied — a node keeps every readable type it
+        // copied for local paste, bounded only by the global size budget.
+        let owned = cap_to_payload_size(owned, self.cfg.max_payload_size);
+        if owned.is_empty() {
+            return; // everything was over budget; nothing left to own
+        }
+        // Mark before the write so the watcher event it triggers is skipped.
+        self.self_written
+            .lock()
+            .unwrap()
+            .insert(kind, content_hash(&owned));
+        if let Err(e) = self.clipboard.write_offer(kind, owned).await {
+            warn!("couldn't take ownership of the {kind:?} selection: {e:#}");
+            // The write failed, so no watch event will arrive to consume the
+            // marker; drop it so a later genuine copy of identical bytes isn't
+            // wrongly suppressed.
+            self.self_written.lock().unwrap().remove(&kind);
         }
     }
 
@@ -1588,14 +1658,23 @@ mod tests {
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
     }
 
-    async fn wait_applied(h: &Harness, kind: SelectionKind, o: &Offer) {
+    /// Poll `cond` every 5ms until true, panicking after 1s with `label`. The one
+    /// place the harness waits on engine-driven state.
+    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
         timeout(Duration::from_secs(1), async {
-            while h.clip.get(kind).as_ref() != Some(o) {
+            while !cond() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("offer was not applied");
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    async fn wait_applied(h: &Harness, kind: SelectionKind, o: &Offer) {
+        wait_for("offer to be applied", || {
+            h.clip.get(kind).as_ref() == Some(o)
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1724,6 +1803,186 @@ mod tests {
             ["UTF8_STRING"],
             "with the flag off the offer must be broadcast unchanged"
         );
+    }
+
+    async fn wait_for_write_count(h: &Harness, n: usize) {
+        wait_for(&format!("write_count to reach {n}"), || {
+            h.clip.write_count() >= n
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_rewrites_the_local_selection_once() {
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hi"));
+        // The copy is still broadcast exactly once.
+        let (_, _, o) = recv_clip(&mut h).await;
+        assert_eq!(o, offer("hi"));
+        // clipmesh re-owns the selection (one write) with the same content, and
+        // its own write does not loop into more writes or broadcasts.
+        wait_for_write_count(&h, 1).await;
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("hi")));
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(h.clip.write_count(), 1, "ownership rewrite must not loop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_with_synthesis_backfills_the_local_clipboard() {
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        cfg.synthesize_text_plain = true;
+        let mut h = start(cfg).await;
+        let raw: Offer = [("UTF8_STRING".to_string(), b"hi".to_vec())]
+            .into_iter()
+            .collect();
+        h.clip.local_copy(SelectionKind::Clipboard, raw);
+        let (_, _, broadcast) = recv_clip(&mut h).await;
+        assert_eq!(
+            broadcast.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
+        );
+        // The LOCAL clipboard is re-owned WITH the synthesized reps, so a paste
+        // on the origin host now sees text/plain too.
+        wait_for_write_count(&h, 1).await;
+        let owned = h.clip.get(SelectionKind::Clipboard).unwrap();
+        assert_eq!(
+            owned.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
+        );
+        assert_eq!(owned.get("text/plain").map(Vec::as_slice), Some(&b"hi"[..]));
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(h.clip.write_count(), 1, "ownership rewrite must not loop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_off_does_not_rewrite() {
+        let mut h = start(Config::for_test("s")).await; // take_ownership defaults off
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hi"));
+        let _ = recv_clip(&mut h).await;
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(
+            h.clip.write_count(),
+            0,
+            "no ownership write when the flag is off"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_never_persists_a_sensitive_secret() {
+        let mut cfg = Config::for_test("s"); // exclude_sensitive defaults true
+        cfg.take_ownership = true;
+        let mut h = start(cfg).await;
+        let secret: Offer = [
+            ("text/plain".to_string(), b"hunter2".to_vec()),
+            (SENSITIVE_MIME.to_string(), b"secret".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        h.clip.local_copy(SelectionKind::Clipboard, secret);
+        // Sensitive content is neither broadcast nor re-owned (a password manager
+        // clears its clipboard; clipmesh must not keep serving it).
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(
+            h.clip.write_count(),
+            0,
+            "must not take ownership of a password-manager secret"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_with_link_selections_terminates() {
+        // Ownership rewrites both the clipboard and (via the bridge) the primary;
+        // each rewrite re-fires the watcher. The self_written markers must make
+        // the whole thing quiesce rather than storm.
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hi"));
+        let (kind, _, o) = recv_clip(&mut h).await;
+        assert_eq!((kind, o), (SelectionKind::Clipboard, offer("hi")));
+        // Both selections settle on the content and the engine goes quiet.
+        wait_applied(&h, SelectionKind::Primary, &offer("hi")).await;
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("hi")));
+        // Exactly three writes, all echo-suppressed afterward: the bridge mirror
+        // to PRIMARY, the CLIPBOARD ownership rewrite, and the PRIMARY ownership
+        // rewrite (triggered by the bridge's write). A runaway loop would hang
+        // above or exceed this.
+        assert_eq!(
+            h.clip.write_count(),
+            3,
+            "expected exactly 3 writes (bridge + 2 ownership)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_caps_the_rewrite_to_max_payload_size() {
+        // Multi-rep, asymmetric sizes: a large image plus a UTF8_STRING with no
+        // text/plain. Synthesis adds two text/plain reps before the atom, blowing
+        // the budget; the cap must drop the oversized image while KEEPING the
+        // synthesized text/plain (the feature's point) in advertise order — and
+        // the capped set must round-trip the read budget without churning.
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        cfg.synthesize_text_plain = true;
+        cfg.max_payload_size = 150;
+        let mut h = start(cfg).await;
+        let raw: Offer = [
+            ("image/png".to_string(), vec![0u8; 150]), // 159 B — over budget alone
+            ("UTF8_STRING".to_string(), vec![b'x'; 30]),
+        ]
+        .into_iter()
+        .collect();
+        h.clip.local_copy(SelectionKind::Clipboard, raw);
+        let _ = recv_clip(&mut h).await;
+        wait_for_write_count(&h, 1).await;
+        let owned = h.clip.get(SelectionKind::Clipboard).unwrap();
+        // Image dropped (too big); synthesized text/plain reps + atom survive, in
+        // advertise order.
+        assert_eq!(
+            owned.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
+        );
+        let total: usize = owned.iter().map(|(m, d)| m.len() + d.len()).sum();
+        assert!(total <= 150, "over budget: {total}");
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(h.clip.write_count(), 1, "ownership rewrite must not loop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_drops_its_marker_when_the_write_fails() {
+        // A failed ownership write must drop the self_written marker it set, or a
+        // later genuine copy of identical bytes would be wrongly suppressed (and
+        // never re-owned). With the marker dropped, the retry re-owns (one write).
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        let mut h = start(cfg).await;
+        h.clip.set_fail_writes(true);
+        h.clip.local_copy(SelectionKind::Clipboard, offer("a"));
+        let _ = recv_clip(&mut h).await; // broadcast happens before the failed write
+        h.clip.set_fail_writes(false);
+        h.clip.local_copy(SelectionKind::Clipboard, offer("a")); // identical re-copy
+                                                                 // Reaching one successful write proves the stale marker was not blocking
+                                                                 // the rewrite at the top of process_local_change.
+        wait_for_write_count(&h, 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_ownership_re_owns_even_on_a_receive_only_node() {
+        // A receive-only node never broadcasts, but with take_ownership it still
+        // re-owns the local selection (the early-out guard must let it through).
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        cfg.direction = Direction::ReceiveOnly;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("hi"));
+        assert_no_broadcast(&mut h).await; // receive-only: nothing sent
+        wait_for_write_count(&h, 1).await; // but ownership still rewrites locally
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("hi")));
     }
 
     #[tokio::test(start_paused = true)]

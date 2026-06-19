@@ -89,6 +89,11 @@ struct RawConfig {
     /// text/plain from it (re-encoded to UTF-8). Off by default.
     #[serde(default)]
     synthesize_text_plain: bool,
+    /// After a local copy, re-write the selection so clipmesh owns it (the
+    /// content then survives the source app exiting), and — with
+    /// synthesize_text_plain — back-fill text/plain locally too. Off by default.
+    #[serde(default)]
+    take_ownership: bool,
     /// Per-type allow/deny rules file; defaults to `mimetypes` beside this
     /// config when unset.
     mime_rules_file: Option<String>,
@@ -145,6 +150,12 @@ pub struct Config {
     /// TEXT atom on the capture side when no text/plain* rep exists. Off by
     /// default. The synthesized reps go through the normal MIME rules and cap.
     pub synthesize_text_plain: bool,
+    /// After a local copy, re-offer the selection so clipmesh owns it (content
+    /// survives the source app exiting); with `synthesize_text_plain` the
+    /// re-offered set includes the synthesized text/plain so it pastes locally.
+    /// Applies to every watched selection. Off by default. Never persists
+    /// password-manager secrets (subject to `exclude_sensitive`).
+    pub take_ownership: bool,
     /// Path to the per-type rules file. Resolved to `mimetypes` next to the
     /// config file by `load` when not set explicitly; `None` keeps the rules
     /// in memory only (used by tests).
@@ -301,6 +312,7 @@ impl Config {
             log_level: raw.log_level,
             unknown_mime: raw.unknown_mime,
             synthesize_text_plain: raw.synthesize_text_plain,
+            take_ownership: raw.take_ownership,
             mime_rules_path: raw
                 .mime_rules_file
                 .map(|f| PathBuf::from(shellexpand::tilde(&f).into_owned())),
@@ -329,6 +341,7 @@ impl Config {
             // policy and a rules file path.
             unknown_mime: MimePolicy::Allow,
             synthesize_text_plain: false,
+            take_ownership: false,
             mime_rules_path: None,
         }
     }

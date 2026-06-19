@@ -123,6 +123,16 @@ clipmesh manages the file for you:
   copied from X11/legacy apps (`STRING` is re-encoded from latin-1, `TEXT` is
   sniffed). The synthesized types pass through these rules, so with
   `unknown_mime = "deny"` you must allow `text/plain*` or they're stripped.
+  Synthesis applies to what's broadcast to peers; to make it paste on the
+  *origin* host too, also enable `take_ownership`.
+- `take_ownership` (off by default) makes clipmesh re-offer each selection after
+  a local copy so it owns it — the clipboard then survives the source app
+  exiting, and (with `synthesize_text_plain`) the re-offered set includes the
+  synthesized `text/plain`, so X11-sourced content pastes on the origin host too.
+  It engages on copies made while clipmesh is running, not on content already on
+  the clipboard when it starts. With `exclude_sensitive` on (the default),
+  password-manager-flagged content is not re-owned, so it can't outlive the
+  manager clearing the clipboard (with `exclude_sensitive = false` it would be).
 - Any new type clipmesh sees is appended automatically with the `unknown_mime`
   default — so to curate what syncs, copy a few things, then edit the generated
   file and flip types to `allow`/`deny`. On save the `[rules]` table is sorted
