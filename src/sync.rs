@@ -69,11 +69,30 @@ fn reencode_atom(atom: &str, bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Clean a value derived from a legacy text atom for use as text/plain: drop the
+/// trailing NUL(s) X11 apps often append, then a single trailing line terminator
+/// (`\n` or `\r\n`, common on PRIMARY line selections) so it doesn't paste as a
+/// stray newline. Applied only to the synthesized rep; the source atom keeps its
+/// verbatim bytes.
+fn clean_plaintext(mut v: Vec<u8>) -> Vec<u8> {
+    while v.last() == Some(&0) {
+        v.pop();
+    }
+    if v.last() == Some(&b'\n') {
+        v.pop();
+        if v.last() == Some(&b'\r') {
+            v.pop();
+        }
+    }
+    v
+}
+
 /// Optional compatibility shim (`synthesize_text_plain` config): when an offer
 /// carries a legacy plain-text atom (`UTF8_STRING`/`STRING`/`TEXT`) but no
 /// `text/plain*` representation, synthesize `text/plain;charset=utf-8` and
-/// `text/plain` (the atom's value re-encoded to UTF-8) immediately before the
-/// source atom, so Wayland-native pasters that only understand `text/plain` can
+/// `text/plain` (the atom's value re-encoded to UTF-8 and cleaned of a trailing
+/// NUL/newline) immediately before the source atom, so Wayland-native pasters
+/// that only understand `text/plain` can
 /// still paste content copied from an X11/legacy app. The highest-priority atom
 /// present supplies the value. A no-op if any `text/plain*` already exists or no
 /// source atom is present.
@@ -84,7 +103,7 @@ fn synthesize_text_plain(offer: Offer) -> Offer {
     let Some((src, value)) = PLAINTEXT_ATOMS.iter().find_map(|atom| {
         offer
             .get(*atom)
-            .map(|bytes| (*atom, reencode_atom(atom, bytes)))
+            .map(|bytes| (*atom, clean_plaintext(reencode_atom(atom, bytes))))
     }) else {
         return offer; // no legacy atom to derive from
     };
@@ -1148,6 +1167,41 @@ mod tests {
                 ("text/plain", "é".as_bytes()),
                 ("UTF8_STRING", "é".as_bytes()),
             ]
+        );
+    }
+
+    #[test]
+    fn synthesize_strips_trailing_nul_and_newline_from_the_value() {
+        // X11 atoms are often NUL-terminated and/or carry a trailing newline
+        // (PRIMARY line selections). The synthesized text/plain value is cleaned,
+        // but the source atom keeps its verbatim bytes.
+        let offer: Offer = [("UTF8_STRING".to_string(), b"hi\n\0".to_vec())]
+            .into_iter()
+            .collect();
+        let out = synthesize_text_plain(offer);
+        assert_eq!(out.get("text/plain").map(Vec::as_slice), Some(&b"hi"[..]));
+        assert_eq!(
+            out.get("text/plain;charset=utf-8").map(Vec::as_slice),
+            Some(&b"hi"[..])
+        );
+        assert_eq!(
+            out.get("UTF8_STRING").map(Vec::as_slice),
+            Some(&b"hi\n\0"[..]),
+            "the source atom must keep its exact bytes"
+        );
+    }
+
+    #[test]
+    fn synthesize_strips_a_single_crlf_terminator() {
+        let offer: Offer = [("UTF8_STRING".to_string(), b"a\n\r\n".to_vec())]
+            .into_iter()
+            .collect();
+        // Only one trailing terminator is removed: "a\n\r\n" -> "a\n".
+        assert_eq!(
+            synthesize_text_plain(offer)
+                .get("text/plain")
+                .map(Vec::as_slice),
+            Some(&b"a\n"[..])
         );
     }
 

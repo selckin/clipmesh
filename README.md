@@ -161,7 +161,7 @@ clipmesh manages the file for you:
   apps. When a copied selection offers only a `UTF8_STRING`, `STRING`, or `TEXT`
   atom and no `text/plain*` type, clipmesh derives `text/plain;charset=utf-8` and
   `text/plain` from it — re-encoded to UTF-8 (`STRING` is latin-1; `TEXT` is
-  sniffed) — so Wayland-native apps that only understand `text/plain` can paste
-  it. The synthesized types pass through
+  sniffed) and trimmed of a trailing NUL/newline — so Wayland-native apps that
+  only understand `text/plain` can paste it. The synthesized types pass through
   the rules above, so under deny-by-default you must allow `text/plain*` or they
   are stripped.
