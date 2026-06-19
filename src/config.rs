@@ -84,6 +84,11 @@ struct RawConfig {
     /// Allow or deny a MIME type that has no rule yet (default deny).
     #[serde(default = "default_unknown_mime")]
     unknown_mime: MimePolicy,
+    /// When a captured selection offers a legacy UTF8_STRING/STRING/TEXT atom
+    /// but no text/plain* representation, synthesize text/plain;charset=utf-8 and
+    /// text/plain from it (re-encoded to UTF-8). Off by default.
+    #[serde(default)]
+    synthesize_text_plain: bool,
     /// Per-type allow/deny rules file; defaults to `mimetypes` beside this
     /// config when unset.
     mime_rules_file: Option<String>,
@@ -136,6 +141,10 @@ pub struct Config {
     pub log_level: String,
     /// Allow or deny a MIME type that is not yet listed in the rules file.
     pub unknown_mime: MimePolicy,
+    /// Back-fill text/plain (+ ;charset=utf-8) from a legacy UTF8_STRING/STRING/
+    /// TEXT atom on the capture side when no text/plain* rep exists. Off by
+    /// default. The synthesized reps go through the normal MIME rules and cap.
+    pub synthesize_text_plain: bool,
     /// Path to the per-type rules file. Resolved to `mimetypes` next to the
     /// config file by `load` when not set explicitly; `None` keeps the rules
     /// in memory only (used by tests).
@@ -291,6 +300,7 @@ impl Config {
             verbose: raw.verbose,
             log_level: raw.log_level,
             unknown_mime: raw.unknown_mime,
+            synthesize_text_plain: raw.synthesize_text_plain,
             mime_rules_path: raw
                 .mime_rules_file
                 .map(|f| PathBuf::from(shellexpand::tilde(&f).into_owned())),
@@ -318,6 +328,7 @@ impl Config {
             // Permissive default for tests; rule-specific tests set their own
             // policy and a rules file path.
             unknown_mime: MimePolicy::Allow,
+            synthesize_text_plain: false,
             mime_rules_path: None,
         }
     }

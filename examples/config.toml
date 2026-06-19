@@ -52,6 +52,15 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # everything not explicitly denied.
 # unknown_mime = "deny"
 
+# When a copied selection offers only a legacy X11 plain-text atom
+# (UTF8_STRING, STRING, or TEXT) and no text/plain* representation, synthesize
+# text/plain;charset=utf-8 and text/plain from it (re-encoded to UTF-8: STRING
+# is latin-1, TEXT is sniffed) so Wayland-native apps that only understand
+# text/plain can paste it. Off by default. The synthesized types go through the
+# MIME rules below, so with unknown_mime = "deny" you must allow text/plain* or
+# they are stripped.
+# synthesize_text_plain = false
+
 # Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside this
 # config. Each entry under [rules] is, e.g.:
 #     [rules]

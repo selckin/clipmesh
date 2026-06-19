@@ -35,6 +35,70 @@ fn offer_size(offer: &Offer) -> usize {
     offer.iter().map(|(m, d)| m.len() + d.len()).sum()
 }
 
+/// Legacy X11 plain-text selection atoms we can derive a `text/plain` value
+/// from, in descending order of how trustworthy their declared encoding is.
+const PLAINTEXT_ATOMS: [&str; 3] = ["UTF8_STRING", "STRING", "TEXT"];
+
+/// Whether `mime` is a `text/plain` variant (`text/plain`, `text/plain;charset=…`).
+/// Matches the `text/plain*` glob, case-insensitively.
+fn is_text_plain(mime: &str) -> bool {
+    mime.get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case("text/plain"))
+}
+
+/// Decode ISO-8859-1 (latin-1) bytes to UTF-8. Total and lossless: every byte
+/// 0x00–0xFF maps to the Unicode scalar of the same value.
+fn latin1_to_utf8(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|&b| b as char)
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// Derive a UTF-8 `text/plain` value from a legacy atom's bytes:
+/// - `UTF8_STRING` is already UTF-8 → verbatim.
+/// - `STRING` is ISO-8859-1 per ICCCM → latin-1 decode.
+/// - `TEXT`'s encoding is owner-defined → use it verbatim if it's valid UTF-8,
+///   otherwise fall back to latin-1.
+fn reencode_atom(atom: &str, bytes: &[u8]) -> Vec<u8> {
+    match atom {
+        "STRING" => latin1_to_utf8(bytes),
+        "TEXT" if std::str::from_utf8(bytes).is_err() => latin1_to_utf8(bytes),
+        _ => bytes.to_vec(),
+    }
+}
+
+/// Optional compatibility shim (`synthesize_text_plain` config): when an offer
+/// carries a legacy plain-text atom (`UTF8_STRING`/`STRING`/`TEXT`) but no
+/// `text/plain*` representation, synthesize `text/plain;charset=utf-8` and
+/// `text/plain` (the atom's value re-encoded to UTF-8) immediately before the
+/// source atom, so Wayland-native pasters that only understand `text/plain` can
+/// still paste content copied from an X11/legacy app. The highest-priority atom
+/// present supplies the value. A no-op if any `text/plain*` already exists or no
+/// source atom is present.
+fn synthesize_text_plain(offer: Offer) -> Offer {
+    if offer.keys().any(|k| is_text_plain(k)) {
+        return offer;
+    }
+    let Some((src, value)) = PLAINTEXT_ATOMS.iter().find_map(|atom| {
+        offer
+            .get(*atom)
+            .map(|bytes| (*atom, reencode_atom(atom, bytes)))
+    }) else {
+        return offer; // no legacy atom to derive from
+    };
+    let mut out = Offer::with_capacity(offer.len() + 2);
+    for (k, v) in offer {
+        if k == src {
+            out.insert("text/plain;charset=utf-8".to_string(), value.clone());
+            out.insert("text/plain".to_string(), value.clone());
+        }
+        out.insert(k, v);
+    }
+    out
+}
+
 /// Trim the offer to `max` bytes, dropping individual representations that don't
 /// fit (smallest-first, so a small text payload survives even when a giant image
 /// would blow the budget) instead of dropping the whole offer. The smallest-first
@@ -405,6 +469,14 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("nothing to sync: the clipboard is empty");
             return None;
         }
+        // Capture side only (record_unseen): optionally back-fill text/plain from
+        // a legacy UTF8_STRING/STRING/TEXT atom before the rules and cap apply, so
+        // the synthesized reps are curated and budgeted like any other type.
+        let offer = if record_unseen && self.cfg.synthesize_text_plain {
+            synthesize_text_plain(offer)
+        } else {
+            offer
+        };
         if self.excludes_sensitive(&offer) {
             debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
             return None;
@@ -989,6 +1061,118 @@ mod tests {
             .collect()
     }
 
+    fn pairs(offer: &Offer) -> Vec<(&str, &[u8])> {
+        offer
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect()
+    }
+
+    #[test]
+    fn synthesize_inserts_text_plain_reps_before_utf8_string() {
+        let offer: Offer = [("UTF8_STRING".to_string(), b"hi".to_vec())]
+            .into_iter()
+            .collect();
+        let out = synthesize_text_plain(offer);
+        assert_eq!(
+            pairs(&out),
+            [
+                ("text/plain;charset=utf-8", &b"hi"[..]),
+                ("text/plain", &b"hi"[..]),
+                ("UTF8_STRING", &b"hi"[..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synthesize_is_a_noop_when_any_text_plain_variant_exists() {
+        // Exact text/plain present.
+        let a: Offer = [
+            ("text/plain".to_string(), b"x".to_vec()),
+            ("UTF8_STRING".to_string(), b"y".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(pairs(&synthesize_text_plain(a.clone())), pairs(&a));
+        // A parameterized text/plain;charset=... also counts.
+        let b: Offer = [
+            ("text/plain;charset=utf-8".to_string(), b"x".to_vec()),
+            ("UTF8_STRING".to_string(), b"y".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(pairs(&synthesize_text_plain(b.clone())), pairs(&b));
+    }
+
+    #[test]
+    fn synthesize_is_a_noop_without_a_source_atom() {
+        let offer: Offer = [("image/png".to_string(), b"\x89PNG".to_vec())]
+            .into_iter()
+            .collect();
+        assert_eq!(pairs(&synthesize_text_plain(offer.clone())), pairs(&offer));
+    }
+
+    #[test]
+    fn synthesize_reencodes_latin1_string_to_utf8() {
+        // STRING is ISO-8859-1: 0xE9 is 'é', which is 0xC3 0xA9 in UTF-8.
+        let offer: Offer = [("STRING".to_string(), vec![0xE9])].into_iter().collect();
+        let out = synthesize_text_plain(offer);
+        assert_eq!(
+            out.get("text/plain").map(Vec::as_slice),
+            Some(&[0xC3u8, 0xA9][..]),
+            "latin-1 STRING must be re-encoded to UTF-8"
+        );
+        assert_eq!(
+            out.get("text/plain;charset=utf-8").map(Vec::as_slice),
+            Some(&[0xC3u8, 0xA9][..])
+        );
+    }
+
+    #[test]
+    fn synthesize_prefers_utf8_string_over_string_and_text() {
+        // All three atoms present: UTF8_STRING wins, and the reps go before it.
+        let offer: Offer = [
+            ("TEXT".to_string(), vec![0xE9]),
+            ("STRING".to_string(), vec![0xE9]),
+            ("UTF8_STRING".to_string(), "é".as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        let out = synthesize_text_plain(offer);
+        assert_eq!(
+            pairs(&out),
+            [
+                ("TEXT", &[0xE9u8][..]),
+                ("STRING", &[0xE9u8][..]),
+                ("text/plain;charset=utf-8", "é".as_bytes()),
+                ("text/plain", "é".as_bytes()),
+                ("UTF8_STRING", "é".as_bytes()),
+            ]
+        );
+    }
+
+    #[test]
+    fn synthesize_text_atom_sniffs_utf8_else_latin1() {
+        // Valid UTF-8 TEXT is used verbatim.
+        let utf8: Offer = [("TEXT".to_string(), "é".as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            synthesize_text_plain(utf8)
+                .get("text/plain")
+                .map(Vec::as_slice),
+            Some("é".as_bytes())
+        );
+        // Non-UTF-8 TEXT falls back to latin-1.
+        let latin: Offer = [("TEXT".to_string(), vec![0xE9])].into_iter().collect();
+        assert_eq!(
+            synthesize_text_plain(latin)
+                .get("text/plain")
+                .map(Vec::as_slice),
+            Some(&[0xC3u8, 0xA9][..])
+        );
+    }
+
     #[test]
     fn cap_to_payload_size_keeps_original_order_of_survivors() {
         // Reps given in a non-size order; the budget forces dropping the biggest.
@@ -1449,6 +1633,42 @@ mod tests {
             broadcast.keys().map(String::as_str).collect::<Vec<_>>(),
             ["text/html", "text/plain", "image/png"],
             "denied type dropped, but survivors must keep advertise order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthesize_text_plain_backfills_on_capture_when_enabled() {
+        let mut cfg = Config::for_test("s");
+        cfg.synthesize_text_plain = true;
+        let mut h = start(cfg).await;
+        let raw: Offer = [("UTF8_STRING".to_string(), b"hi".to_vec())]
+            .into_iter()
+            .collect();
+        h.clip.local_copy(SelectionKind::Clipboard, raw);
+        let (_, _, broadcast) = recv_clip(&mut h).await;
+        assert_eq!(
+            broadcast.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"],
+            "the shim should back-fill text/plain before the atom and broadcast it"
+        );
+        assert_eq!(
+            broadcast.get("text/plain").map(Vec::as_slice),
+            Some(&b"hi"[..])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthesize_text_plain_is_off_by_default() {
+        let mut h = start(Config::for_test("s")).await; // flag defaults off
+        let raw: Offer = [("UTF8_STRING".to_string(), b"hi".to_vec())]
+            .into_iter()
+            .collect();
+        h.clip.local_copy(SelectionKind::Clipboard, raw);
+        let (_, _, broadcast) = recv_clip(&mut h).await;
+        assert_eq!(
+            broadcast.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["UTF8_STRING"],
+            "with the flag off the offer must be broadcast unchanged"
         );
     }
 

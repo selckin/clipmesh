@@ -117,6 +117,12 @@ clipmesh manages the file for you:
 - The `unknown_mime` config option decides what happens to a type with no rule
   yet — **`deny` by default**, so nothing syncs until you allow it. Set it to
   `allow` to sync everything you haven't explicitly denied.
+- `synthesize_text_plain` (off by default) back-fills `text/plain;charset=utf-8`
+  and `text/plain` from a legacy `UTF8_STRING`/`STRING`/`TEXT` atom when a copied
+  selection offers no `text/plain*` rep, so Wayland-native apps can paste content
+  copied from X11/legacy apps (`STRING` is re-encoded from latin-1, `TEXT` is
+  sniffed). The synthesized types pass through these rules, so with
+  `unknown_mime = "deny"` you must allow `text/plain*` or they're stripped.
 - Any new type clipmesh sees is appended automatically with the `unknown_mime`
   default — so to curate what syncs, copy a few things, then edit the generated
   file and flip types to `allow`/`deny`. On save the `[rules]` table is sorted
@@ -151,3 +157,11 @@ clipmesh manages the file for you:
   a type to `allow` will make it sync on your host — that is the point. The
   password-manager `exclude_sensitive` filter is never shared and stays local.
   Set `share_mime_rules = false` to keep each host's rules independent.
+- `synthesize_text_plain` (off by default) helps content copied from X11/legacy
+  apps. When a copied selection offers only a `UTF8_STRING`, `STRING`, or `TEXT`
+  atom and no `text/plain*` type, clipmesh derives `text/plain;charset=utf-8` and
+  `text/plain` from it — re-encoded to UTF-8 (`STRING` is latin-1; `TEXT` is
+  sniffed) — so Wayland-native apps that only understand `text/plain` can paste
+  it. The synthesized types pass through
+  the rules above, so under deny-by-default you must allow `text/plain*` or they
+  are stripped.
