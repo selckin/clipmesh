@@ -44,7 +44,11 @@ fn copy_type(kind: SelectionKind) -> copy::ClipboardType {
 
 fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     let ct = paste_type(kind);
-    let types = match paste::get_mime_types(ct, paste::Seat::Unspecified) {
+    // get_mime_types_ordered (not get_mime_types) preserves the compositor's
+    // advertise order — preference order, richest first — so the offer we build
+    // carries it through to remote pasters. get_mime_types returns a HashSet,
+    // discarding that order before we ever see it.
+    let types = match paste::get_mime_types_ordered(ct, paste::Seat::Unspecified) {
         Ok(t) => t,
         Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => {
             return Ok(Offer::new())
@@ -94,19 +98,26 @@ fn is_content_type(mime: &str) -> bool {
 /// representation that changed mid-read is likewise skipped; the watcher fires
 /// again for the new content.
 ///
-/// Types are read in sorted order so that, when the budget can't fit everything,
-/// which representations survive is deterministic rather than dependent on the
-/// (HashSet) order the compositor's types arrived in.
+/// Types are read in the compositor's advertise order (preference order, richest
+/// first), which the offer then preserves end-to-end. When the budget can't fit
+/// everything, the earlier-advertised (more-preferred) representations survive;
+/// the order is deterministic because `get_mime_types_ordered` hands it to us as
+/// an ordered list rather than an unordered set.
 fn assemble_offer(
     types: impl IntoIterator<Item = String>,
     max: usize,
     mut read: impl FnMut(&str, usize) -> Result<Vec<u8>>,
 ) -> (Offer, usize) {
-    let mut types: Vec<String> = types.into_iter().collect();
-    types.sort();
     let mut offer = Offer::new();
     let mut total = 0usize;
     for mime in types {
+        // get_mime_types_ordered is a plain Vec with no dedup; a type advertised
+        // twice must be read and counted once, or its bytes are double-charged to
+        // the budget and could wrongly evict a later rep (the HashSet path used
+        // to dedup for free).
+        if offer.contains_key(&mime) {
+            continue;
+        }
         // saturating_sub: total never exceeds max here, but guard against a
         // future change turning this into a panic on attacker-influenced input.
         let budget = max.saturating_sub(total);
@@ -269,20 +280,44 @@ mod tests {
     }
 
     #[test]
-    fn assemble_offer_is_deterministic_regardless_of_input_order() {
-        // Budget fits only the first rep read; the result must not depend on the
-        // (HashSet-derived) iteration order of the advertised types.
-        let (a, _) = assemble_offer(vec!["a/x".into(), "b/x".into()], 50, |_m, _b| {
-            Ok(vec![0u8; 40])
+    fn assemble_offer_dedups_a_doubly_advertised_type() {
+        // A type advertised twice (get_mime_types_ordered is a Vec with no
+        // dedup) must be read and counted ONCE — otherwise its bytes are
+        // double-charged to the budget and can wrongly evict a later rep.
+        let types = vec!["a/x".into(), "a/x".into(), "b/x".into()];
+        let mut reads = 0;
+        let (offer, _) = assemble_offer(types, 50, |_m, _b| {
+            reads += 1;
+            Ok(vec![0u8; 20]) // mime(3) + 20 = 23 per rep; two fit in 50, three don't
         });
-        let (b, _) = assemble_offer(vec!["b/x".into(), "a/x".into()], 50, |_m, _b| {
-            Ok(vec![0u8; 40])
-        });
-        assert_eq!(
-            a.keys().collect::<Vec<_>>(),
-            b.keys().collect::<Vec<_>>(),
-            "result depends on input order"
+        assert!(
+            offer.contains_key("a/x") && offer.contains_key("b/x"),
+            "the duplicate must not double-count and evict b/x"
         );
-        assert!(a.contains_key("a/x") && !a.contains_key("b/x"));
+        assert_eq!(reads, 2, "the duplicate type should not be read twice");
+    }
+
+    #[test]
+    fn assemble_offer_preserves_advertised_order() {
+        // Types are read and kept in the order the compositor advertised them
+        // (preference order, richest first), not alphabetized.
+        let types = vec!["text/html".into(), "text/plain".into(), "image/png".into()];
+        let (offer, _) = assemble_offer(types, 1024, |_m, _b| Ok(vec![1u8, 2, 3]));
+        assert_eq!(
+            offer.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/html", "text/plain", "image/png"]
+        );
+    }
+
+    #[test]
+    fn assemble_offer_truncation_follows_advertised_order() {
+        // Over budget, the earlier-advertised (more-preferred) rep is the one
+        // that survives — not whichever sorts first alphabetically.
+        let types = vec!["z/pref".into(), "a/other".into()];
+        let (offer, _) = assemble_offer(types, 50, |_m, _b| Ok(vec![0u8; 40]));
+        assert!(
+            offer.contains_key("z/pref") && !offer.contains_key("a/other"),
+            "the first-advertised rep should win the budget"
+        );
     }
 }

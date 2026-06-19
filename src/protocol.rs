@@ -1,15 +1,17 @@
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Wire protocol version. Bumped whenever the on-wire message format changes.
 /// bincode is not self-describing, so mismatched versions cannot interoperate —
 /// all nodes must run a compatible build. Logged at startup for diagnosis.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
-/// All MIME representations of one clipboard state. BTreeMap keeps keys
-/// sorted, which makes content_hash deterministic.
-pub type Offer = BTreeMap<String, Vec<u8>>;
+/// All MIME representations of one clipboard state, in the source compositor's
+/// advertise order (preference order — richest first), which `IndexMap`
+/// preserves end-to-end so a remote paster sees the same order. `content_hash`
+/// sorts a copy internally, so identity/dedup stays order-independent.
+pub type Offer = IndexMap<String, Vec<u8>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SelectionKind {
@@ -53,11 +55,17 @@ pub enum Message {
     },
 }
 
-/// BLAKE3 over the sorted (mime, bytes) pairs, length-prefixed to avoid
-/// boundary ambiguity.
+/// BLAKE3 over the (mime, bytes) pairs, length-prefixed to avoid boundary
+/// ambiguity. The pairs are sorted by MIME for hashing only — the `Offer` itself
+/// keeps its advertise order — so two offers with the same content but different
+/// order hash equal. This keeps echo suppression robust: when we write an offer
+/// and the compositor hands the types back in a different order, the read-back
+/// still matches and doesn't trigger a rebroadcast loop.
 pub fn content_hash(offer: &Offer) -> [u8; 32] {
+    let mut pairs: Vec<(&String, &Vec<u8>)> = offer.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
     let mut h = blake3::Hasher::new();
-    for (mime, data) in offer {
+    for (mime, data) in pairs {
         h.update(&(mime.len() as u64).to_le_bytes());
         h.update(mime.as_bytes());
         h.update(&(data.len() as u64).to_le_bytes());
@@ -67,8 +75,8 @@ pub fn content_hash(offer: &Offer) -> [u8; 32] {
 }
 
 /// Compact `mime=size, mime=size` rendering of an offer for log lines, sizes
-/// in human units. Keys are already sorted (BTreeMap), so the output is stable.
-/// Build it only inside an enabled log statement — it allocates per call.
+/// in human units, in the offer's advertise (insertion) order. Build it only
+/// inside an enabled log statement — it allocates per call.
 pub fn describe_offer(offer: &Offer) -> String {
     offer
         .iter()
@@ -117,7 +125,8 @@ mod tests {
 
     #[test]
     fn content_hash_is_deterministic_and_order_independent() {
-        // BTreeMap sorts keys, so insertion order must not matter
+        // content_hash sorts a copy of the pairs, so insertion order must not
+        // matter even though the Offer (IndexMap) preserves it.
         let a = offer(&[("text/plain", b"hi"), ("text/html", b"<b>hi</b>")]);
         let b = offer(&[("text/html", b"<b>hi</b>"), ("text/plain", b"hi")]);
         assert_eq!(content_hash(&a), content_hash(&b));
@@ -163,11 +172,37 @@ mod tests {
     }
 
     #[test]
-    fn describe_offer_lists_mimes_and_sizes_in_sorted_order() {
-        // BTreeMap iterates sorted, so image/png precedes text/plain
+    fn describe_offer_lists_mimes_and_sizes_in_insertion_order() {
+        // IndexMap iterates in insertion order, so the order the pairs were
+        // built in is preserved (text/plain was inserted first here).
         let o = offer(&[("text/plain", b"hi"), ("image/png", b"\x89PNG")]);
-        assert_eq!(describe_offer(&o), "image/png=4 B, text/plain=2 B");
+        assert_eq!(describe_offer(&o), "text/plain=2 B, image/png=4 B");
         assert_eq!(describe_offer(&Offer::new()), "");
+    }
+
+    #[test]
+    fn encode_decode_preserves_mime_order() {
+        // A deliberately non-alphabetical order (preference order, richest
+        // first) must survive the wire round-trip unchanged.
+        let o = offer(&[
+            ("text/html", b"<b>hi</b>"),
+            ("text/plain", b"hi"),
+            ("image/png", b"\x89PNG"),
+        ]);
+        let clip = Message::Clip {
+            kind: SelectionKind::Clipboard,
+            hash: content_hash(&o),
+            offer: o,
+            stamp: 1,
+            origin: Uuid::new_v4(),
+        };
+        let Message::Clip { offer, .. } = decode(&encode(&clip)).unwrap() else {
+            panic!("expected a Clip");
+        };
+        assert_eq!(
+            offer.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/html", "text/plain", "image/png"]
+        );
     }
 
     #[test]

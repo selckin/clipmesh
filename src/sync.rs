@@ -35,6 +35,47 @@ fn offer_size(offer: &Offer) -> usize {
     offer.iter().map(|(m, d)| m.len() + d.len()).sum()
 }
 
+/// Trim the offer to `max` bytes, dropping individual representations that don't
+/// fit (smallest-first, so a small text payload survives even when a giant image
+/// would blow the budget) instead of dropping the whole offer. The smallest-first
+/// pass only decides *which* reps survive; the kept reps are emitted in the
+/// offer's original (advertise) order, so over-budget truncation preserves the
+/// source's preference order. Mirrors the read-path budget and per-type caps.
+fn cap_to_payload_size(offer: Offer, max: usize) -> Offer {
+    if offer_size(&offer) <= max {
+        return offer; // common case: the whole offer fits
+    }
+    let reps: Vec<(String, Vec<u8>)> = offer.into_iter().collect();
+    // Choose survivors smallest-first (maximizes how many fit), recording which
+    // by original index so the output can preserve the advertise order.
+    let mut by_size: Vec<usize> = (0..reps.len()).collect();
+    by_size.sort_by_key(|&i| reps[i].0.len() + reps[i].1.len());
+    let mut total = 0usize;
+    let mut keep = vec![false; reps.len()];
+    for i in by_size {
+        let (mime, data) = &reps[i];
+        let sz = mime.len() + data.len();
+        if total.saturating_add(sz) > max {
+            // warn, not debug: at the default log level the user would
+            // otherwise have no clue why a large copy never syncs.
+            warn!(
+                "dropping {mime} ({}): doesn't fit the {} max_payload_size budget \
+                 (raise max_payload_size to sync more)",
+                human_bytes(data.len()),
+                human_bytes(max)
+            );
+            continue;
+        }
+        total += sz;
+        keep[i] = true;
+    }
+    reps.into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, kv)| kv)
+        .collect()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -373,44 +414,12 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("nothing to sync: every MIME type was blocked by the rules");
             return None;
         }
-        let offer = self.cap_to_payload_size(offer);
+        let offer = cap_to_payload_size(offer, self.cfg.max_payload_size);
         if offer.is_empty() {
             debug!("nothing to sync: everything was over the max_payload_size budget");
             return None;
         }
         Some(offer)
-    }
-
-    /// Trim the offer to max_payload_size, dropping individual representations
-    /// that don't fit (smallest-first, so a small text payload survives even
-    /// when a giant image would blow the budget) instead of dropping the whole
-    /// offer. Mirrors the read-path budget and the per-type size caps.
-    fn cap_to_payload_size(&self, offer: Offer) -> Offer {
-        let max = self.cfg.max_payload_size;
-        if offer_size(&offer) <= max {
-            return offer; // common case: the whole offer fits
-        }
-        let mut reps: Vec<(String, Vec<u8>)> = offer.into_iter().collect();
-        reps.sort_by_key(|(m, d)| m.len() + d.len());
-        let mut total = 0usize;
-        let mut kept = Offer::new();
-        for (mime, data) in reps {
-            let sz = mime.len() + data.len();
-            if total.saturating_add(sz) > max {
-                // warn, not debug: at the default log level the user would
-                // otherwise have no clue why a large copy never syncs.
-                warn!(
-                    "dropping {mime} ({}): doesn't fit the {} max_payload_size budget \
-                     (raise max_payload_size to sync more)",
-                    human_bytes(data.len()),
-                    human_bytes(max)
-                );
-                continue;
-            }
-            total += sz;
-            kept.insert(mime, data);
-        }
-        kept
     }
 
     /// Drop representations blocked by the per-type rules — denied types, or
@@ -980,6 +989,46 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn cap_to_payload_size_keeps_original_order_of_survivors() {
+        // Reps given in a non-size order; the budget forces dropping the biggest.
+        // The survivors must come out in their ORIGINAL (advertise) order, not
+        // reordered smallest-first by the drop-selection pass.
+        let offer: Offer = [
+            ("text/html".to_string(), vec![0u8; 30]),  // 9 + 30 = 39
+            ("image/png".to_string(), vec![0u8; 100]), // 9 + 100 = 109 -> dropped
+            ("text/plain".to_string(), vec![0u8; 5]),  // 10 + 5 = 15
+        ]
+        .into_iter()
+        .collect();
+        // Budget fits html + plain (54) but not png; png is the only drop.
+        let capped = cap_to_payload_size(offer, 60);
+        assert_eq!(
+            capped.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/html", "text/plain"]
+        );
+    }
+
+    #[test]
+    fn cap_to_payload_size_breaks_size_ties_in_advertise_order() {
+        // All three reps are the same size, so the survivor selection is decided
+        // purely by the stable sort: the budget fits two, and they must be the
+        // first two advertised (a/x, b/x), kept in that order — c/x drops. This
+        // pins the stable-sort dependency; an unstable sort could drop b instead.
+        let offer: Offer = [
+            ("a/x".to_string(), vec![0u8; 17]), // 3 + 17 = 20 each
+            ("b/x".to_string(), vec![0u8; 17]),
+            ("c/x".to_string(), vec![0u8; 17]),
+        ]
+        .into_iter()
+        .collect();
+        let capped = cap_to_payload_size(offer, 45); // fits two (40), not three (60)
+        assert_eq!(
+            capped.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["a/x", "b/x"]
+        );
+    }
+
     /// A `[rules]` TOML body from (mime, rule-word) pairs.
     fn rules_toml(rules: &[(&str, &str)]) -> String {
         let mut body = String::from("[rules]\n");
@@ -1319,6 +1368,88 @@ mod tests {
         assert_eq!(kind, SelectionKind::Clipboard);
         assert_eq!(o, offer("hello"));
         assert_eq!(hash, content_hash(&o));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mime_order_is_preserved_through_capture_and_apply() {
+        // A multi-rep offer in deliberate (non-alphabetical) preference order:
+        // the whole pipeline must carry it unchanged in both directions.
+        let order = ["text/html", "text/plain", "image/png"];
+        let ordered: Offer = [
+            ("text/html".to_string(), b"<b>hi</b>".to_vec()),
+            ("text/plain".to_string(), b"hi".to_vec()),
+            ("image/png".to_string(), b"\x89PNG".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut h = start(Config::for_test("s")).await;
+
+        // Capture → broadcast: the outgoing Clip keeps the advertise order.
+        h.clip.local_copy(SelectionKind::Clipboard, ordered);
+        let (_, _, broadcast) = recv_clip(&mut h).await;
+        assert_eq!(
+            broadcast.keys().map(String::as_str).collect::<Vec<_>>(),
+            order,
+            "capture/broadcast scrambled the MIME order"
+        );
+
+        // Inbound → apply → write: the clipboard is written in arrival order.
+        let inbound: Offer = [
+            ("text/html".to_string(), b"<i>x</i>".to_vec()),
+            ("text/plain".to_string(), b"x".to_vec()),
+            ("image/png".to_string(), b"\x89PN2".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        send_inbound_full(
+            &h,
+            SelectionKind::Clipboard,
+            inbound.clone(),
+            future_stamp(10_000),
+        )
+        .await;
+        wait_applied(&h, SelectionKind::Clipboard, &inbound).await;
+        assert_eq!(
+            h.clip
+                .get(SelectionKind::Clipboard)
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            order,
+            "apply/write scrambled the MIME order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mime_order_survives_a_denied_type_in_the_middle() {
+        // The rule filter must remove the denied type without disturbing the
+        // advertise order of the survivors — apply_mime_rules collects into the
+        // ordered Offer, so the gap left by the dropped middle type closes up.
+        let mut cfg = Config::for_test("s");
+        let _dir = with_rules(
+            &mut cfg,
+            MimePolicy::Allow,
+            &[("application/x-blocked", "deny")],
+        );
+        let mut h = start(cfg).await;
+
+        let raw: Offer = [
+            ("text/html".to_string(), b"<b>hi</b>".to_vec()),
+            ("application/x-blocked".to_string(), b"nope".to_vec()),
+            ("text/plain".to_string(), b"hi".to_vec()),
+            ("image/png".to_string(), b"\x89PNG".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        h.clip.local_copy(SelectionKind::Clipboard, raw);
+        let (_, _, broadcast) = recv_clip(&mut h).await;
+        assert_eq!(
+            broadcast.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text/html", "text/plain", "image/png"],
+            "denied type dropped, but survivors must keep advertise order"
+        );
     }
 
     #[tokio::test(start_paused = true)]

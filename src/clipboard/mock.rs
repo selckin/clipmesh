@@ -143,7 +143,7 @@ mod tests {
         clip.local_copy(SelectionKind::Primary, offer("prim"));
         assert_eq!(
             clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
-            Default::default()
+            Offer::new()
         );
         assert_eq!(
             clip.read_offer(SelectionKind::Primary).await.unwrap(),
