@@ -39,3 +39,8 @@
 "image/tiff" = { rule = "allow", max = "16MiB" }
 "JAVA_DATATRANSFER*" = "deny"
 "*;charset=utf-16*" = "deny"
+# File copies put local filesystem paths on the clipboard (text/uri-list, and
+# x-special/gnome-copied-files from the file manager); those paths don't resolve
+# on another machine, so syncing them is pointless and misleading.
+"text/uri-list" = "deny"
+"x-special/*" = "deny"
