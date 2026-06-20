@@ -3,6 +3,17 @@
 **Date:** 2026-06-14
 **Status:** Approved design
 
+> **Update (2026-06-20): propagation mechanics superseded.** The bridge
+> *semantics* described here are unchanged — what mirrors where, direct-change-wins
+> (a concurrent direct change is never clobbered), `exclude_sensitive`, size caps,
+> mesh feed, and termination. What changed is *how* the engine schedules the
+> mirror/ownership writes and broadcasts: the per-selection, echo-driven path
+> (`process_local_change` → `bridge_from`/`take_ownership_of`, with the separate
+> `self_written`/`mirrored` memos) is replaced by a deterministic read → plan →
+> execute batch pipeline that writes each selection at most once and unifies the
+> two memos into one `last_written`. See
+> `docs/superpowers/specs/2026-06-20-bridge-write-consolidation-design.md`.
+
 ## Summary
 
 Add a *local* bridge between the two selections on a single host: mirror
