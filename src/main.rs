@@ -1,18 +1,21 @@
 use anyhow::{bail, Context, Result};
 use clipmesh::clipboard::wayland::WaylandClipboard;
 use clipmesh::config::{Config, MimePolicy};
+use clipmesh::config_template;
 use clipmesh::mime::{MimeRules, Relation, Verdict};
 use clipmesh::node;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const USAGE: &str = "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob> | --rules]";
+const USAGE: &str =
+    "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob> | --rules | --sync-config]";
 
 /// A one-shot CLI action (none = run the daemon).
 enum CliAction {
     Edit { allow: bool, pattern: String },
     PrintRules,
+    SyncConfig,
 }
 
 #[tokio::main]
@@ -26,7 +29,7 @@ async fn main() -> Result<()> {
         match arg.as_str() {
             "--config" if config_path.is_some() => bail!(USAGE),
             "--config" => config_path = Some(PathBuf::from(args.next().context(USAGE)?)),
-            "--allow" | "--deny" | "--rules" if action.is_some() => bail!(USAGE),
+            "--allow" | "--deny" | "--rules" | "--sync-config" if action.is_some() => bail!(USAGE),
             "--allow" | "--deny" => {
                 let pattern = args.next().context(USAGE)?;
                 action = Some(CliAction::Edit {
@@ -35,6 +38,7 @@ async fn main() -> Result<()> {
                 });
             }
             "--rules" => action = Some(CliAction::PrintRules),
+            "--sync-config" => action = Some(CliAction::SyncConfig),
             _ => bail!(USAGE),
         }
     }
@@ -49,6 +53,7 @@ async fn main() -> Result<()> {
             return apply_rule_edit(&config_path, allow, &pattern)
         }
         Some(CliAction::PrintRules) => return print_rules(&config_path),
+        Some(CliAction::SyncConfig) => return sync_config_action(&config_path),
         None => {}
     }
 
@@ -96,6 +101,29 @@ async fn main() -> Result<()> {
     // The engine never stops in normal operation; exit non-zero so systemd
     // (Restart=always) brings the daemon back.
     bail!("sync engine exited unexpectedly");
+}
+
+/// Normalize the config file (fill in missing options + comments) and exit.
+fn sync_config_action(config_path: &Path) -> Result<()> {
+    let path = config_path.to_path_buf();
+    match config_template::sync_config(&path)? {
+        config_template::SyncOutcome::Unchanged => {
+            println!("config {} is already up to date", path.display());
+        }
+        config_template::SyncOutcome::Rewrote { added } => {
+            if added.is_empty() {
+                println!("refreshed comments in {}", path.display());
+            } else {
+                println!(
+                    "wrote {} ({} option(s) added as commented defaults: {})",
+                    path.display(),
+                    added.len(),
+                    added.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply a single `--allow`/`--deny` glob to the MIME-rules file and exit. Any

@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::path::Path;
 use toml_edit::{Decor, DocumentMut, Item, Value};
 
 /// psk source keys in canonical order, with the sample shown when commented.
@@ -18,7 +19,6 @@ const PSK_SAMPLES: [(&str, &str); 3] = [
 ];
 
 /// One block of the canonical config file, in render order.
-#[allow(dead_code)] // used in tests
 enum Block {
     /// Free prose not tied to a key (e.g. the file header).
     Prose(&'static str),
@@ -44,7 +44,6 @@ enum Block {
 
 /// The user's present values, extracted from their config file.
 #[derive(Default)]
-#[allow(dead_code)] // used in tests
 struct Values {
     /// Present top-level key -> canonical (decor-stripped) value text.
     scalars: HashMap<String, String>,
@@ -54,7 +53,6 @@ struct Values {
 }
 
 /// Render each comment line as `# line` (a blank line becomes `#`).
-#[allow(dead_code)] // used in tests
 fn push_comment(text: &str, out: &mut String) {
     for line in text.lines() {
         if line.is_empty() {
@@ -69,7 +67,6 @@ fn push_comment(text: &str, out: &mut String) {
 
 /// Render the whole file: each block's comment, then its option line(s), then a
 /// single blank line. Exactly one trailing newline at EOF.
-#[allow(dead_code)] // used in tests
 fn render(template: &[Block], values: &Values) -> String {
     let mut out = String::new();
     for block in template {
@@ -80,7 +77,6 @@ fn render(template: &[Block], values: &Values) -> String {
     format!("{trimmed}\n")
 }
 
-#[allow(dead_code)] // used in tests
 fn push_block(block: &Block, values: &Values, out: &mut String) {
     match block {
         Block::Prose(text) => push_comment(text, out),
@@ -139,7 +135,6 @@ fn push_block(block: &Block, values: &Values, out: &mut String) {
 /// (decor-stripped, single-line) value text, plus the `[link_selections]`
 /// booleans. Tables other than `[link_selections]` are ignored (config.toml has
 /// no others). Errors only if the text isn't valid TOML.
-#[allow(dead_code)] // used in tests
 fn extract_values(text: &str) -> Result<Values> {
     let doc: DocumentMut = text.parse().context("parsing the config as TOML")?;
     let mut scalars = HashMap::new();
@@ -163,7 +158,6 @@ fn extract_values(text: &str) -> Result<Values> {
 
 /// A value as canonical TOML: decor (surrounding whitespace / inline comments)
 /// stripped, arrays flattened to one line. Idempotent on its own output.
-#[allow(dead_code)] // used in tests
 fn canonical(value: &Value) -> String {
     match value {
         Value::Array(arr) => {
@@ -176,6 +170,66 @@ fn canonical(value: &Value) -> String {
             v.to_string().trim().to_string()
         }
     }
+}
+
+/// What `sync_config` did, for the CLI summary.
+pub enum SyncOutcome {
+    /// The file already matched the canonical render; nothing written.
+    Unchanged,
+    /// The file was rewritten; `added` lists options that gained a commented
+    /// default (i.e. keys in the template the user had not set).
+    Rewrote { added: Vec<String> },
+}
+
+/// Normalize the config file at `path`: validate it loads, then rewrite it from
+/// `TEMPLATE` overlaid with the user's present values. Never rewrites a config
+/// that doesn't load (it is left untouched). Idempotent.
+pub fn sync_config(path: &Path) -> Result<SyncOutcome> {
+    use crate::config::Config;
+    // 1. Validate. A config we can't load is left untouched.
+    Config::load(path).context("the config must load before --sync-config can normalize it")?;
+    // 2. Read raw values from the user's file.
+    let current =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let values = extract_values(&current)?;
+    // 3. Render and compare.
+    let rendered = render(TEMPLATE, &values);
+    if rendered == current {
+        return Ok(SyncOutcome::Unchanged);
+    }
+    // 4. Which optional keys are absent (added as commented defaults)?
+    let added = optional_keys()
+        .into_iter()
+        .filter(|k| !values.scalars.contains_key(*k))
+        .map(str::to_string)
+        .collect();
+    write_atomic(path, &rendered)?;
+    Ok(SyncOutcome::Rewrote { added })
+}
+
+/// The optional scalar keys in the template, for the "added" summary.
+fn optional_keys() -> Vec<&'static str> {
+    TEMPLATE
+        .iter()
+        .filter_map(|b| match b {
+            Block::Optional { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Write `contents` to `path` atomically (temp file in the same dir + rename),
+/// so a crash mid-write can't truncate the live config.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config.toml");
+    let tmp = dir.join(format!(".{name}.sync-config.tmp"));
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
 }
 
 const TEMPLATE: &[Block] = &[
@@ -441,6 +495,49 @@ mod tests {
         // re-rendering the example through extract+render is a no-op (idempotent)
         let again = render(TEMPLATE, &extract_values(&text).unwrap());
         assert_eq!(again, text, "render is not idempotent on the example");
+    }
+
+    #[test]
+    fn sync_config_adds_missing_keeps_set_and_is_idempotent() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // a minimal but valid config (psk inline so no psk_file read needed)
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "listen = \"x\"\npsk = \"s\"\ndebounce_ms = 250\n").unwrap();
+        drop(f);
+
+        let outcome = sync_config(&path).unwrap();
+        assert!(matches!(outcome, SyncOutcome::Rewrote { .. }));
+        let text = std::fs::read_to_string(&path).unwrap();
+        // the user's set value is preserved, active
+        assert!(text.contains("debounce_ms = 250"));
+        // psk is the active source; psk_file/psk_env are commented
+        assert!(text.contains("psk = \"s\""));
+        assert!(text.contains("# psk_file ="));
+        // a previously-absent option was added as a commented default
+        assert!(text.contains("# exclude_sensitive = true"));
+        // it still loads
+        crate::config::Config::from_toml(&text).unwrap();
+
+        // running again is a no-op
+        let outcome2 = sync_config(&path).unwrap();
+        assert!(matches!(outcome2, SyncOutcome::Unchanged));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn sync_config_refuses_an_unloadable_config() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "listen = \"x\"\nsync_primary = true\n"; // unknown key
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{original}").unwrap();
+        drop(f);
+        assert!(sync_config(&path).is_err());
+        // the broken file is left untouched
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
