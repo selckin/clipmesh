@@ -8,6 +8,13 @@
 
 use std::collections::HashMap;
 
+/// psk source keys in canonical order, with the sample shown when commented.
+const PSK_SAMPLES: [(&str, &str); 3] = [
+    ("psk_file", "\"~/.config/clipmesh/psk\""),
+    ("psk", "\"supersecret\""),
+    ("psk_env", "\"CLIPMESH_PSK\""),
+];
+
 /// One block of the canonical config file, in render order.
 #[allow(dead_code)] // used in tests
 enum Block {
@@ -28,10 +35,8 @@ enum Block {
         default: &'static str,
     },
     /// The psk source group: exactly one of psk_file/psk/psk_env is active.
-    #[allow(dead_code)] // filled in Task 2
     PskGroup { comment: &'static str },
     /// The `[link_selections]` table; always rendered last.
-    #[allow(dead_code)] // filled in Task 2
     LinkSelections { comment: &'static str },
 }
 
@@ -43,7 +48,6 @@ struct Values {
     scalars: HashMap<String, String>,
     /// The `[link_selections]` table if present: (clipboard_to_selection,
     /// selection_to_clipboard).
-    #[allow(dead_code)] // filled in Task 2
     link: Option<(bool, bool)>,
 }
 
@@ -102,8 +106,30 @@ fn push_block(block: &Block, values: &Values, out: &mut String) {
                 None => out.push_str(&format!("# {key} = {default}\n")),
             }
         }
-        // PskGroup and LinkSelections rendering added in Task 2.
-        Block::PskGroup { .. } | Block::LinkSelections { .. } => {}
+        Block::PskGroup { comment } => {
+            push_comment(comment, out);
+            for (key, sample) in PSK_SAMPLES {
+                match values.scalars.get(key) {
+                    Some(v) => out.push_str(&format!("{key} = {v}\n")),
+                    None => out.push_str(&format!("# {key} = {sample}\n")),
+                }
+            }
+        }
+        Block::LinkSelections { comment } => {
+            push_comment(comment, out);
+            match values.link {
+                Some((c2s, s2c)) => {
+                    out.push_str("[link_selections]\n");
+                    out.push_str(&format!("clipboard_to_selection = {c2s}\n"));
+                    out.push_str(&format!("selection_to_clipboard = {s2c}\n"));
+                }
+                None => {
+                    out.push_str("# [link_selections]\n");
+                    out.push_str("# clipboard_to_selection = false\n");
+                    out.push_str("# selection_to_clipboard = false\n");
+                }
+            }
+        }
     }
 }
 
@@ -147,6 +173,50 @@ mod tests {
              \n\
              # quiet period\n\
              # debounce_ms = 100\n"
+        );
+    }
+
+    #[test]
+    fn psk_group_actives_the_users_source_only() {
+        let template = &[Block::PskGroup { comment: "one of:" }];
+        // user uses psk_file
+        let out = render(template, &vals(&[("psk_file", "\"/k\"")]));
+        assert_eq!(
+            out,
+            "# one of:\n\
+             psk_file = \"/k\"\n\
+             # psk = \"supersecret\"\n\
+             # psk_env = \"CLIPMESH_PSK\"\n"
+        );
+    }
+
+    #[test]
+    fn link_selections_absent_is_fully_commented() {
+        let template = &[Block::LinkSelections { comment: "link" }];
+        let out = render(template, &Values::default());
+        assert_eq!(
+            out,
+            "# link\n\
+             # [link_selections]\n\
+             # clipboard_to_selection = false\n\
+             # selection_to_clipboard = false\n"
+        );
+    }
+
+    #[test]
+    fn link_selections_present_actives_both_keys() {
+        let template = &[Block::LinkSelections { comment: "link" }];
+        let v = Values {
+            link: Some((true, false)),
+            ..Values::default()
+        };
+        let out = render(template, &v);
+        assert_eq!(
+            out,
+            "# link\n\
+             [link_selections]\n\
+             clipboard_to_selection = true\n\
+             selection_to_clipboard = false\n"
         );
     }
 }
