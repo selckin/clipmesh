@@ -216,6 +216,12 @@ pub struct SyncEngine<C> {
     /// state); a separate map because the lifecycle (one-shot echo suppressor
     /// vs. durable LWW state) is genuinely different.
     self_written: Mutex<HashMap<SelectionKind, [u8; 32]>>,
+    /// Raw-content hash of the last value the local bridge *mirrored into* each
+    /// selection. Durable (overwritten on each mirror), not one-shot. Lets
+    /// `bridge_from` tell its own prior mirror echoing back (safe to overwrite)
+    /// from a genuine concurrent user change in the same debounce batch (which
+    /// must NOT be clobbered) — see the `partner_changed_in_batch` guard.
+    mirrored: Mutex<HashMap<SelectionKind, [u8; 32]>>,
 }
 
 impl<C: Clipboard> SyncEngine<C> {
@@ -235,6 +241,7 @@ impl<C: Clipboard> SyncEngine<C> {
             mime_rules,
             rules_changed_tx,
             self_written: Mutex::new(HashMap::new()),
+            mirrored: Mutex::new(HashMap::new()),
         })
     }
 
@@ -356,8 +363,9 @@ impl<C: Clipboard> SyncEngine<C> {
                     primed = true;
                     if !pending.is_empty() {
                         if self.cfg.debounce_ms == 0 {
-                            for k in pending.drain(..) {
-                                self.process_local_change(k).await;
+                            let batch = std::mem::take(&mut pending);
+                            for &k in &batch {
+                                self.process_local_change(k, &batch).await;
                             }
                         } else {
                             deadline.as_mut().reset(tokio::time::Instant::now() + window);
@@ -374,8 +382,9 @@ impl<C: Clipboard> SyncEngine<C> {
                         // buffer — broadcasting now would re-send it as fresh.
                         if primed {
                             if self.cfg.debounce_ms == 0 {
-                                for k in pending.drain(..) {
-                                    self.process_local_change(k).await;
+                                let batch = std::mem::take(&mut pending);
+                                for &k in &batch {
+                                    self.process_local_change(k, &batch).await;
                                 }
                             } else {
                                 deadline.as_mut().reset(tokio::time::Instant::now() + window);
@@ -390,8 +399,9 @@ impl<C: Clipboard> SyncEngine<C> {
                 },
                 _ = &mut deadline, if armed => {
                     armed = false;
-                    for k in std::mem::take(&mut pending) {
-                        self.process_local_change(k).await;
+                    let batch = std::mem::take(&mut pending);
+                    for &k in &batch {
+                        self.process_local_change(k, &batch).await;
                     }
                 },
                 msg = inbound.recv() => match msg {
@@ -657,7 +667,13 @@ impl<C: Clipboard> SyncEngine<C> {
     /// Never holds a lock across an await. The full raw offer is mirrored on
     /// purpose: unlike the mesh path it bypasses the MIME/size filters, so
     /// locally-denied or oversized representations still reach the partner.
-    async fn bridge_from(&self, kind: SelectionKind, raw: Offer) {
+    ///
+    /// `partner_changed_in_batch` is true when the partner selection was itself
+    /// drained in this same debounce window. If the partner now holds content the
+    /// bridge did not just mirror there, that content is a fresh *direct* user
+    /// change (e.g. a text selection made right after a copy) — last-writer-wins,
+    /// so the mirror steps aside rather than clobbering it.
+    async fn bridge_from(&self, kind: SelectionKind, raw: Offer, partner_changed_in_batch: bool) {
         let Some(partner) = self.bridge_partner(kind) else {
             return;
         };
@@ -676,7 +692,22 @@ impl<C: Clipboard> SyncEngine<C> {
         match self.read_selection(partner).await {
             // Partner already holds this content: nothing to mirror.
             Some(partner_now) if content_hash(&partner_now) == h => return,
-            Some(_) => {} // partner differs — mirror it
+            Some(partner_now) => {
+                // Partner differs. If it changed directly in this batch and what
+                // it holds is NOT our own prior mirror (tracked in `mirrored`),
+                // it's a fresh user change that outranks this older source — leave
+                // it. The mirror echo case (partner == what we last mirrored) is
+                // safe to overwrite, so a later copy still propagates.
+                if partner_changed_in_batch
+                    && self.mirrored.lock().unwrap().get(&partner)
+                        != Some(&content_hash(&partner_now))
+                {
+                    debug!(
+                        "not mirroring {kind:?} -> {partner:?}: {partner:?} was changed directly this batch"
+                    );
+                    return;
+                }
+            }
             None => {
                 // Couldn't read the partner (error/timeout); read_selection has
                 // already warned. Mirror best-effort to preserve liveness — an
@@ -690,6 +721,9 @@ impl<C: Clipboard> SyncEngine<C> {
         let copied = self.cfg.verbose.then(|| describe_offer(&raw));
         match self.clipboard.write_offer(partner, raw).await {
             Ok(()) => {
+                // Remember what we mirrored here so this write's own watch echo
+                // (and only it) is later recognized as non-user content.
+                self.mirrored.lock().unwrap().insert(partner, h);
                 if let Some(copied) = copied {
                     info!("mirrored {kind:?} -> {partner:?} [{copied}]");
                 }
@@ -700,8 +734,10 @@ impl<C: Clipboard> SyncEngine<C> {
 
     /// Drain one pending selection change: read it once, then propagate it to
     /// each active local sink — the mesh broadcast, the selection bridge, and the
-    /// ownership rewrite.
-    async fn process_local_change(&self, kind: SelectionKind) {
+    /// ownership rewrite. `batch` is every selection drained together in this
+    /// debounce window, used to spot a partner the user changed directly in the
+    /// same window (so the bridge doesn't clobber it).
+    async fn process_local_change(&self, kind: SelectionKind, batch: &[SelectionKind]) {
         // Skip the read entirely when nothing will act on this selection,
         // preserving the verbose "not sent" diagnostic.
         if !self.has_local_sink(kind) {
@@ -730,12 +766,17 @@ impl<C: Clipboard> SyncEngine<C> {
         // only the earlier ones clone.
         let own = self.cfg.take_ownership;
         if self.bridge_partner(kind).is_some() {
+            // The bridge's partner was also changed directly in this batch when it
+            // appears here: a fresh user change the mirror must not overwrite.
+            let partner_in_batch = self
+                .bridge_partner(kind)
+                .is_some_and(|p| batch.contains(&p));
             self.broadcast_selection(kind, raw.clone()).await;
             if own {
-                self.bridge_from(kind, raw.clone()).await;
+                self.bridge_from(kind, raw.clone(), partner_in_batch).await;
                 self.take_ownership_of(kind, raw).await;
             } else {
-                self.bridge_from(kind, raw).await;
+                self.bridge_from(kind, raw, partner_in_batch).await;
             }
         } else if own {
             self.broadcast_selection(kind, raw.clone()).await;
@@ -3058,6 +3099,56 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn clip_to_primary_does_not_clobber_a_concurrent_primary_selection() {
+        // sync_primary + clipboard_to_primary: a clipboard copy and a fresh PRIMARY
+        // selection land in the same debounce window. The user's direct selection
+        // must win over the clipboard->primary mirror (last-writer-wins), and must
+        // itself reach the mesh — without this the mirror overwrote PRIMARY with the
+        // clipboard content, so the selection couldn't be pasted and was never sent.
+        let mut cfg = Config::for_test("s");
+        cfg.sync_primary = true;
+        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.debounce_ms = 100; // batch the copy and the selection together
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("copied"));
+        h.clip.local_copy(SelectionKind::Primary, offer("selected"));
+        // The clipboard entry is processed first, then the primary entry; each is
+        // broadcast with its OWN content.
+        let (k1, _, o1) = recv_clip(&mut h).await;
+        assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("copied")));
+        let (k2, _, o2) = recv_clip(&mut h).await;
+        assert_eq!((k2, o2), (SelectionKind::Primary, offer("selected")));
+        assert_no_broadcast(&mut h).await;
+        // The user's selection survives in PRIMARY, and the mirror did not write.
+        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("selected")));
+        assert_eq!(
+            h.clip.write_count(),
+            0,
+            "the mirror must not clobber a concurrent selection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clip_to_primary_still_mirrors_a_new_copy_after_its_own_echo() {
+        // Guard against over-correction: a second clipboard copy must still mirror
+        // into PRIMARY even when the previous mirror's own watch echo shares its
+        // debounce batch (the echo is not a user change, so it must not suppress
+        // the new mirror).
+        let mut cfg = Config::for_test("s");
+        cfg.sync_primary = true;
+        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.debounce_ms = 100;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("A"));
+        let (k1, _, o1) = recv_clip(&mut h).await; // clipboard A broadcast
+        assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("A")));
+        // Copy B before the mirror's primary echo has drained, so they batch.
+        h.clip.local_copy(SelectionKind::Clipboard, offer("B"));
+        // PRIMARY must follow the newest clipboard content, not stay stuck on A.
+        wait_applied(&h, SelectionKind::Primary, &offer("B")).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn sensitive_content_is_not_bridged() {
         let mut cfg = Config::for_test("s"); // exclude_sensitive on by default
         cfg.link_selections = LinkSelections::ClipboardToPrimary;
@@ -3269,22 +3360,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn same_window_conflict_first_change_wins() {
+    async fn same_window_conflict_keeps_each_direct_change() {
         let mut cfg = Config::for_test("s");
         cfg.debounce_ms = 100;
         cfg.sync_primary = true;
         cfg.link_selections = LinkSelections::Both;
         let mut h = start(cfg).await;
-        // both selections change within one debounce window; clipboard changed
-        // first, so it wins and overwrites the primary's concurrent change.
+        // Both selections are changed *directly* by the user within one debounce
+        // window. A direct change outranks the mirror (last-writer-wins), so
+        // neither clobbers the other: each selection keeps — and broadcasts — its
+        // own content, instead of the first-seen change overwriting the second.
         h.clip.local_copy(SelectionKind::Clipboard, offer("clip"));
         h.clip.local_copy(SelectionKind::Primary, offer("prim"));
         let (k1, _, o1) = recv_clip(&mut h).await;
         assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("clip")));
         let (k2, _, o2) = recv_clip(&mut h).await;
-        assert_eq!((k2, o2), (SelectionKind::Primary, offer("clip")));
+        assert_eq!((k2, o2), (SelectionKind::Primary, offer("prim")));
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("clip")));
-        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("clip")));
+        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("prim")));
+        assert_eq!(
+            h.clip.write_count(),
+            0,
+            "neither mirror may clobber a concurrent direct change"
+        );
     }
 }

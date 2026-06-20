@@ -220,17 +220,29 @@ An optional optimization is to read the raw offer once in `process` and pass
 it to both; not done initially to keep `broadcast_selection`'s signature and
 its `verbose`-describe logic untouched. Revisit only if it shows up.
 
-**Conflict resolution within one debounce window.** With `both` enabled, if
-*both* selections change inside a single `debounce_ms` window, `pending`
-holds both and `process()` runs them in arrival order. The first entry's
-`bridge_from` overwrites the partner selection *before* the partner's own
-`process()` reads it, so the **first-changed selection wins** and the other
-selection's concurrent change is overwritten (its now-stale read is then
-echo-suppressed or re-broadcast as the winning content). This is an
-arbitrary but deterministic rule; it is acceptable because near-simultaneous
-independent edits to *both* selections are rare (CLIPBOARD changes
-infrequently) and `both` already accepts that the selections track each
-other. Documented so it isn't a surprise.
+**Conflict resolution within one debounce window. A direct change beats the
+mirror.** If a selection and its bridge partner both change inside a single
+`debounce_ms` window, `pending` holds both and `process()` runs them in
+arrival order. A naive `bridge_from` would overwrite the partner *before* the
+partner's own `process()` reads it, so the first-seen change would win and the
+other selection's concurrent change would be silently destroyed — its
+now-stale read then re-broadcast as the winning content. With `sync_primary +
+clipboard_to_primary` (or `primary_to_clipboard`) this is a real data-loss
+bug: copy something and then select text within ~`debounce_ms`, and the
+selection you just made is overwritten by the clipboard mirror and can never
+be pasted (nor is it sent to the mesh).
+
+The rule instead is **the directly-changed selection wins**: a user change to
+a selection is never clobbered by a mirror *into* that selection from the same
+window. `process()` passes the set of selections drained together (`batch`) to
+`bridge_from`; when the partner is also in `batch` and holds content the bridge
+did *not* just place there (tracked per-selection in `mirrored`, the raw hash
+of the last value mirrored into each selection), that content is a fresh direct
+user change and the mirror steps aside. The `mirrored` memo is what
+distinguishes a genuine concurrent selection (preserve it) from the bridge's
+own prior write echoing back into a later batch (safe to overwrite, so a new
+copy still propagates). Under `both`, each selection therefore keeps its own
+concurrent edit instead of one stomping the other.
 
 ### Interactions
 
