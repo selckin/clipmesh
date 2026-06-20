@@ -6,7 +6,7 @@
 //! are commented defaults. `examples/config.toml` is generated from the same
 //! template (golden test), so the example and the normalizer can't drift.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use toml_edit::{Decor, DocumentMut, Item, Value};
@@ -226,15 +226,36 @@ fn optional_keys() -> Vec<&'static str> {
 /// so the rename stays on one filesystem (atomic).
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let target = crate::fsutil::resolve_link_target(path);
+    // resolve_link_target stops after a bounded number of hops; if the result
+    // is still a symlink the chain was too deep (or a cycle) and we never
+    // reached the real file. Refuse rather than rename over — and clobber —
+    // that intermediate link. (Config::load already rejects broken/cyclic links
+    // upstream; this guards the over-deep case its single open() can still pass.)
+    if crate::fsutil::is_symlink(&target) {
+        bail!(
+            "config {} resolves through too many symlink hops to write safely",
+            path.display()
+        );
+    }
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let name = target
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config.toml");
     let tmp = dir.join(format!(".{name}.sync-config.tmp"));
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
-    Ok(())
+    let written = std::fs::write(&tmp, contents)
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, &target)
+                .with_context(|| format!("replacing {}", target.display()))
+        });
+    if written.is_err() {
+        // Don't leave a partial temp behind — it would sit in the resolved
+        // target's directory (e.g. a stow dotfiles repo). Best-effort; a
+        // successful rename already consumed the temp.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 const TEMPLATE: &[Block] = &[
@@ -579,6 +600,57 @@ mod tests {
             sync_config(&link).unwrap(),
             SyncOutcome::Unchanged
         ));
+    }
+
+    #[test]
+    fn write_atomic_refuses_an_over_deep_symlink_chain() {
+        // A chain longer than resolve_link_target's hop cap resolves to an
+        // INTERMEDIATE symlink, not the real file. write_atomic must refuse
+        // rather than rename over (and clobber) that intermediate link.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "old").unwrap();
+        // real <- l0 <- l1 <- ... <- l9 (10 hops from l9 to real, > the cap)
+        let mut prev = real.clone();
+        let mut links = Vec::new();
+        for i in 0..10 {
+            let link = dir.path().join(format!("l{i}.toml"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link.clone();
+            links.push(link);
+        }
+        let head = prev; // l9
+
+        assert!(
+            write_atomic(&head, "new").is_err(),
+            "should refuse a chain deeper than the hop cap"
+        );
+        // the real target is untouched and every intermediate link survives
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "old");
+        for link in &links {
+            assert!(
+                crate::fsutil::is_symlink(link),
+                "intermediate link was clobbered: {}",
+                link.display()
+            );
+        }
+    }
+
+    #[test]
+    fn write_atomic_does_not_leak_its_temp_on_a_failed_rename() {
+        // Force the rename to fail by pointing at a path that is a directory
+        // (you can't rename a file over a directory); the temp file must be
+        // cleaned up rather than left behind (here, in a stow target dir).
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("config.toml");
+        std::fs::create_dir(&as_dir).unwrap();
+
+        assert!(write_atomic(&as_dir, "x").is_err());
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".sync-config.tmp"));
+        assert!(!leftover_tmp, "temp file leaked after a failed write");
     }
 
     #[test]
