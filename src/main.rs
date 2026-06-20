@@ -105,18 +105,17 @@ async fn main() -> Result<()> {
 
 /// Normalize the config file (fill in missing options + comments) and exit.
 fn sync_config_action(config_path: &Path) -> Result<()> {
-    let path = config_path.to_path_buf();
-    match config_template::sync_config(&path)? {
+    match config_template::sync_config(config_path)? {
         config_template::SyncOutcome::Unchanged => {
-            println!("config {} is already up to date", path.display());
+            println!("config {} is already up to date", config_path.display());
         }
         config_template::SyncOutcome::Rewrote { added } => {
             if added.is_empty() {
-                println!("refreshed comments in {}", path.display());
+                println!("refreshed comments in {}", config_path.display());
             } else {
                 println!(
                     "wrote {} ({} option(s) added as commented defaults: {})",
-                    path.display(),
+                    config_path.display(),
                     added.len(),
                     added.join(", ")
                 );
