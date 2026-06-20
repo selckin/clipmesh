@@ -16,7 +16,7 @@ pub type Offer = IndexMap<String, Vec<u8>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SelectionKind {
     Clipboard,
-    Primary,
+    Selection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

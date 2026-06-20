@@ -15,14 +15,15 @@ Copy on one host, paste on all of them.
   (see Configuration). By default the rules file is shared across the mesh (whole-file
   last-writer-wins); disable with `share_mime_rules = false`.
 - Skips password-manager-flagged contents by default.
-- Optionally links the two local selections on a host: `link_selections`
-  mirrors the clipboard into the middle-click primary selection and/or the
-  reverse (`clipboard_to_primary` | `primary_to_clipboard` | `both`, default
-  off). This is local-only coupling, separate from `sync_primary` (which syncs
-  each selection across the mesh). Note `primary_to_clipboard` (and `both`)
-  means selecting any text overwrites your clipboard — and, since the clipboard
-  is always synced when this node sends to the mesh, that selection lands on
-  every peer's clipboard too (regardless of `sync_primary`).
+- Optionally links the two local selections on a host via a `[link_selections]`
+  table with one boolean per direction: `clipboard_to_selection` (a Ctrl+C copy
+  also lands in the middle-click selection) and `selection_to_clipboard` (a mouse
+  highlight also lands in the Ctrl+C clipboard), each off unless set. This is
+  local-only coupling, separate from `sync_selection` (which syncs each selection
+  across the mesh). Note `selection_to_clipboard` means selecting any text
+  overwrites your clipboard — and, since the clipboard is always synced when this
+  node sends to the mesh, that selection lands on every peer's clipboard too
+  (regardless of `sync_selection`).
 - Resyncs on reconnect: content copied while a peer was offline is pushed
   to it when it comes back, newer content wins (ties broken deterministically
   by node ID; disable with `resync_on_connect = false`).

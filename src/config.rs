@@ -19,30 +19,49 @@ pub enum MimePolicy {
     Deny,
 }
 
-/// Whether to mirror one local selection into the other on this host. A
-/// purely *local* coupling, distinct from the cross-host `sync_primary`.
+/// Whether to mirror one local selection into the other on this host — one
+/// boolean per direction, each off by default. A purely *local* coupling,
+/// distinct from the cross-host `sync_selection`. Parsed directly from the
+/// `[link_selections]` table; the two directions are independent, so this is
+/// just the table itself (no separate raw/resolved shapes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LinkSelections {
-    /// No local mirroring (default).
-    #[default]
-    Off,
-    /// Mirror CLIPBOARD changes into PRIMARY.
-    ClipboardToPrimary,
-    /// Mirror PRIMARY changes into CLIPBOARD.
-    PrimaryToClipboard,
-    /// Both directions.
-    Both,
+#[serde(deny_unknown_fields, default)]
+pub struct LinkSelections {
+    /// A Ctrl+C clipboard copy is also written to the middle-click selection.
+    pub clipboard_to_selection: bool,
+    /// A mouse text selection is also written to the Ctrl+C clipboard.
+    pub selection_to_clipboard: bool,
 }
 
 impl LinkSelections {
-    /// True when CLIPBOARD changes should be mirrored into PRIMARY.
-    pub fn clip_to_primary(self) -> bool {
-        matches!(self, Self::ClipboardToPrimary | Self::Both)
+    /// No mirroring in either direction (the default).
+    pub const OFF: Self = Self {
+        clipboard_to_selection: false,
+        selection_to_clipboard: false,
+    };
+    /// Mirror CLIPBOARD changes into the SELECTION only.
+    pub const CLIPBOARD_TO_SELECTION: Self = Self {
+        clipboard_to_selection: true,
+        selection_to_clipboard: false,
+    };
+    /// Mirror SELECTION changes into the CLIPBOARD only.
+    pub const SELECTION_TO_CLIPBOARD: Self = Self {
+        clipboard_to_selection: false,
+        selection_to_clipboard: true,
+    };
+    /// Mirror both directions.
+    pub const BOTH: Self = Self {
+        clipboard_to_selection: true,
+        selection_to_clipboard: true,
+    };
+
+    /// True when CLIPBOARD changes should be mirrored into the SELECTION.
+    pub fn clip_to_selection(self) -> bool {
+        self.clipboard_to_selection
     }
-    /// True when PRIMARY changes should be mirrored into CLIPBOARD.
-    pub fn primary_to_clip(self) -> bool {
-        matches!(self, Self::PrimaryToClipboard | Self::Both)
+    /// True when SELECTION changes should be mirrored into the CLIPBOARD.
+    pub fn selection_to_clip(self) -> bool {
+        self.selection_to_clipboard
     }
 }
 
@@ -65,7 +84,7 @@ struct RawConfig {
     #[serde(default = "default_debounce_ms")]
     debounce_ms: u64,
     #[serde(default)]
-    sync_primary: bool,
+    sync_selection: bool,
     #[serde(default)]
     link_selections: LinkSelections,
     #[serde(default = "default_direction")]
@@ -129,8 +148,8 @@ pub struct Config {
     pub psk: [u8; 32],
     pub max_payload_size: usize,
     pub debounce_ms: u64,
-    pub sync_primary: bool,
-    /// Local clipboard↔primary mirroring (distinct from `sync_primary`).
+    pub sync_selection: bool,
+    /// Local clipboard↔selection mirroring (distinct from `sync_selection`).
     pub link_selections: LinkSelections,
     pub direction: Direction,
     pub exclude_sensitive: bool,
@@ -219,13 +238,13 @@ fn with_default_port(addr: &str, default_port: &str) -> String {
 }
 
 impl Config {
-    /// Whether the PRIMARY selection must be observed by the clipboard watcher:
-    /// either it is mesh-synced (`sync_primary`), or the local bridge needs
-    /// PRIMARY changes so it can mirror them into CLIPBOARD
-    /// (`primary_to_clipboard`/`both`). Single source of truth for both the
+    /// Whether the SELECTION must be observed by the clipboard watcher:
+    /// either it is mesh-synced (`sync_selection`), or the local bridge needs
+    /// SELECTION changes so it can mirror them into CLIPBOARD
+    /// (`selection_to_clipboard`/`both`). Single source of truth for both the
     /// backend wiring (`main`) and the engine's `watched_kinds`.
-    pub fn watch_primary(&self) -> bool {
-        self.sync_primary || self.link_selections.primary_to_clip()
+    pub fn watch_selection(&self) -> bool {
+        self.sync_selection || self.link_selections.selection_to_clip()
     }
 
     pub fn load(path: &Path) -> Result<Config> {
@@ -302,7 +321,7 @@ impl Config {
                 n => n,
             },
             debounce_ms: raw.debounce_ms,
-            sync_primary: raw.sync_primary,
+            sync_selection: raw.sync_selection,
             link_selections: raw.link_selections,
             direction: raw.direction,
             exclude_sensitive: raw.exclude_sensitive,
@@ -327,8 +346,8 @@ impl Config {
             psk: *blake3::hash(secret.as_bytes()).as_bytes(),
             max_payload_size: 32 * 1024 * 1024,
             debounce_ms: 0,
-            sync_primary: false,
-            link_selections: LinkSelections::Off,
+            sync_selection: false,
+            link_selections: LinkSelections::OFF,
             direction: Direction::Both,
             exclude_sensitive: true,
             resync_on_connect: true,
@@ -393,14 +412,17 @@ peers = ["host-b:48100", "host-c:48100"]
 psk = "supersecret"
 max_payload_size = "2MiB"
 debounce_ms = 250
-sync_primary = true
+sync_selection = true
 direction = "send_only"
 exclude_sensitive = false
 resync_on_connect = false
 log_level = "debug"
 unknown_mime = "allow"
 mime_rules_file = "/tmp/clipmesh-test/mimetypes"
-link_selections = "both"
+
+[link_selections]
+clipboard_to_selection = true
+selection_to_clipboard = true
 "#;
         let cfg = Config::from_toml(toml).unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:48100"); // listen + port combined
@@ -408,7 +430,7 @@ link_selections = "both"
         assert_eq!(cfg.psk, *blake3::hash(b"supersecret").as_bytes());
         assert_eq!(cfg.max_payload_size, 2 * 1024 * 1024);
         assert_eq!(cfg.debounce_ms, 250);
-        assert!(cfg.sync_primary);
+        assert!(cfg.sync_selection);
         assert_eq!(cfg.direction, Direction::SendOnly);
         assert!(!cfg.exclude_sensitive);
         assert!(!cfg.resync_on_connect);
@@ -418,7 +440,7 @@ link_selections = "both"
             cfg.mime_rules_path,
             Some(PathBuf::from("/tmp/clipmesh-test/mimetypes"))
         );
-        assert_eq!(cfg.link_selections, LinkSelections::Both);
+        assert_eq!(cfg.link_selections, LinkSelections::BOTH);
     }
 
     #[test]
@@ -428,7 +450,7 @@ link_selections = "both"
         assert_eq!(cfg.listen, "0.0.0.0:48100"); // port defaults to 48100
         assert_eq!(cfg.max_payload_size, 32 * 1024 * 1024);
         assert_eq!(cfg.debounce_ms, 100);
-        assert!(!cfg.sync_primary);
+        assert!(!cfg.sync_selection);
         assert_eq!(cfg.direction, Direction::Both);
         assert!(cfg.exclude_sensitive);
         assert!(cfg.resync_on_connect);
@@ -540,48 +562,93 @@ link_selections = "both"
     }
 
     #[test]
-    fn link_selections_defaults_off_and_parses_all_values() {
+    fn sync_selection_parses_and_defaults_off() {
         let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
-        assert_eq!(cfg.link_selections, LinkSelections::Off);
-        for (word, expected) in [
-            ("off", LinkSelections::Off),
-            ("clipboard_to_primary", LinkSelections::ClipboardToPrimary),
-            ("primary_to_clipboard", LinkSelections::PrimaryToClipboard),
-            ("both", LinkSelections::Both),
-        ] {
-            let toml = format!("listen = \"x\"\npsk = \"s\"\nlink_selections = \"{word}\"\n");
+        assert!(!cfg.sync_selection);
+        let cfg =
+            Config::from_toml("listen = \"x\"\npsk = \"s\"\nsync_selection = true\n").unwrap();
+        assert!(cfg.sync_selection);
+    }
+
+    #[test]
+    fn link_selections_table_parses_into_directions() {
+        let base = "listen = \"x\"\npsk = \"s\"\n";
+        // Omitted table -> Off.
+        assert_eq!(
+            Config::from_toml(base).unwrap().link_selections,
+            LinkSelections::OFF
+        );
+        // Each boolean combination maps to the matching direction.
+        let cases = [
+            (
+                "clipboard_to_selection = true\n",
+                LinkSelections::CLIPBOARD_TO_SELECTION,
+            ),
+            (
+                "selection_to_clipboard = true\n",
+                LinkSelections::SELECTION_TO_CLIPBOARD,
+            ),
+            (
+                "clipboard_to_selection = true\nselection_to_clipboard = true\n",
+                LinkSelections::BOTH,
+            ),
+            (
+                "clipboard_to_selection = false\nselection_to_clipboard = false\n",
+                LinkSelections::OFF,
+            ),
+        ];
+        for (body, expected) in cases {
+            let toml = format!("{base}[link_selections]\n{body}");
             let cfg = Config::from_toml(&toml).unwrap();
-            assert_eq!(cfg.link_selections, expected, "parsing {word}");
+            assert_eq!(cfg.link_selections, expected, "parsing:\n{toml}");
         }
     }
 
     #[test]
-    fn link_selections_direction_helpers() {
-        assert!(!LinkSelections::Off.clip_to_primary());
-        assert!(!LinkSelections::Off.primary_to_clip());
-        assert!(LinkSelections::ClipboardToPrimary.clip_to_primary());
-        assert!(!LinkSelections::ClipboardToPrimary.primary_to_clip());
-        assert!(!LinkSelections::PrimaryToClipboard.clip_to_primary());
-        assert!(LinkSelections::PrimaryToClipboard.primary_to_clip());
-        assert!(LinkSelections::Both.clip_to_primary());
-        assert!(LinkSelections::Both.primary_to_clip());
+    fn link_selections_rejects_unknown_keys() {
+        let toml = "listen = \"x\"\npsk = \"s\"\n[link_selections]\ntypo = true\n";
+        assert!(Config::from_toml(toml).is_err());
     }
 
     #[test]
-    fn watch_primary_tracks_sync_primary_and_the_primary_bridge() {
+    fn pre_table_config_forms_are_rejected() {
+        // The pre-table surface is gone: the old string form of link_selections
+        // and the renamed `sync_primary` key must fail loudly (not silently
+        // misparse), so an unmigrated config errors on load rather than running
+        // with the wrong settings.
+        assert!(
+            Config::from_toml("listen = \"x\"\npsk = \"s\"\nlink_selections = \"both\"\n").is_err()
+        );
+        assert!(Config::from_toml("listen = \"x\"\npsk = \"s\"\nsync_primary = true\n").is_err());
+    }
+
+    #[test]
+    fn link_selections_direction_helpers() {
+        assert!(!LinkSelections::OFF.clip_to_selection());
+        assert!(!LinkSelections::OFF.selection_to_clip());
+        assert!(LinkSelections::CLIPBOARD_TO_SELECTION.clip_to_selection());
+        assert!(!LinkSelections::CLIPBOARD_TO_SELECTION.selection_to_clip());
+        assert!(!LinkSelections::SELECTION_TO_CLIPBOARD.clip_to_selection());
+        assert!(LinkSelections::SELECTION_TO_CLIPBOARD.selection_to_clip());
+        assert!(LinkSelections::BOTH.clip_to_selection());
+        assert!(LinkSelections::BOTH.selection_to_clip());
+    }
+
+    #[test]
+    fn watch_selection_tracks_sync_selection_and_the_selection_bridge() {
         let mut cfg = Config::for_test("s");
-        assert!(!cfg.watch_primary()); // default: neither
-        cfg.sync_primary = true;
-        assert!(cfg.watch_primary()); // mesh-synced
-        cfg.sync_primary = false;
-        cfg.link_selections = LinkSelections::PrimaryToClipboard;
-        assert!(cfg.watch_primary()); // bridge needs PRIMARY observed
-        cfg.link_selections = LinkSelections::Both;
-        assert!(cfg.watch_primary());
-        // clipboard_to_primary alone never needs PRIMARY watched (it only
-        // *writes* PRIMARY); CLIPBOARD is always observed.
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
-        assert!(!cfg.watch_primary());
+        assert!(!cfg.watch_selection()); // default: neither
+        cfg.sync_selection = true;
+        assert!(cfg.watch_selection()); // mesh-synced
+        cfg.sync_selection = false;
+        cfg.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD;
+        assert!(cfg.watch_selection()); // bridge needs SELECTION observed
+        cfg.link_selections = LinkSelections::BOTH;
+        assert!(cfg.watch_selection());
+        // clipboard_to_selection alone never needs SELECTION watched (it only
+        // *writes* SELECTION); CLIPBOARD is always observed.
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
+        assert!(!cfg.watch_selection());
     }
 
     #[test]

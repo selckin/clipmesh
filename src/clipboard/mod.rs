@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 #[async_trait]
 pub trait Clipboard: Send + Sync + 'static {
     /// Subscribe to change notifications. Fires at least once per change of
-    /// a watched selection (Primary only when enabled), including changes
+    /// a watched selection (Selection only when enabled), including changes
     /// made through write_offer (real clipboards do this). Implementations
     /// may also fire once at subscribe time for the current selection.
     fn watch(&self) -> mpsc::UnboundedReceiver<SelectionKind>;

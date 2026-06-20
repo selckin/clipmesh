@@ -140,13 +140,13 @@ mod tests {
     #[tokio::test]
     async fn selections_are_independent() {
         let clip = MockClipboard::new();
-        clip.local_copy(SelectionKind::Primary, offer("prim"));
+        clip.local_copy(SelectionKind::Selection, offer("prim"));
         assert_eq!(
             clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
             Offer::new()
         );
         assert_eq!(
-            clip.read_offer(SelectionKind::Primary).await.unwrap(),
+            clip.read_offer(SelectionKind::Selection).await.unwrap(),
             offer("prim")
         );
     }

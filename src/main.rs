@@ -71,10 +71,10 @@ async fn main() -> Result<()> {
         clipmesh::protocol::PROTOCOL_VERSION
     );
 
-    // Watch PRIMARY if the mesh syncs it cross-host, or if link_selections
-    // needs to mirror it into CLIPBOARD locally (see Config::watch_primary).
+    // Watch SELECTION if the mesh syncs it cross-host, or if link_selections
+    // needs to mirror it into CLIPBOARD locally (see Config::watch_selection).
     let clipboard = Arc::new(WaylandClipboard::new(
-        cfg.watch_primary(),
+        cfg.watch_selection(),
         cfg.max_payload_size,
     ));
     let rules_path = cfg.mime_rules_path.clone();

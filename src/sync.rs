@@ -71,7 +71,7 @@ fn reencode_atom(atom: &str, bytes: &[u8]) -> Vec<u8> {
 
 /// Clean a value derived from a legacy text atom for use as text/plain: drop the
 /// trailing NUL(s) X11 apps often append, then a single trailing line terminator
-/// (`\n` or `\r\n`, common on PRIMARY line selections) so it doesn't paste as a
+/// (`\n` or `\r\n`, common on SELECTION line selections) so it doesn't paste as a
 /// stray newline. Applied only to the synthesized rep; the source atom keeps its
 /// verbatim bytes.
 fn clean_plaintext(mut v: Vec<u8>) -> Vec<u8> {
@@ -245,25 +245,25 @@ impl<C: Clipboard> SyncEngine<C> {
         })
     }
 
-    /// Selections this node syncs (Primary only when enabled).
+    /// Selections this node syncs (Selection only when enabled).
     fn synced_kinds(&self) -> Vec<SelectionKind> {
         let mut kinds = vec![SelectionKind::Clipboard];
-        if self.cfg.sync_primary {
-            kinds.push(SelectionKind::Primary);
+        if self.cfg.sync_selection {
+            kinds.push(SelectionKind::Selection);
         }
         kinds
     }
 
-    /// Selections this node cares about observing — CLIPBOARD always, PRIMARY
-    /// per the shared `Config::watch_primary` decision (so this can never drift
+    /// Selections this node cares about observing — CLIPBOARD always, SELECTION
+    /// per the shared `Config::watch_selection` decision (so this can never drift
     /// from the backend's watcher wiring in `main`). Used only by `prime` to
     /// decide which selections to seed; the run loop itself receives every
     /// selection the backend delivers, regardless of this set. Broader than
-    /// `synced_kinds` (PRIMARY may be observed but not synced).
+    /// `synced_kinds` (SELECTION may be observed but not synced).
     fn watched_kinds(&self) -> Vec<SelectionKind> {
         let mut kinds = vec![SelectionKind::Clipboard];
-        if self.cfg.watch_primary() {
-            kinds.push(SelectionKind::Primary);
+        if self.cfg.watch_selection() {
+            kinds.push(SelectionKind::Selection);
         }
         kinds
     }
@@ -273,10 +273,10 @@ impl<C: Clipboard> SyncEngine<C> {
     /// that maps the `link_selections` directions to a source→partner pair.
     fn bridge_partner(&self, kind: SelectionKind) -> Option<SelectionKind> {
         match kind {
-            SelectionKind::Clipboard if self.cfg.link_selections.clip_to_primary() => {
-                Some(SelectionKind::Primary)
+            SelectionKind::Clipboard if self.cfg.link_selections.clip_to_selection() => {
+                Some(SelectionKind::Selection)
             }
-            SelectionKind::Primary if self.cfg.link_selections.primary_to_clip() => {
+            SelectionKind::Selection if self.cfg.link_selections.selection_to_clip() => {
                 Some(SelectionKind::Clipboard)
             }
             _ => None,
@@ -285,12 +285,12 @@ impl<C: Clipboard> SyncEngine<C> {
 
     fn may_send(&self, kind: SelectionKind) -> bool {
         self.cfg.direction != Direction::ReceiveOnly
-            && (kind != SelectionKind::Primary || self.cfg.sync_primary)
+            && (kind != SelectionKind::Selection || self.cfg.sync_selection)
     }
 
     fn may_recv(&self, kind: SelectionKind) -> bool {
         self.cfg.direction != Direction::SendOnly
-            && (kind != SelectionKind::Primary || self.cfg.sync_primary)
+            && (kind != SelectionKind::Selection || self.cfg.sync_selection)
     }
 
     /// Issue a fresh stamp for locally originated content. saturating_add
@@ -996,8 +996,8 @@ impl<C: Clipboard> SyncEngine<C> {
             describe_offer(&offer)
         );
         if !self.may_recv(kind) {
-            debug!("ignoring inbound {kind:?} from peer {from}: blocked by direction/sync_primary config");
-            return "dropped (blocked by direction/sync_primary config)";
+            debug!("ignoring inbound {kind:?} from peer {from}: blocked by direction/sync_selection config");
+            return "dropped (blocked by direction/sync_selection config)";
         }
         if content_hash(&offer) != hash {
             warn!("dropping update from peer {from}: content hash doesn't match (corrupted or tampered)");
@@ -1072,7 +1072,7 @@ impl<C: Clipboard> SyncEngine<C> {
                 // content must not be re-mirrored to the partner selection nor
                 // re-broadcast to the mesh under our own origin. `link_selections`
                 // is a purely *local* coupling; cross-host propagation is
-                // `sync_primary`'s job.
+                // `sync_selection`'s job.
                 self.self_written.lock().unwrap().insert(kind, applied_hash);
                 "applied"
             }
@@ -1284,7 +1284,7 @@ mod tests {
     #[test]
     fn synthesize_strips_trailing_nul_and_newline_from_the_value() {
         // X11 atoms are often NUL-terminated and/or carry a trailing newline
-        // (PRIMARY line selections). The synthesized text/plain value is cleaned,
+        // (SELECTION line selections). The synthesized text/plain value is cleaned,
         // but the source atom keeps its verbatim bytes.
         let offer: Offer = [("UTF8_STRING".to_string(), b"hi\n\0".to_vec())]
             .into_iter()
@@ -1520,7 +1520,7 @@ mod tests {
     }
 
     /// Like `start_seeded` but seeds arbitrary selections before priming, so a
-    /// restart over existing PRIMARY content can be modelled too.
+    /// restart over existing SELECTION content can be modelled too.
     async fn start_seeded_with(cfg: Config, seeds: &[(SelectionKind, Offer)]) -> Harness {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (connect_tx, connect_rx) = mpsc::channel(64);
@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(
             e.apply_inbound_clip(from, kind, content_hash(&c), c, 1000, from)
                 .await,
-            "dropped (blocked by direction/sync_primary config)"
+            "dropped (blocked by direction/sync_selection config)"
         );
 
         // Deny-everything rules: the content filters remove all of it.
@@ -1935,22 +1935,22 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn take_ownership_with_link_selections_terminates() {
-        // Ownership rewrites both the clipboard and (via the bridge) the primary;
+        // Ownership rewrites both the clipboard and (via the bridge) the selection;
         // each rewrite re-fires the watcher. The self_written markers must make
         // the whole thing quiesce rather than storm.
         let mut cfg = Config::for_test("s");
         cfg.take_ownership = true;
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("hi"));
         let (kind, _, o) = recv_clip(&mut h).await;
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("hi")));
         // Both selections settle on the content and the engine goes quiet.
-        wait_applied(&h, SelectionKind::Primary, &offer("hi")).await;
+        wait_applied(&h, SelectionKind::Selection, &offer("hi")).await;
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("hi")));
         // Exactly three writes, all echo-suppressed afterward: the bridge mirror
-        // to PRIMARY, the CLIPBOARD ownership rewrite, and the PRIMARY ownership
+        // to SELECTION, the CLIPBOARD ownership rewrite, and the SELECTION ownership
         // rewrite (triggered by the bridge's write). A runaway loop would hang
         // above or exceed this.
         assert_eq!(
@@ -2027,32 +2027,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn clipboard_change_mirrors_to_primary() {
+    async fn clipboard_change_mirrors_to_selection() {
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         cfg.verbose = true; // also exercises the bridge's verbose mirror log
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
         // the clipboard change is broadcast as usual...
         let (kind, _, o) = recv_clip(&mut h).await;
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("foo")));
-        // ...and mirrored into the primary selection locally.
-        wait_applied(&h, SelectionKind::Primary, &offer("foo")).await;
-        // sync_primary is off, so primary isn't in synced_kinds(): the mirror's
+        // ...and mirrored into the selection locally.
+        wait_applied(&h, SelectionKind::Selection, &offer("foo")).await;
+        // sync_selection is off, so selection isn't in synced_kinds(): the mirror's
         // watcher event yields no broadcast.
         assert_no_broadcast(&mut h).await;
-        // exactly one write_offer: the single primary mirror (local_copy does
+        // exactly one write_offer: the single selection mirror (local_copy does
         // not count; nothing inbound here).
         assert_eq!(h.clip.write_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primary_change_mirrors_to_clipboard() {
+    async fn selection_change_mirrors_to_clipboard() {
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::PrimaryToClipboard;
+        cfg.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD;
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Primary, offer("sel"));
-        // primary→clipboard: the selection lands in the clipboard and (because
+        h.clip.local_copy(SelectionKind::Selection, offer("sel"));
+        // selection→clipboard: the selection lands in the clipboard and (because
         // clipboard is always mesh-synced) is broadcast as a clipboard update.
         let (kind, _, o) = recv_clip(&mut h).await;
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("sel")));
@@ -2062,14 +2062,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_direction_does_not_mirror_the_other_way() {
-        // clipboard_to_primary must NOT mirror a primary change into clipboard.
+        // clipboard_to_selection must NOT mirror a selection change into clipboard.
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true; // so the primary change is at least observable
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.sync_selection = true; // so the selection change is at least observable
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Primary, offer("sel"));
-        let (kind, _, o) = recv_clip(&mut h).await; // primary broadcast (sync_primary)
-        assert_eq!((kind, o), (SelectionKind::Primary, offer("sel")));
+        h.clip.local_copy(SelectionKind::Selection, offer("sel"));
+        let (kind, _, o) = recv_clip(&mut h).await; // selection broadcast (sync_selection)
+        assert_eq!((kind, o), (SelectionKind::Selection, offer("sel")));
         assert_eq!(h.clip.write_count(), 0); // clipboard never mirrored
         assert_eq!(h.clip.get(SelectionKind::Clipboard), None);
         assert_no_broadcast(&mut h).await;
@@ -2168,23 +2168,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primary_is_ignored_unless_enabled() {
+    async fn selection_is_ignored_unless_enabled() {
         let mut h = start(Config::for_test("s")).await;
-        h.clip.local_copy(SelectionKind::Primary, offer("sel"));
+        h.clip.local_copy(SelectionKind::Selection, offer("sel"));
         assert_no_broadcast(&mut h).await;
-        send_inbound(&h, SelectionKind::Primary, offer("rem")).await;
+        send_inbound(&h, SelectionKind::Selection, offer("rem")).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(h.clip.write_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primary_is_synced_when_enabled() {
+    async fn selection_is_synced_when_enabled() {
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
+        cfg.sync_selection = true;
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Primary, offer("sel"));
+        h.clip.local_copy(SelectionKind::Selection, offer("sel"));
         let (kind, _, o) = recv_clip(&mut h).await;
-        assert_eq!(kind, SelectionKind::Primary);
+        assert_eq!(kind, SelectionKind::Selection);
         assert_eq!(o, offer("sel"));
     }
 
@@ -2264,13 +2264,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn inbound_primary_applies_to_primary_only() {
+    async fn inbound_selection_applies_to_selection_only() {
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
+        cfg.sync_selection = true;
         let h = start(cfg).await;
         let o = offer("sel");
-        send_inbound(&h, SelectionKind::Primary, o.clone()).await;
-        wait_applied(&h, SelectionKind::Primary, &o).await;
+        send_inbound(&h, SelectionKind::Selection, o.clone()).await;
+        wait_applied(&h, SelectionKind::Selection, &o).await;
         assert_eq!(h.clip.get(SelectionKind::Clipboard), None);
     }
 
@@ -3061,26 +3061,26 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn both_directions_settle_without_redundant_writes() {
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::Both;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::BOTH;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
-        // exactly two broadcasts: the clipboard, then the mirrored primary
+        // exactly two broadcasts: the clipboard, then the mirrored selection
         let (k1, _, o1) = recv_clip(&mut h).await;
         assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("foo")));
         let (k2, _, o2) = recv_clip(&mut h).await;
-        assert_eq!((k2, o2), (SelectionKind::Primary, offer("foo")));
+        assert_eq!((k2, o2), (SelectionKind::Selection, offer("foo")));
         assert_no_broadcast(&mut h).await;
-        // one write only (the primary mirror); no echo ping-pong
+        // one write only (the selection mirror); no echo ping-pong
         assert_eq!(h.clip.write_count(), 1);
-        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("foo")));
+        assert_eq!(h.clip.get(SelectionKind::Selection), Some(offer("foo")));
     }
 
     #[tokio::test(start_paused = true)]
     async fn both_directions_no_redundant_write_with_denied_rep() {
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::Both;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::BOTH;
         let _dir = with_rules(&mut cfg, MimePolicy::Allow, &[("image/png", "deny")]);
         let mut h = start(cfg).await;
         let mut o = offer("text part");
@@ -3090,37 +3090,41 @@ mod tests {
         let (k1, _, b1) = recv_clip(&mut h).await;
         assert_eq!((k1, b1), (SelectionKind::Clipboard, offer("text part")));
         let (k2, _, b2) = recv_clip(&mut h).await;
-        assert_eq!((k2, b2), (SelectionKind::Primary, offer("text part")));
+        assert_eq!((k2, b2), (SelectionKind::Selection, offer("text part")));
         assert_no_broadcast(&mut h).await;
-        // primary holds the FULL raw offer (the denied rep is kept locally)
-        assert_eq!(h.clip.get(SelectionKind::Primary), Some(o));
+        // selection holds the FULL raw offer (the denied rep is kept locally)
+        assert_eq!(h.clip.get(SelectionKind::Selection), Some(o));
         // exactly one mirror write — no echo loop
         assert_eq!(h.clip.write_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn clip_to_primary_does_not_clobber_a_concurrent_primary_selection() {
-        // sync_primary + clipboard_to_primary: a clipboard copy and a fresh PRIMARY
+    async fn clip_to_selection_does_not_clobber_a_concurrent_selection() {
+        // sync_selection + clipboard_to_selection: a clipboard copy and a fresh SELECTION
         // selection land in the same debounce window. The user's direct selection
-        // must win over the clipboard->primary mirror (last-writer-wins), and must
-        // itself reach the mesh — without this the mirror overwrote PRIMARY with the
+        // must win over the clipboard->selection mirror (last-writer-wins), and must
+        // itself reach the mesh — without this the mirror overwrote SELECTION with the
         // clipboard content, so the selection couldn't be pasted and was never sent.
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         cfg.debounce_ms = 100; // batch the copy and the selection together
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("copied"));
-        h.clip.local_copy(SelectionKind::Primary, offer("selected"));
-        // The clipboard entry is processed first, then the primary entry; each is
+        h.clip
+            .local_copy(SelectionKind::Selection, offer("selected"));
+        // The clipboard entry is processed first, then the selection entry; each is
         // broadcast with its OWN content.
         let (k1, _, o1) = recv_clip(&mut h).await;
         assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("copied")));
         let (k2, _, o2) = recv_clip(&mut h).await;
-        assert_eq!((k2, o2), (SelectionKind::Primary, offer("selected")));
+        assert_eq!((k2, o2), (SelectionKind::Selection, offer("selected")));
         assert_no_broadcast(&mut h).await;
-        // The user's selection survives in PRIMARY, and the mirror did not write.
-        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("selected")));
+        // The user's selection survives in SELECTION, and the mirror did not write.
+        assert_eq!(
+            h.clip.get(SelectionKind::Selection),
+            Some(offer("selected"))
+        );
         assert_eq!(
             h.clip.write_count(),
             0,
@@ -3129,29 +3133,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn clip_to_primary_still_mirrors_a_new_copy_after_its_own_echo() {
+    async fn clip_to_selection_still_mirrors_a_new_copy_after_its_own_echo() {
         // Guard against over-correction: a second clipboard copy must still mirror
-        // into PRIMARY even when the previous mirror's own watch echo shares its
+        // into SELECTION even when the previous mirror's own watch echo shares its
         // debounce batch (the echo is not a user change, so it must not suppress
         // the new mirror).
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         cfg.debounce_ms = 100;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("A"));
         let (k1, _, o1) = recv_clip(&mut h).await; // clipboard A broadcast
         assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("A")));
-        // Copy B before the mirror's primary echo has drained, so they batch.
+        // Copy B before the mirror's selection echo has drained, so they batch.
         h.clip.local_copy(SelectionKind::Clipboard, offer("B"));
-        // PRIMARY must follow the newest clipboard content, not stay stuck on A.
-        wait_applied(&h, SelectionKind::Primary, &offer("B")).await;
+        // SELECTION must follow the newest clipboard content, not stay stuck on A.
+        wait_applied(&h, SelectionKind::Selection, &offer("B")).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn sensitive_content_is_not_bridged() {
         let mut cfg = Config::for_test("s"); // exclude_sensitive on by default
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         let mut o = offer("hunter2");
         o.insert("x-kde-passwordManagerHint".to_string(), b"secret".to_vec());
@@ -3159,28 +3163,28 @@ mod tests {
         // sensitive: not broadcast (existing behavior) and not mirrored
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.write_count(), 0);
-        assert_eq!(h.clip.get(SelectionKind::Primary), None);
+        assert_eq!(h.clip.get(SelectionKind::Selection), None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn clearing_a_selection_does_not_wipe_the_partner() {
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
-        // put something in primary first (no reverse mirror, so it stays)
-        h.clip.local_copy(SelectionKind::Primary, offer("keep"));
+        // put something in selection first (no reverse mirror, so it stays)
+        h.clip.local_copy(SelectionKind::Selection, offer("keep"));
         assert_no_broadcast(&mut h).await;
         // now "clear" the clipboard (empty offer)
         h.clip.local_copy(SelectionKind::Clipboard, Offer::new());
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.write_count(), 0);
-        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("keep")));
+        assert_eq!(h.clip.get(SelectionKind::Selection), Some(offer("keep")));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_read_does_not_poison_the_bridge() {
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         h.clip.set_fail_reads(true);
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
@@ -3191,13 +3195,13 @@ mod tests {
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
         let (kind, _, o) = recv_clip(&mut h).await;
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("foo")));
-        wait_applied(&h, SelectionKind::Primary, &offer("foo")).await;
+        wait_applied(&h, SelectionKind::Selection, &offer("foo")).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn priming_does_not_spontaneously_bridge_restored_content() {
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         // restart over an existing clipboard
         let mut h = start_seeded(cfg, Some(offer("restored"))).await;
         // the watcher re-reports the restored clipboard (as a subscribe-time
@@ -3206,21 +3210,22 @@ mod tests {
             .local_copy(SelectionKind::Clipboard, offer("restored"));
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.write_count(), 0);
-        assert_eq!(h.clip.get(SelectionKind::Primary), None);
+        assert_eq!(h.clip.get(SelectionKind::Selection), None);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn priming_does_not_spontaneously_bridge_restored_primary() {
-        // The primary→clipboard symmetric case: this is the only test that
-        // exercises watched_kinds()'s primary_to_clip branch (PRIMARY watched
-        // for the bridge while sync_primary is off).
+    async fn priming_does_not_spontaneously_bridge_restored_selection() {
+        // The selection→clipboard symmetric case: this is the only test that
+        // exercises watched_kinds()'s selection_to_clip branch (SELECTION watched
+        // for the bridge while sync_selection is off).
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::PrimaryToClipboard;
-        // restart over an existing primary selection
-        let mut h = start_seeded_with(cfg, &[(SelectionKind::Primary, offer("restored"))]).await;
-        // the watcher re-reports the restored primary; priming recorded it in
-        // self_written[Primary], so it must NOT mirror into the clipboard.
-        h.clip.local_copy(SelectionKind::Primary, offer("restored"));
+        cfg.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD;
+        // restart over an existing selection
+        let mut h = start_seeded_with(cfg, &[(SelectionKind::Selection, offer("restored"))]).await;
+        // the watcher re-reports the restored selection; priming recorded it in
+        // self_written[Selection], so it must NOT mirror into the clipboard.
+        h.clip
+            .local_copy(SelectionKind::Selection, offer("restored"));
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.write_count(), 0);
         assert_eq!(h.clip.get(SelectionKind::Clipboard), None);
@@ -3228,24 +3233,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn recopy_remirrors_after_partner_drifts_out_of_band() {
-        // clipboard_to_primary, sync_primary off: PRIMARY is unwatched, so it
+        // clipboard_to_selection, sync_selection off: SELECTION is unwatched, so it
         // can change without the engine ever seeing it. Re-copying the SAME
         // clipboard content must still re-establish the mirror — the bridge
-        // reconciles against PRIMARY's actual content, not a stale write memo.
+        // reconciles against SELECTION's actual content, not a stale write memo.
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
         let (kind, _, o) = recv_clip(&mut h).await;
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("foo")));
-        wait_applied(&h, SelectionKind::Primary, &offer("foo")).await;
-        // PRIMARY drifts out of band (seed = no watcher event in this mode).
-        h.clip.seed(SelectionKind::Primary, offer("bar"));
+        wait_applied(&h, SelectionKind::Selection, &offer("foo")).await;
+        // SELECTION drifts out of band (seed = no watcher event in this mode).
+        h.clip.seed(SelectionKind::Selection, offer("bar"));
         // Re-copy identical clipboard bytes: echo-suppressed on the mesh...
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
         assert_no_broadcast(&mut h).await;
-        // ...but re-mirrored locally, because PRIMARY no longer holds it.
-        wait_applied(&h, SelectionKind::Primary, &offer("foo")).await;
+        // ...but re-mirrored locally, because SELECTION no longer holds it.
+        wait_applied(&h, SelectionKind::Selection, &offer("foo")).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3255,13 +3260,13 @@ mod tests {
         // re-broadcast to the mesh under this node's own origin (which would
         // amplify traffic O(peers) and re-attribute the update).
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         send_inbound(&h, SelectionKind::Clipboard, offer("foo")).await;
         wait_applied(&h, SelectionKind::Clipboard, &offer("foo")).await;
         assert_no_broadcast(&mut h).await; // not re-broadcast
-        assert_eq!(h.clip.get(SelectionKind::Primary), None); // not bridged
+        assert_eq!(h.clip.get(SelectionKind::Selection), None); // not bridged
         assert_eq!(h.clip.write_count(), 1); // only the inbound apply itself
     }
 
@@ -3271,18 +3276,18 @@ mod tests {
         // keyed on only one selection while both are live — verify received
         // content on either selection is still neither bridged nor re-broadcast.
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::Both;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::BOTH;
         let mut h = start(cfg).await;
-        // inbound CLIPBOARD must not bridge into PRIMARY
+        // inbound CLIPBOARD must not bridge into SELECTION
         send_inbound(&h, SelectionKind::Clipboard, offer("foo")).await;
         wait_applied(&h, SelectionKind::Clipboard, &offer("foo")).await;
         assert_no_broadcast(&mut h).await;
-        assert_eq!(h.clip.get(SelectionKind::Primary), None);
+        assert_eq!(h.clip.get(SelectionKind::Selection), None);
         assert_eq!(h.clip.write_count(), 1);
-        // inbound PRIMARY must not bridge into CLIPBOARD (which keeps "foo")
-        send_inbound(&h, SelectionKind::Primary, offer("bar")).await;
-        wait_applied(&h, SelectionKind::Primary, &offer("bar")).await;
+        // inbound SELECTION must not bridge into CLIPBOARD (which keeps "foo")
+        send_inbound(&h, SelectionKind::Selection, offer("bar")).await;
+        wait_applied(&h, SelectionKind::Selection, &offer("bar")).await;
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("foo")));
         assert_eq!(h.clip.write_count(), 2); // only the two inbound applies
@@ -3290,18 +3295,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn recopy_remirrors_after_clipboard_drifts_out_of_band() {
-        // The primary→clipboard mirror axis of recopy_remirrors_...: here the
+        // The selection→clipboard mirror axis of recopy_remirrors_...: here the
         // CLIPBOARD is the partner and drifts out of band; re-selecting the
-        // same primary content must re-establish the mirror.
+        // same selection content must re-establish the mirror.
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::PrimaryToClipboard;
+        cfg.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD;
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Primary, offer("foo"));
+        h.clip.local_copy(SelectionKind::Selection, offer("foo"));
         let (kind, _, o) = recv_clip(&mut h).await; // lands in (synced) clipboard
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("foo")));
         wait_applied(&h, SelectionKind::Clipboard, &offer("foo")).await;
         h.clip.seed(SelectionKind::Clipboard, offer("bar")); // out-of-band drift
-        h.clip.local_copy(SelectionKind::Primary, offer("foo"));
+        h.clip.local_copy(SelectionKind::Selection, offer("foo"));
         wait_applied(&h, SelectionKind::Clipboard, &offer("foo")).await; // re-mirrored
     }
 
@@ -3310,11 +3315,11 @@ mod tests {
         // The reconcile's termination guard: when the partner already holds the
         // source content, a re-copy must not issue another write.
         let mut cfg = Config::for_test("s");
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
         let _ = recv_clip(&mut h).await;
-        wait_applied(&h, SelectionKind::Primary, &offer("foo")).await;
+        wait_applied(&h, SelectionKind::Selection, &offer("foo")).await;
         assert_eq!(h.clip.write_count(), 1);
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo")); // identical re-copy
         assert_no_broadcast(&mut h).await;
@@ -3322,16 +3327,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn mirrored_primary_is_fed_to_the_mesh_when_synced() {
+    async fn mirrored_selection_is_fed_to_the_mesh_when_synced() {
         let mut cfg = Config::for_test("s");
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::ClipboardToPrimary;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
         let (k1, _, o1) = recv_clip(&mut h).await;
         assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("foo")));
         let (k2, _, o2) = recv_clip(&mut h).await;
-        assert_eq!((k2, o2), (SelectionKind::Primary, offer("foo")));
+        assert_eq!((k2, o2), (SelectionKind::Selection, offer("foo")));
         assert_no_broadcast(&mut h).await;
     }
 
@@ -3339,11 +3344,11 @@ mod tests {
     async fn bridge_runs_locally_under_receive_only_without_broadcasting() {
         let mut cfg = Config::for_test("s");
         cfg.direction = Direction::ReceiveOnly;
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::Both;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::BOTH;
         let mut h = start(cfg).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("foo"));
-        wait_applied(&h, SelectionKind::Primary, &offer("foo")).await; // local mirror
+        wait_applied(&h, SelectionKind::Selection, &offer("foo")).await; // local mirror
         assert_no_broadcast(&mut h).await; // receive_only never broadcasts
         assert_eq!(h.clip.write_count(), 1);
     }
@@ -3356,29 +3361,29 @@ mod tests {
         assert_eq!((kind, o), (SelectionKind::Clipboard, offer("foo")));
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.write_count(), 0);
-        assert_eq!(h.clip.get(SelectionKind::Primary), None);
+        assert_eq!(h.clip.get(SelectionKind::Selection), None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn same_window_conflict_keeps_each_direct_change() {
         let mut cfg = Config::for_test("s");
         cfg.debounce_ms = 100;
-        cfg.sync_primary = true;
-        cfg.link_selections = LinkSelections::Both;
+        cfg.sync_selection = true;
+        cfg.link_selections = LinkSelections::BOTH;
         let mut h = start(cfg).await;
         // Both selections are changed *directly* by the user within one debounce
         // window. A direct change outranks the mirror (last-writer-wins), so
         // neither clobbers the other: each selection keeps — and broadcasts — its
         // own content, instead of the first-seen change overwriting the second.
         h.clip.local_copy(SelectionKind::Clipboard, offer("clip"));
-        h.clip.local_copy(SelectionKind::Primary, offer("prim"));
+        h.clip.local_copy(SelectionKind::Selection, offer("prim"));
         let (k1, _, o1) = recv_clip(&mut h).await;
         assert_eq!((k1, o1), (SelectionKind::Clipboard, offer("clip")));
         let (k2, _, o2) = recv_clip(&mut h).await;
-        assert_eq!((k2, o2), (SelectionKind::Primary, offer("prim")));
+        assert_eq!((k2, o2), (SelectionKind::Selection, offer("prim")));
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("clip")));
-        assert_eq!(h.clip.get(SelectionKind::Primary), Some(offer("prim")));
+        assert_eq!(h.clip.get(SelectionKind::Selection), Some(offer("prim")));
         assert_eq!(
             h.clip.write_count(),
             0,

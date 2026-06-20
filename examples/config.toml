@@ -26,17 +26,11 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # Everything below is optional (defaults shown):
 # max_payload_size = "32MiB"  # skip clipboard contents larger than this (whole offer)
 # debounce_ms = 100           # quiet period before broadcasting
-# sync_primary = false        # also sync the middle-click primary selection
-# link_selections = "off"     # locally mirror between the clipboard and the
-#                             # middle-click primary selection on THIS host
-#                             # (separate from sync_primary, which is mesh-wide).
-#                             # "off" | "clipboard_to_primary" |
-#                             # "primary_to_clipboard" | "both".
-#                             # WARNING: "primary_to_clipboard" (and "both")
-#                             # make selecting any text overwrite your clipboard
-#                             # — and, because the clipboard is always synced
-#                             # when this node sends, your peers' clipboards too
-#                             # (regardless of sync_primary).
+# sync_selection = false      # also sync the middle-click selection across the mesh
+# link_selections: locally mirror between the clipboard and the middle-click
+#                  selection on THIS host (separate from sync_selection, which is
+#                  mesh-wide). Configured as a [link_selections] table — see the
+#                  bottom of this file (a TOML table header must come last).
 # direction = "both"          # "both" | "send_only" | "receive_only"
 # exclude_sensitive = true    # skip password-manager-flagged contents
 # resync_on_connect = true    # push current clipboard to peers when they (re)connect
@@ -65,12 +59,12 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # then survives the source app exiting (clipboard-manager behavior), and — with
 # synthesize_text_plain above — the re-offered set includes the synthesized
 # text/plain, so X11-sourced content pastes on THIS host too (not just peers).
-# Applies to every watched selection (clipboard, and primary when sync_primary or
-# a primary bridge is on). Off by default. Engages on copies made while clipmesh
-# runs, not on content already present when it starts. While exclude_sensitive is
-# on (the default), password-manager-flagged content is not re-owned (so it can't
-# outlive the manager clearing the clipboard); with exclude_sensitive = false it
-# would be.
+# Applies to every watched selection (clipboard, and the selection when
+# sync_selection or a selection bridge is on). Off by default. Engages on copies
+# made while clipmesh runs, not on content already present when it starts. While
+# exclude_sensitive is on (the default), password-manager-flagged content is not
+# re-owned (so it can't outlive the manager clearing the clipboard); with
+# exclude_sensitive = false it would be.
 # take_ownership = false
 
 # Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside this
@@ -97,3 +91,15 @@ psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
 # replaces the others (it does not merge per-type), and clipmesh stamps the file
 # with a managed [clipmesh] table (version + origin) to order edits. Turn it off
 # to keep each host's rules independent.
+
+# Local selection linking (see the note up top). Mirror between the Ctrl+C
+# clipboard and the mouse-highlight / middle-click selection on THIS host. Each
+# direction is independent and off unless set true; omit the whole table for no
+# linking. This is local-only, separate from sync_selection (which is mesh-wide).
+# A TOML table header captures every key below it, so keep this LAST in the file.
+# [link_selections]
+# clipboard_to_selection = true   # Ctrl+C copy    -> also middle-click pasteable
+# selection_to_clipboard = true   # mouse-highlight -> also Ctrl+V pasteable
+#   WARNING: selection_to_clipboard makes selecting any text overwrite your
+#   clipboard — and, because the clipboard is always synced when this node sends,
+#   your peers' clipboards too (regardless of sync_selection).

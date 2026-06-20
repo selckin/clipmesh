@@ -8,7 +8,7 @@
 Add a *local* bridge between the two selections on a single host: mirror
 the regular CLIPBOARD selection into the PRIMARY (middle-click) selection
 and/or vice versa. This is a different axis from the existing mesh sync —
-`sync_primary` already syncs CLIPBOARD↔CLIPBOARD and PRIMARY↔PRIMARY
+`sync_selection` already syncs CLIPBOARD↔CLIPBOARD and PRIMARY↔PRIMARY
 *across hosts*; this feature couples the two selections *on the same host*.
 
 It is controlled per-direction by a new `link_selections` config, default
@@ -23,7 +23,7 @@ On Wayland the CLIPBOARD selection (Ctrl-C / Ctrl-V) and the PRIMARY
 selection (select-to-copy / middle-click-paste) are independent. Users
 commonly want them coupled locally so that, e.g., a Ctrl-C is also
 middle-click-pasteable. clipmesh already speaks both selections
-(`SelectionKind::{Clipboard, Primary}`, `read_offer`/`write_offer` for
+(`SelectionKind::{Clipboard, Selection}`, `read_offer`/`write_offer` for
 each), so the plumbing exists; what's missing is a local transform that
 copies one selection's content into the other.
 
@@ -33,7 +33,7 @@ controllable:
 - **`clipboard → primary`** is harmless: after Ctrl-C the content is also
   middle-click-pasteable.
 - **`primary → clipboard`** is a footgun: *selecting any text anywhere*
-  overwrites the Ctrl-C clipboard — and, with `sync_primary`, every peer's
+  overwrites the Ctrl-C clipboard — and, with `sync_selection`, every peer's
   clipboard too. It's off unless explicitly enabled (this is why X11 tools
   like autocutsel split the two directions).
 
@@ -57,10 +57,19 @@ controllable:
 All behavior lives in `src/sync.rs` (the bridge step + loop guard) and
 `src/config.rs` (the new setting), with a one-field change in
 `src/clipboard/wayland.rs` and one line in `src/main.rs` to decouple
-PRIMARY watching from `sync_primary`. The transport, protocol, mesh, and
+PRIMARY watching from `sync_selection`. The transport, protocol, mesh, and
 MIME-rules layers are untouched.
 
 ### Config surface
+
+> **Superseded (2026-06-20):** the on-disk surface below (a string enum
+> `link_selections = "clipboard_to_selection" | ...`) was later replaced by a
+> `[link_selections]` table with two booleans, `clipboard_to_selection` and
+> `selection_to_clipboard` (each off unless set; omit the table for `Off`). The
+> internal `LinkSelections` enum and its `clip_to_selection()`/
+> `selection_to_clip()` helpers are unchanged — a `RawLinkSelections` table
+> resolves into the enum via `From`. The original enum-string design is kept
+> below as the historical record. See `examples/config.toml` for the live shape.
 
 A new enum modeled on the existing `Direction` / `MimePolicy`:
 
@@ -69,19 +78,19 @@ A new enum modeled on the existing `Direction` / `MimePolicy`:
 #[serde(rename_all = "snake_case")]
 pub enum LinkSelections {
     Off,                  // default
-    ClipboardToPrimary,
-    PrimaryToClipboard,
+    ClipboardToSelection,
+    SelectionToClipboard,
     Both,
 }
 
 impl LinkSelections {
-    fn clip_to_primary(self) -> bool { matches!(self, Self::ClipboardToPrimary | Self::Both) }
-    fn primary_to_clip(self) -> bool { matches!(self, Self::PrimaryToClipboard | Self::Both) }
+    fn clip_to_selection(self) -> bool { matches!(self, Self::ClipboardToSelection | Self::Both) }
+    fn selection_to_clip(self) -> bool { matches!(self, Self::SelectionToClipboard | Self::Both) }
 }
 ```
 
-Exposed as `link_selections = "off" | "clipboard_to_primary" |
-"primary_to_clipboard" | "both"`, default `off`. Named `link_selections`,
+Exposed as `link_selections = "off" | "clipboard_to_selection" |
+"selection_to_clipboard" | "both"`, default `off`. Named `link_selections`,
 not `sync_*`: "sync" is the mesh vocabulary, "link" signals a local
 coupling. The enum can't express a nonsensical state, matching the
 `direction` idiom.
@@ -92,7 +101,7 @@ The field must be added in **four** places, because `RawConfig` is
 has no `Default`:
 
 - `RawConfig`, with `#[serde(default)]` → `LinkSelections::Off`;
-- `Config` (the resolved struct), next to `sync_primary`;
+- `Config` (the resolved struct), next to `sync_selection`;
 - the `RawConfig → Config` resolution (`from_toml`), copying the field;
 - `Config::for_test`, which constructs `Config` field-by-field with no
   `..Default::default()` — defaulting to `LinkSelections::Off` there, or the
@@ -100,17 +109,19 @@ has no `Default`:
 
 ### Watcher decoupling
 
-Today `WaylandClipboard::watch()` calls `spawn_watcher(tx, self.sync_primary)`,
+Today `WaylandClipboard::watch()` calls `spawn_watcher(tx, self.sync_selection)`,
 so PRIMARY is only observed when mesh-primary-sync is on. A
 `primary → clipboard` link needs PRIMARY *observed* even when it isn't
 mesh-synced (to detect select events). So:
 
-- `WaylandClipboard` stores `watch_primary: bool` instead of `sync_primary`.
+- `WaylandClipboard` stores a dedicated `watch_selection: bool` flag, decoupled
+  from the mesh-sync `sync_selection`, so the watcher can observe SELECTION even
+  when it isn't mesh-synced.
 - `main.rs` computes it:
-  `watch_primary = cfg.sync_primary || cfg.link_selections.primary_to_clip()`.
+  `watch_selection = cfg.sync_selection || cfg.link_selections.selection_to_clip()`.
 - `clipboard → primary` alone only *writes* PRIMARY and never needs to
   observe it, so it is correctly absent from that condition (PRIMARY then
-  stays local and unbroadcast when `sync_primary` is off).
+  stays local and unbroadcast when `sync_selection` is off).
 
 This is the one place the two axes (mesh-sync vs. local-link) touch.
 
@@ -148,8 +159,8 @@ A new method run immediately after `broadcast_selection(kind)` wherever a
 pending change is drained:
 
 1. Pick the partner/direction: `Clipboard` → mirror to `Primary` iff
-   `link.clip_to_primary()`; `Primary` → mirror to `Clipboard` iff
-   `link.primary_to_clip()`. If neither applies, return at once — so
+   `link.clip_to_selection()`; `Primary` → mirror to `Clipboard` iff
+   `link.selection_to_clip()`. If neither applies, return at once — so
    `link_selections = off` (the default) is a zero-cost no-op.
 2. Read `kind`'s **raw** offer (`read_selection`, no filter). If the read
    fails or times out (`None`), return **without** touching `last_mirrored`,
@@ -226,8 +237,8 @@ mirror.** If a selection and its bridge partner both change inside a single
 arrival order. A naive `bridge_from` would overwrite the partner *before* the
 partner's own `process()` reads it, so the first-seen change would win and the
 other selection's concurrent change would be silently destroyed — its
-now-stale read then re-broadcast as the winning content. With `sync_primary +
-clipboard_to_primary` (or `primary_to_clipboard`) this is a real data-loss
+now-stale read then re-broadcast as the winning content. With `sync_selection +
+clipboard_to_selection` (or `selection_to_clipboard`) this is a real data-loss
 bug: copy something and then select text within ~`debounce_ms`, and the
 selection you just made is overwritten by the clipboard mirror and can never
 be pasted (nor is it sent to the mesh).
@@ -257,24 +268,24 @@ concurrent edit instead of one stomping the other.
   runs regardless of `direction` (a `receive_only` node still links its two
   local selections). Whether the mirror *propagates* is decided entirely by
   the partner's `may_send`, which already encodes both `direction` and
-  `sync_primary`:
-  - `clip → primary`, `sync_primary = false`: PRIMARY mirrored locally,
+  `sync_selection`:
+  - `clip → primary`, `sync_selection = false`: PRIMARY mirrored locally,
     **not** broadcast (and PRIMARY needn't be watched, and isn't — so the
     bridge's PRIMARY write produces no echo event at all; termination there
-    is trivial, and the `last_mirrored[Primary]` stamp is simply never
+    is trivial, and the `last_mirrored[Selection]` stamp is simply never
     consulted).
-  - `clip → primary`, `sync_primary = true`: PRIMARY mirrored locally **and**
+  - `clip → primary`, `sync_selection = true`: PRIMARY mirrored locally **and**
     broadcast as a primary update.
 - **Resync is unchanged.** `on_peer_connected` still resyncs only
   `synced_kinds()`; the bridge never drives resync directly. A
-  `primary → clipboard` + `sync_primary = false` node still resyncs the
+  `primary → clipboard` + `sync_selection = false` node still resyncs the
   bridged CLIPBOARD value (CLIPBOARD is always synced), but never resyncs
   PRIMARY (it isn't a mesh selection there).
 - **Feed-the-mesh consequence (documented).** Because a bridged write rides
   the normal broadcast path, content received from a peer on one axis can be
   **re-emitted on the other axis** with a fresh `(stamp, origin = us)` —
   e.g. a peer's CLIPBOARD update lands locally, `bridge_from(Clipboard)`
-  mirrors it to PRIMARY, and (with `sync_primary`) we broadcast it as a
+  mirrors it to PRIMARY, and (with `sync_selection`) we broadcast it as a
   PRIMARY update. The mesh still converges: every host broadcasts a given
   `(selection, hash)` at most once (`current[]` echo-suppresses repeats and
   identical-content inbound applies don't re-write), so stamp churn is
@@ -292,13 +303,13 @@ raw hash) triggers the bridge. This mirrors the existing priming philosophy
 (don't re-broadcast restored content as fresh).
 
 The watched set is broader than the synced set: a `primary → clipboard` link
-with `sync_primary = false` *watches* PRIMARY (to detect selections) without
+with `sync_selection = false` *watches* PRIMARY (to detect selections) without
 *syncing* it. Priming therefore iterates the watched kinds — CLIPBOARD
-always, PRIMARY when `watch_primary` — reading each selection once and
+always, PRIMARY when `watch_selection` — reading each selection once and
 deriving both the filtered hash (recorded in `current[]` only for synced
 kinds, used for broadcast echo suppression) and the raw hash (recorded in
 `last_mirrored` for every watched kind). `synced_kinds()` keeps its current
-meaning; a parallel `watched_kinds()` (or the `watch_primary` flag) drives
+meaning; a parallel `watched_kinds()` (or the `watch_selection` flag) drives
 the priming and the seed. Since synced kinds are always a subset of watched
 kinds, no `current[]` seeding is lost.
 
@@ -308,8 +319,8 @@ All tests run on `MockClipboard`, which already fires its watch on
 `write_offer` (see `mock.rs`), so the bridge's echo path is exercised
 headless:
 
-- **Single-direction mirror:** `clipboard_to_primary` mirrors a local
-  clipboard copy into PRIMARY; `primary_to_clipboard` mirrors a selection
+- **Single-direction mirror:** `clipboard_to_selection` mirrors a local
+  clipboard copy into PRIMARY; `selection_to_clipboard` mirrors a selection
   into CLIPBOARD; each single direction does **not** mirror the other way.
 - **No loop / no redundant write under `both`:** after one copy, assert each
   selection is written exactly once (instrument the mock's write count) and
@@ -329,7 +340,7 @@ headless:
   change with different content into one debounce window and assert the
   first-changed selection wins and both selections settle on its content
   (the documented resolution rule).
-- **Feed-the-mesh:** with `sync_primary`, a clipboard copy under
+- **Feed-the-mesh:** with `sync_selection`, a clipboard copy under
   `clip → primary` produces **both** a `Clip{Clipboard}` and a
   `Clip{Primary}` broadcast (assert against captured outbound, as `mesh.rs`
   tests already do). Note the PRIMARY broadcast arrives on a *later* event-
@@ -351,7 +362,7 @@ headless:
 - `README.md`: a short paragraph distinguishing the local selection bridge
   from mesh primary-sync.
 - `CLAUDE.md`: a one-line note in the architecture section that the local
-  selection bridge is a distinct axis from `sync_primary`.
+  selection bridge is a distinct axis from `sync_selection`.
 
 ## Risks
 
@@ -361,7 +372,7 @@ headless:
   clipboards do this") and the mock honors it. If a future backend violated
   it, the bridged selection would not broadcast; the `last_mirrored` guard
   would still prevent loops.
-- **Footgun amplification.** `primary → clipboard` with `sync_primary` means
+- **Footgun amplification.** `primary → clipboard` with `sync_selection` means
   a local text selection overwrites every peer's clipboard. Mitigated by
   default-off and an explicit config warning; it is the user's deliberate
   choice.
