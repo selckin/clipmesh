@@ -545,7 +545,8 @@ impl<C: Clipboard> SyncEngine<C> {
 
     /// Whether this offer must be withheld because the user opted to exclude
     /// password-manager-flagged contents. Shared by the mesh `filter` and the
-    /// local `bridge_from` so the secret-handling policy lives in one place.
+    /// local mirror/ownership writes in `execute_write`, so the secret-handling
+    /// policy lives in one place.
     fn excludes_sensitive(&self, offer: &Offer) -> bool {
         self.cfg.exclude_sensitive && is_sensitive(offer)
     }
@@ -716,18 +717,6 @@ impl<C: Clipboard> SyncEngine<C> {
         });
     }
 
-    /// Local selection bridge: mirror `raw` (the freshly-read content of `kind`)
-    /// into the partner selection per `link_selections`. `raw` is the same read
-    /// the broadcast used. The partner's resulting watch event flows through the
-    /// normal path, so — if the partner is itself mesh-synced — a *local* change
-    /// is fed to the mesh like any other. Content the engine itself placed (an
-    /// inbound apply, restored-at-startup baseline, or an ownership rewrite) is
-    /// already filtered out by the `self_written` check in `process_local_change`
-    /// before this runs, so only genuine local changes reach the bridge.
-    ///
-    /// Never holds a lock across an await. The full raw offer is mirrored on
-    /// purpose: unlike the mesh path it bypasses the MIME/size filters, so
-    /// locally-denied or oversized representations still reach the partner.
     /// Whether any local sink would act on a change to `kind`: the mesh (if this
     /// node sends it), the selection bridge, or the ownership rewrite. When none
     /// would, `handle_batch` skips the read entirely.
@@ -2012,7 +2001,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn take_ownership_drops_its_marker_when_the_write_fails() {
-        // A failed ownership write must drop the self_written marker it set, or a
+        // A failed ownership write must drop the last_written marker it set, or a
         // later genuine copy of identical bytes would be wrongly suppressed (and
         // never re-owned). With the marker dropped, the retry re-owns (one write).
         let mut cfg = Config::for_test("s");
@@ -2024,7 +2013,7 @@ mod tests {
         h.clip.set_fail_writes(false);
         h.clip.local_copy(SelectionKind::Clipboard, offer("a")); // identical re-copy
                                                                  // Reaching one successful write proves the stale marker was not blocking
-                                                                 // the rewrite at the top of process_local_change.
+                                                                 // the echo check at the top of handle_batch.
         wait_for_write_count(&h, 1).await;
     }
 
@@ -3221,7 +3210,7 @@ mod tests {
         // restart over an existing clipboard
         let mut h = start_seeded(cfg, Some(offer("restored"))).await;
         // the watcher re-reports the restored clipboard (as a subscribe-time
-        // event would); priming recorded it in self_written, so it must NOT bridge.
+        // event would); priming recorded it in last_written, so it must NOT bridge.
         h.clip
             .local_copy(SelectionKind::Clipboard, offer("restored"));
         assert_no_broadcast(&mut h).await;
@@ -3239,7 +3228,7 @@ mod tests {
         // restart over an existing selection
         let mut h = start_seeded_with(cfg, &[(SelectionKind::Selection, offer("restored"))]).await;
         // the watcher re-reports the restored selection; priming recorded it in
-        // self_written[Selection], so it must NOT mirror into the clipboard.
+        // last_written[Selection], so it must NOT mirror into the clipboard.
         h.clip
             .local_copy(SelectionKind::Selection, offer("restored"));
         assert_no_broadcast(&mut h).await;
