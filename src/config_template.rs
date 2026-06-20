@@ -219,16 +219,21 @@ fn optional_keys() -> Vec<&'static str> {
 }
 
 /// Write `contents` to `path` atomically (temp file in the same dir + rename),
-/// so a crash mid-write can't truncate the live config.
+/// so a crash mid-write can't truncate the live config. If `path` is a symlink
+/// (stow-managed configs are), follow it and rewrite the real target in place
+/// rather than clobbering the link with a regular file; `resolve_link_target` is
+/// a no-op for a plain file. The temp file lives in the target's own directory
+/// so the rename stays on one filesystem (atomic).
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
+    let target = crate::fsutil::resolve_link_target(path);
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config.toml");
     let tmp = dir.join(format!(".{name}.sync-config.tmp"));
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
     Ok(())
 }
 
@@ -538,6 +543,42 @@ mod tests {
         assert!(sync_config(&path).is_err());
         // the broken file is left untouched
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn sync_config_writes_through_a_symlink_without_replacing_it() {
+        use std::io::Write;
+        // A stow-managed config is a symlink into the dotfiles repo; --sync-config
+        // must rewrite the real target in place, not clobber the link with a
+        // regular file.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-config.toml");
+        let link = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&target).unwrap();
+        write!(f, "listen = \"x\"\npsk = \"s\"\ndebounce_ms = 250\n").unwrap();
+        drop(f);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let outcome = sync_config(&link).unwrap();
+        assert!(matches!(outcome, SyncOutcome::Rewrote { .. }));
+
+        // the link is still a symlink to the same target, not a replaced file
+        assert!(
+            crate::fsutil::is_symlink(&link),
+            "the symlink was replaced by a regular file"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        // the rewrite landed in the target, keeping the user's value
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.contains("debounce_ms = 250"));
+        assert!(text.contains("# exclude_sensitive = true"));
+        crate::config::Config::from_toml(&text).unwrap();
+
+        // idempotent through the link
+        assert!(matches!(
+            sync_config(&link).unwrap(),
+            SyncOutcome::Unchanged
+        ));
     }
 
     #[test]

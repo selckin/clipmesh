@@ -10,7 +10,7 @@
 //! through the link (e.g. into a dotfiles repo) are seen.
 
 use crate::config::Config;
-use crate::fsutil::is_symlink;
+use crate::fsutil::{is_symlink, resolve_link_target};
 use crate::mime::MimeRules;
 use anyhow::{Context, Result};
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
@@ -76,26 +76,6 @@ impl Entry {
     fn matches(&self, wd: &WatchDescriptor, name: &OsStr) -> bool {
         self.wd == *wd && self.path.file_name() == Some(name)
     }
-}
-
-/// Follow a symlink to the file it ultimately names, resolving each relative
-/// hop against the directory of the link being followed (stow's default links
-/// are relative). Stops at the first non-symlink or unreadable component and
-/// returns the deepest path reached, which may or may not exist.
-fn resolve_link_target(path: &Path) -> PathBuf {
-    const MAX_HOPS: usize = 8;
-    let mut current = path.to_path_buf();
-    for _ in 0..MAX_HOPS {
-        match fs::read_link(&current) {
-            Ok(target) if target.is_absolute() => current = target,
-            Ok(target) => {
-                let base = current.parent().unwrap_or_else(|| Path::new("."));
-                current = base.join(target);
-            }
-            Err(_) => break,
-        }
-    }
-    current
 }
 
 /// Resolve a path's symlink target into a [`TargetSite`]: `NotSymlink` for a
@@ -535,19 +515,6 @@ mod tests {
     use super::*;
     use crate::config::MimePolicy;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn resolve_link_target_follows_a_relative_symlink_against_its_own_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let real_dir = dir.path().join("dotfiles");
-        std::fs::create_dir(&real_dir).unwrap();
-        let real = real_dir.join("config.toml");
-        std::fs::write(&real, "x").unwrap();
-        // Relative link, like GNU Stow: config.toml -> dotfiles/config.toml
-        let link = dir.path().join("config.toml");
-        std::os::unix::fs::symlink("dotfiles/config.toml", &link).unwrap();
-        assert_eq!(resolve_link_target(&link), real);
-    }
 
     #[test]
     fn target_site_resolves_a_symlinked_file_to_its_real_dir() {
