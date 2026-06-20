@@ -1,8 +1,9 @@
 use crate::clipboard::Clipboard;
-use crate::config::{Config, Direction};
+use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::MimeRules;
 use crate::protocol::{content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind};
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -206,22 +207,100 @@ pub struct SyncEngine<C> {
     /// shared rules version and broadcast the file (so the broadcast happens on
     /// the loop, not inside the sync filter). fswatch holds a clone too.
     rules_changed_tx: mpsc::Sender<()>,
-    /// Raw-content hash of the last value THIS ENGINE wrote to each selection
-    /// that did not originate as a local user change — an inbound mesh apply,
-    /// content restored at startup (`prime`), or an ownership rewrite
-    /// (`take_ownership_of`). `process_local_change` consumes a matching entry
-    /// (one-shot) to recognize the watcher echo of such a write and skip it, so
-    /// engine-originated content is never re-broadcast, re-bridged, or re-owned.
-    /// Holds *raw* hashes, distinct from `current` (filtered, mesh-ordering
-    /// state); a separate map because the lifecycle (one-shot echo suppressor
-    /// vs. durable LWW state) is genuinely different.
-    self_written: Mutex<HashMap<SelectionKind, [u8; 32]>>,
-    /// Raw-content hash of the last value the local bridge *mirrored into* each
-    /// selection. Durable (overwritten on each mirror), not one-shot. Lets
-    /// `bridge_from` tell its own prior mirror echoing back (safe to overwrite)
-    /// from a genuine concurrent user change in the same debounce batch (which
-    /// must NOT be clobbered) — see the `partner_changed_in_batch` guard.
-    mirrored: Mutex<HashMap<SelectionKind, [u8; 32]>>,
+    /// Raw-content hash of the last value the engine itself wrote to each
+    /// selection (an ownership re-offer, a local-bridge mirror, an inbound mesh
+    /// apply, or the startup-restored baseline). The watcher re-reports every
+    /// write; an incoming change whose hash matches is that echo and is dropped —
+    /// never broadcast, mirrored, or re-owned. One-shot: removed when any change
+    /// to that selection is classified, so a stale marker can never suppress a
+    /// later genuine copy of identical bytes.
+    last_written: Mutex<HashMap<SelectionKind, [u8; 32]>>,
+}
+
+/// Why the engine writes a selection during a batch — selects the reconcile
+/// rule in `execute_write`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// `take_ownership` re-offer: write unconditionally (ownership transfer),
+    /// even when the selection already holds these bytes.
+    Own,
+    /// Local-bridge mirror with `take_ownership` off: write only when the
+    /// partner does not already hold this content (reconcile against drift).
+    Mirror,
+}
+
+/// The broadcasts and writes a debounce batch produces, computed up front so
+/// propagation never rides watch echoes. Each selection is written at most once.
+struct BatchPlan {
+    broadcasts: Vec<(SelectionKind, Offer)>,
+    writes: Vec<(SelectionKind, Offer, Provenance)>,
+}
+
+/// The selection a configured link direction mirrors `kind` INTO, or `None`.
+/// Free-function twin of `SyncEngine::bridge_partner`, so the pure planner needs
+/// no `&self`.
+fn link_partner(kind: SelectionKind, link: LinkSelections) -> Option<SelectionKind> {
+    match kind {
+        SelectionKind::Clipboard if link.clip_to_selection() => Some(SelectionKind::Selection),
+        SelectionKind::Selection if link.selection_to_clip() => Some(SelectionKind::Clipboard),
+        _ => None,
+    }
+}
+
+/// Decide a batch's broadcasts and writes from its genuine local changes. Pure:
+/// no I/O and no content transforms (the `Own` synth+cap and the `Mirror`
+/// reconcile happen in `execute_write`). `reads` is every genuine user change
+/// this batch (echoes already removed), in batch order.
+fn plan_batch(
+    reads: &IndexMap<SelectionKind, Offer>,
+    link: LinkSelections,
+    own: bool,
+) -> BatchPlan {
+    // Mirror targets: a selection some genuine change mirrors INTO that is not
+    // itself a genuine change (direct-change-wins — never clobber a concurrent
+    // user change). The two selections never share a partner (the mapping is a
+    // bijection), so each target has a single source.
+    let mut mirror_targets: IndexMap<SelectionKind, Offer> = IndexMap::new();
+    for (&kind, raw) in reads {
+        if let Some(partner) = link_partner(kind, link) {
+            if !reads.contains_key(&partner) {
+                mirror_targets.insert(partner, raw.clone());
+            }
+        }
+    }
+
+    // Broadcasts: every genuine change, then every mirror target (so a mirrored
+    // partner still reaches the mesh, as today). The caller applies may_send +
+    // content filters + mesh-current dedup, so a non-synced or unchanged
+    // selection yields no actual send.
+    let mut broadcasts = Vec::new();
+    for (&kind, raw) in reads {
+        broadcasts.push((kind, raw.clone()));
+    }
+    for (&kind, raw) in &mirror_targets {
+        broadcasts.push((kind, raw.clone()));
+    }
+
+    // Writes, each selection at most once:
+    //  - own on  -> Own (unconditional) for every genuine change AND every mirror
+    //    target (the mirror+own merge: one owned write, no separate mirror write).
+    //  - own off -> Mirror (reconciled) for mirror targets only; genuine changes
+    //    are broadcast but not written locally.
+    let mut writes = Vec::new();
+    if own {
+        for (&kind, raw) in reads {
+            writes.push((kind, raw.clone(), Provenance::Own));
+        }
+        for (&kind, raw) in &mirror_targets {
+            writes.push((kind, raw.clone(), Provenance::Own));
+        }
+    } else {
+        for (&kind, raw) in &mirror_targets {
+            writes.push((kind, raw.clone(), Provenance::Mirror));
+        }
+    }
+
+    BatchPlan { broadcasts, writes }
 }
 
 impl<C: Clipboard> SyncEngine<C> {
@@ -240,8 +319,7 @@ impl<C: Clipboard> SyncEngine<C> {
             clock: Mutex::new(0),
             mime_rules,
             rules_changed_tx,
-            self_written: Mutex::new(HashMap::new()),
-            mirrored: Mutex::new(HashMap::new()),
+            last_written: Mutex::new(HashMap::new()),
         })
     }
 
@@ -272,15 +350,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// `None` when no bridge direction is configured for `kind`. Single place
     /// that maps the `link_selections` directions to a source→partner pair.
     fn bridge_partner(&self, kind: SelectionKind) -> Option<SelectionKind> {
-        match kind {
-            SelectionKind::Clipboard if self.cfg.link_selections.clip_to_selection() => {
-                Some(SelectionKind::Selection)
-            }
-            SelectionKind::Selection if self.cfg.link_selections.selection_to_clip() => {
-                Some(SelectionKind::Clipboard)
-            }
-            _ => None,
-        }
+        link_partner(kind, self.cfg.link_selections)
     }
 
     fn may_send(&self, kind: SelectionKind) -> bool {
@@ -363,10 +433,7 @@ impl<C: Clipboard> SyncEngine<C> {
                     primed = true;
                     if !pending.is_empty() {
                         if self.cfg.debounce_ms == 0 {
-                            let batch = std::mem::take(&mut pending);
-                            for &k in &batch {
-                                self.process_local_change(k, &batch).await;
-                            }
+                            self.handle_batch(std::mem::take(&mut pending)).await;
                         } else {
                             deadline.as_mut().reset(tokio::time::Instant::now() + window);
                             armed = true;
@@ -382,10 +449,7 @@ impl<C: Clipboard> SyncEngine<C> {
                         // buffer — broadcasting now would re-send it as fresh.
                         if primed {
                             if self.cfg.debounce_ms == 0 {
-                                let batch = std::mem::take(&mut pending);
-                                for &k in &batch {
-                                    self.process_local_change(k, &batch).await;
-                                }
+                                self.handle_batch(std::mem::take(&mut pending)).await;
                             } else {
                                 deadline.as_mut().reset(tokio::time::Instant::now() + window);
                                 armed = true;
@@ -399,10 +463,7 @@ impl<C: Clipboard> SyncEngine<C> {
                 },
                 _ = &mut deadline, if armed => {
                     armed = false;
-                    let batch = std::mem::take(&mut pending);
-                    for &k in &batch {
-                        self.process_local_change(k, &batch).await;
-                    }
+                    self.handle_batch(std::mem::take(&mut pending)).await;
                 },
                 msg = inbound.recv() => match msg {
                     Some((from, msg)) => self.on_inbound(from, msg).await,
@@ -453,7 +514,7 @@ impl<C: Clipboard> SyncEngine<C> {
             // inbound apply may already have recorded newer content here — don't
             // clobber it.
             let raw_hash = content_hash(&raw);
-            self.self_written
+            self.last_written
                 .lock()
                 .unwrap()
                 .entry(kind)
@@ -667,173 +728,127 @@ impl<C: Clipboard> SyncEngine<C> {
     /// Never holds a lock across an await. The full raw offer is mirrored on
     /// purpose: unlike the mesh path it bypasses the MIME/size filters, so
     /// locally-denied or oversized representations still reach the partner.
-    ///
-    /// `partner_changed_in_batch` is true when the partner selection was itself
-    /// drained in this same debounce window. If the partner now holds content the
-    /// bridge did not just mirror there, that content is a fresh *direct* user
-    /// change (e.g. a text selection made right after a copy) — last-writer-wins,
-    /// so the mirror steps aside rather than clobbering it.
-    async fn bridge_from(&self, kind: SelectionKind, raw: Offer, partner_changed_in_batch: bool) {
-        let Some(partner) = self.bridge_partner(kind) else {
-            return;
-        };
-        if raw.is_empty() {
-            return; // clearing one selection must not wipe the partner
-        }
-        let h = content_hash(&raw);
-        if self.excludes_sensitive(&raw) {
-            return; // never hop a password-manager secret between selections
-        }
-        // Reconcile against the partner's ACTUAL content rather than a write-side
-        // hash memo: only write when it differs. This is what keeps the bridge
-        // correct when the partner drifts out of band (it may be unwatched), and
-        // it guarantees termination — after the write the partner equals the
-        // source, so the mirror's own echo finds them equal and stops.
-        match self.read_selection(partner).await {
-            // Partner already holds this content: nothing to mirror.
-            Some(partner_now) if content_hash(&partner_now) == h => return,
-            Some(partner_now) => {
-                // Partner differs. If it changed directly in this batch and what
-                // it holds is NOT our own prior mirror (tracked in `mirrored`),
-                // it's a fresh user change that outranks this older source — leave
-                // it. The mirror echo case (partner == what we last mirrored) is
-                // safe to overwrite, so a later copy still propagates.
-                if partner_changed_in_batch
-                    && self.mirrored.lock().unwrap().get(&partner)
-                        != Some(&content_hash(&partner_now))
-                {
-                    debug!(
-                        "not mirroring {kind:?} -> {partner:?}: {partner:?} was changed directly this batch"
-                    );
-                    return;
-                }
-            }
-            None => {
-                // Couldn't read the partner (error/timeout); read_selection has
-                // already warned. Mirror best-effort to preserve liveness — an
-                // extra write is harmless and self-terminating — rather than
-                // skip, despite that warning's generic "skipping" wording.
-                debug!("couldn't read {partner:?} to reconcile; mirroring {kind:?} best-effort");
-            }
-        }
-        // Describe before `raw` is moved into write_offer; logged only on a
-        // successful mirror, matching the broadcast path's verbose style.
-        let copied = self.cfg.verbose.then(|| describe_offer(&raw));
-        match self.clipboard.write_offer(partner, raw).await {
-            Ok(()) => {
-                // Remember what we mirrored here so this write's own watch echo
-                // (and only it) is later recognized as non-user content.
-                self.mirrored.lock().unwrap().insert(partner, h);
-                if let Some(copied) = copied {
-                    info!("mirrored {kind:?} -> {partner:?} [{copied}]");
-                }
-            }
-            Err(e) => warn!("couldn't mirror {kind:?} to {partner:?}: {e:#}"),
-        }
-    }
-
-    /// Drain one pending selection change: read it once, then propagate it to
-    /// each active local sink — the mesh broadcast, the selection bridge, and the
-    /// ownership rewrite. `batch` is every selection drained together in this
-    /// debounce window, used to spot a partner the user changed directly in the
-    /// same window (so the bridge doesn't clobber it).
-    async fn process_local_change(&self, kind: SelectionKind, batch: &[SelectionKind]) {
-        // Skip the read entirely when nothing will act on this selection,
-        // preserving the verbose "not sent" diagnostic.
-        if !self.has_local_sink(kind) {
-            if self.cfg.verbose {
-                info!("copied {kind:?}: not sent (this node does not send)");
-            }
-            return;
-        }
-        let Some(raw) = self.read_selection(kind).await else {
-            return;
-        };
-        // Recognize and skip the engine's own writes — an inbound apply, content
-        // restored by prime, or an ownership rewrite. The watcher re-reports
-        // them, but they aren't fresh user copies, so they must not be broadcast,
-        // bridged, or re-owned. The marker is drained whenever one is present (so
-        // a stale one can't accumulate), and the offer is hashed ONLY when a
-        // marker exists — the common genuine-copy path does no hashing here.
-        let is_echo = match self.self_written.lock().unwrap().remove(&kind) {
-            Some(h) => h == content_hash(&raw),
-            None => false,
-        };
-        if is_echo {
-            return;
-        }
-        // Propagate to each active sink, moving `raw` into the last consumer so
-        // only the earlier ones clone.
-        let own = self.cfg.take_ownership;
-        if self.bridge_partner(kind).is_some() {
-            // The bridge's partner was also changed directly in this batch when it
-            // appears here: a fresh user change the mirror must not overwrite.
-            let partner_in_batch = self
-                .bridge_partner(kind)
-                .is_some_and(|p| batch.contains(&p));
-            self.broadcast_selection(kind, raw.clone()).await;
-            if own {
-                self.bridge_from(kind, raw.clone(), partner_in_batch).await;
-                self.take_ownership_of(kind, raw).await;
-            } else {
-                self.bridge_from(kind, raw, partner_in_batch).await;
-            }
-        } else if own {
-            self.broadcast_selection(kind, raw.clone()).await;
-            self.take_ownership_of(kind, raw).await;
-        } else {
-            self.broadcast_selection(kind, raw).await;
-        }
-    }
-
     /// Whether any local sink would act on a change to `kind`: the mesh (if this
     /// node sends it), the selection bridge, or the ownership rewrite. When none
-    /// would, `process_local_change` skips the read entirely.
+    /// would, `handle_batch` skips the read entirely.
     fn has_local_sink(&self, kind: SelectionKind) -> bool {
         self.may_send(kind) || self.bridge_partner(kind).is_some() || self.cfg.take_ownership
     }
 
-    /// Re-offer `raw` so clipmesh owns the `kind` selection (its content then
-    /// survives the source app exiting), optionally back-filling text/plain when
-    /// `synthesize_text_plain` is on so it pastes locally too. The written content
-    /// is recorded in `self_written` *before* the write, so the resulting watch
-    /// event is recognized as ours and skipped — no re-broadcast, re-bridge, or
-    /// rewrite loop. Never persists a password-manager secret.
-    async fn take_ownership_of(&self, kind: SelectionKind, raw: Offer) {
-        if raw.is_empty() {
-            return; // nothing to own; never clobber an empty selection
+    /// Drain one debounce batch: read each fired selection once, plan every
+    /// broadcast and write up front, then execute — writing each selection at most
+    /// once and recording it in `last_written` so its watch echo is dropped next
+    /// batch rather than re-driving propagation.
+    async fn handle_batch(&self, batch: Vec<SelectionKind>) {
+        // Phase 1: read & classify. `read_cache` holds every read (incl. echoes) so
+        // a Mirror reconcile can reuse a partner that fired this batch.
+        let mut reads: IndexMap<SelectionKind, Offer> = IndexMap::new();
+        let mut read_cache: HashMap<SelectionKind, Offer> = HashMap::new();
+        for kind in batch {
+            if !self.has_local_sink(kind) {
+                if self.cfg.verbose {
+                    info!("copied {kind:?}: not sent (this node does not send)");
+                }
+                continue;
+            }
+            let Some(raw) = self.read_selection(kind).await else {
+                continue;
+            };
+            // One-shot consume the echo memo; hash only when a marker exists (the
+            // common genuine-copy path does no hashing here).
+            let is_echo = match self.last_written.lock().unwrap().remove(&kind) {
+                Some(h) => h == content_hash(&raw),
+                None => false,
+            };
+            read_cache.insert(kind, raw.clone());
+            if is_echo {
+                continue; // our own write echoing back — drop, no propagation
+            }
+            reads.insert(kind, raw);
         }
-        if self.excludes_sensitive(&raw) {
-            debug!("not taking ownership of {kind:?}: flagged sensitive");
+        if reads.is_empty() {
             return;
         }
-        let owned = if self.cfg.synthesize_text_plain {
-            synthesize_text_plain(raw)
-        } else {
-            raw
-        };
-        // Cap to max_payload_size so the written offer round-trips through the
-        // read-back budget: assemble_offer caps every read at the same limit, so
-        // an over-budget rewrite (synthesis can add ~2x the atom's bytes) would
-        // be re-read smaller, miss its own self_written marker, and churn
-        // (re-broadcast + re-own). Unlike the mesh path the per-type MIME rules
-        // are intentionally NOT applied — a node keeps every readable type it
-        // copied for local paste, bounded only by the global size budget.
-        let owned = cap_to_payload_size(owned, self.cfg.max_payload_size);
-        if owned.is_empty() {
-            return; // everything was over budget; nothing left to own
+
+        // Phase 2: plan (pure).
+        let plan = plan_batch(&reads, self.cfg.link_selections, self.cfg.take_ownership);
+
+        // Phase 3: execute.
+        for (kind, raw) in plan.broadcasts {
+            self.broadcast_selection(kind, raw).await;
         }
-        // Mark before the write so the watcher event it triggers is skipped.
-        self.self_written
-            .lock()
-            .unwrap()
-            .insert(kind, content_hash(&owned));
-        if let Err(e) = self.clipboard.write_offer(kind, owned).await {
-            warn!("couldn't take ownership of the {kind:?} selection: {e:#}");
-            // The write failed, so no watch event will arrive to consume the
-            // marker; drop it so a later genuine copy of identical bytes isn't
-            // wrongly suppressed.
-            self.self_written.lock().unwrap().remove(&kind);
+        for (kind, content, prov) in plan.writes {
+            self.execute_write(kind, content, prov, &read_cache).await;
+        }
+    }
+
+    /// Execute one planned write: apply the `Own` transform (synthesis + size cap)
+    /// or the `Mirror` reconcile, record `last_written` before writing so the echo
+    /// is dropped, and undo the record on write failure.
+    async fn execute_write(
+        &self,
+        kind: SelectionKind,
+        content: Offer,
+        prov: Provenance,
+        read_cache: &HashMap<SelectionKind, Offer>,
+    ) {
+        // Never re-offer or mirror a password-manager secret.
+        if self.excludes_sensitive(&content) {
+            if prov == Provenance::Own {
+                debug!("not taking ownership of {kind:?}: flagged sensitive");
+            }
+            return;
+        }
+        let final_offer = match prov {
+            Provenance::Own => {
+                let owned = if self.cfg.synthesize_text_plain {
+                    synthesize_text_plain(content)
+                } else {
+                    content
+                };
+                // Cap so the owned offer round-trips the read-back budget (see the
+                // original take_ownership_of note): an over-budget rewrite would be
+                // re-read smaller, miss its marker, and churn.
+                cap_to_payload_size(owned, self.cfg.max_payload_size)
+            }
+            // The bridge intentionally bypasses the MIME/size filters so locally
+            // denied or oversized reps still reach the partner.
+            Provenance::Mirror => content,
+        };
+        if final_offer.is_empty() {
+            return;
+        }
+        if prov == Provenance::Mirror {
+            // Reconcile against the partner's ACTUAL content (handles out-of-band
+            // drift; the partner may be unwatched). Reuse a read from this batch if
+            // the partner fired, else read once. A failed read falls through to a
+            // best-effort, self-terminating mirror (matching the old bridge_from).
+            let partner_now = match read_cache.get(&kind) {
+                Some(o) => Some(o.clone()),
+                None => self.read_selection(kind).await,
+            };
+            if let Some(now) = partner_now {
+                if content_hash(&now) == content_hash(&final_offer) {
+                    return;
+                }
+            }
+        }
+        let h = content_hash(&final_offer);
+        let copied = self.cfg.verbose.then(|| describe_offer(&final_offer));
+        // Record BEFORE the write so the watch echo it produces is recognised.
+        self.last_written.lock().unwrap().insert(kind, h);
+        match self.clipboard.write_offer(kind, final_offer).await {
+            Ok(()) => {
+                if let (Provenance::Mirror, Some(copied)) = (prov, copied) {
+                    info!("mirrored into {kind:?} [{copied}]");
+                }
+            }
+            Err(e) => {
+                warn!("couldn't write the {kind:?} selection: {e:#}");
+                // No echo will arrive; drop the marker so a later genuine copy of
+                // identical bytes isn't wrongly suppressed.
+                self.last_written.lock().unwrap().remove(&kind);
+            }
         }
     }
 
@@ -1073,7 +1088,7 @@ impl<C: Clipboard> SyncEngine<C> {
                 // re-broadcast to the mesh under our own origin. `link_selections`
                 // is a purely *local* coupling; cross-host propagation is
                 // `sync_selection`'s job.
-                self.self_written.lock().unwrap().insert(kind, applied_hash);
+                self.last_written.lock().unwrap().insert(kind, applied_hash);
                 "applied"
             }
             Err(e) => {
@@ -1936,7 +1951,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn take_ownership_with_link_selections_terminates() {
         // Ownership rewrites both the clipboard and (via the bridge) the selection;
-        // each rewrite re-fires the watcher. The self_written markers must make
+        // each rewrite re-fires the watcher. The last_written markers must make
         // the whole thing quiesce rather than storm.
         let mut cfg = Config::for_test("s");
         cfg.take_ownership = true;
@@ -1949,14 +1964,15 @@ mod tests {
         wait_applied(&h, SelectionKind::Selection, &offer("hi")).await;
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("hi")));
-        // Exactly three writes, all echo-suppressed afterward: the bridge mirror
-        // to SELECTION, the CLIPBOARD ownership rewrite, and the SELECTION ownership
-        // rewrite (triggered by the bridge's write). A runaway loop would hang
-        // above or exceed this.
+        // Exactly two writes, both echo-suppressed afterward: the CLIPBOARD
+        // ownership write and the SELECTION write are now one owned write each
+        // (the bridge mirror and the SELECTION ownership rewrite are merged),
+        // with no intermediate raw mirror write. A runaway loop would hang above
+        // or exceed this.
         assert_eq!(
             h.clip.write_count(),
-            3,
-            "expected exactly 3 writes (bridge + 2 ownership)"
+            2,
+            "expected exactly 2 writes (own CLIPBOARD + own SELECTION, merged)"
         );
     }
 
@@ -3388,6 +3404,124 @@ mod tests {
             h.clip.write_count(),
             0,
             "neither mirror may clobber a concurrent direct change"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_into_stale_selection_writes_each_selection_once() {
+        // CLIPBOARD copy with clipboard_to_selection + take_ownership, while the
+        // SELECTION still holds older content. The SELECTION must end owning the new
+        // content, but via a SINGLE owned write — not a raw mirror write followed by
+        // an ownership rewrite. Two writes total (own CLIPBOARD, own SELECTION).
+        let mut cfg = Config::for_test("s");
+        cfg.take_ownership = true;
+        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
+        let mut h = start_seeded_with(cfg, &[(SelectionKind::Selection, offer("old"))]).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("new"));
+        let (kind, _, o) = recv_clip(&mut h).await;
+        assert_eq!((kind, o), (SelectionKind::Clipboard, offer("new")));
+        wait_applied(&h, SelectionKind::Selection, &offer("new")).await;
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(h.clip.get(SelectionKind::Clipboard), Some(offer("new")));
+        assert_eq!(
+            h.clip.write_count(),
+            2,
+            "one owned write per selection — mirror and ownership merged"
+        );
+    }
+
+    // ---- plan_batch (pure) ----
+    // `IndexMap` resolves via `use super::*` once Step 3 adds the module-level
+    // import; do NOT add a `use indexmap::IndexMap;` here (it would become a
+    // redundant import and fail clippy -D warnings).
+
+    fn reads_of(pairs: &[(SelectionKind, &str)]) -> IndexMap<SelectionKind, Offer> {
+        pairs.iter().map(|(k, t)| (*k, offer(t))).collect()
+    }
+
+    #[test]
+    fn plan_copy_on_select_owns_both_with_no_mirror() {
+        // Both selections genuinely changed to the same content: no mirror (direct
+        // change wins on the partner), two unconditional ownership writes.
+        let reads = reads_of(&[
+            (SelectionKind::Clipboard, "Y"),
+            (SelectionKind::Selection, "Y"),
+        ]);
+        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, true);
+        assert_eq!(
+            plan.writes,
+            vec![
+                (SelectionKind::Clipboard, offer("Y"), Provenance::Own),
+                (SelectionKind::Selection, offer("Y"), Provenance::Own),
+            ]
+        );
+        assert_eq!(plan.broadcasts.len(), 2);
+    }
+
+    #[test]
+    fn plan_ctrl_c_stale_merges_mirror_into_one_owned_write() {
+        // Only CLIPBOARD changed; SELECTION is a mirror target. With ownership on it
+        // becomes a single Own write of SELECTION — not a mirror write plus a later
+        // ownership write. SELECTION is still broadcast (mirror target).
+        let reads = reads_of(&[(SelectionKind::Clipboard, "Y")]);
+        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, true);
+        assert_eq!(
+            plan.writes,
+            vec![
+                (SelectionKind::Clipboard, offer("Y"), Provenance::Own),
+                (SelectionKind::Selection, offer("Y"), Provenance::Own),
+            ]
+        );
+        let kinds: Vec<_> = plan.broadcasts.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![SelectionKind::Clipboard, SelectionKind::Selection]
+        );
+    }
+
+    #[test]
+    fn plan_clobber_skips_mirror_when_partner_is_a_concurrent_change() {
+        // CLIPBOARD=X and SELECTION=Y both genuine in one batch: CLIPBOARD->SELECTION
+        // mirror is skipped so SELECTION keeps Y. Ownership off => no writes at all.
+        let reads = reads_of(&[
+            (SelectionKind::Clipboard, "X"),
+            (SelectionKind::Selection, "Y"),
+        ]);
+        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, false);
+        assert!(plan.writes.is_empty());
+        assert_eq!(plan.broadcasts.len(), 2);
+    }
+
+    #[test]
+    fn plan_mirror_only_when_ownership_off() {
+        // CLIPBOARD changed, ownership off: SELECTION mirror target gets a reconciled
+        // Mirror write; CLIPBOARD itself is broadcast only (the user put it there).
+        let reads = reads_of(&[(SelectionKind::Clipboard, "Y")]);
+        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, false);
+        assert_eq!(
+            plan.writes,
+            vec![(SelectionKind::Selection, offer("Y"), Provenance::Mirror)]
+        );
+    }
+
+    #[test]
+    fn plan_no_link_broadcasts_without_writing() {
+        let reads = reads_of(&[(SelectionKind::Clipboard, "Y")]);
+        let plan = plan_batch(&reads, LinkSelections::OFF, false);
+        assert!(plan.writes.is_empty());
+        assert_eq!(
+            plan.broadcasts,
+            vec![(SelectionKind::Clipboard, offer("Y"))]
+        );
+    }
+
+    #[test]
+    fn plan_selection_to_clipboard_mirrors_the_other_way() {
+        let reads = reads_of(&[(SelectionKind::Selection, "Y")]);
+        let plan = plan_batch(&reads, LinkSelections::SELECTION_TO_CLIPBOARD, false);
+        assert_eq!(
+            plan.writes,
+            vec![(SelectionKind::Clipboard, offer("Y"), Provenance::Mirror)]
         );
     }
 }
