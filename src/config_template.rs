@@ -6,7 +6,9 @@
 //! are commented defaults. `examples/config.toml` is generated from the same
 //! template (golden test), so the example and the normalizer can't drift.
 
+use anyhow::{Context, Result};
 use std::collections::HashMap;
+use toml_edit::{Decor, DocumentMut, Item, Value};
 
 /// psk source keys in canonical order, with the sample shown when commented.
 const PSK_SAMPLES: [(&str, &str); 3] = [
@@ -133,6 +135,49 @@ fn push_block(block: &Block, values: &Values, out: &mut String) {
     }
 }
 
+/// Parse config text and collect present top-level keys -> canonical
+/// (decor-stripped, single-line) value text, plus the `[link_selections]`
+/// booleans. Tables other than `[link_selections]` are ignored (config.toml has
+/// no others). Errors only if the text isn't valid TOML.
+#[allow(dead_code)] // used in tests
+fn extract_values(text: &str) -> Result<Values> {
+    let doc: DocumentMut = text.parse().context("parsing the config as TOML")?;
+    let mut scalars = HashMap::new();
+    for (key, item) in doc.iter() {
+        if key == "link_selections" {
+            continue; // captured below
+        }
+        if let Some(value) = item.as_value() {
+            scalars.insert(key.to_string(), canonical(value));
+        }
+    }
+    let link = doc
+        .get("link_selections")
+        .and_then(Item::as_table)
+        .map(|t| {
+            let b = |k: &str| t.get(k).and_then(Item::as_bool).unwrap_or(false);
+            (b("clipboard_to_selection"), b("selection_to_clipboard"))
+        });
+    Ok(Values { scalars, link })
+}
+
+/// A value as canonical TOML: decor (surrounding whitespace / inline comments)
+/// stripped, arrays flattened to one line. Idempotent on its own output.
+#[allow(dead_code)] // used in tests
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Array(arr) => {
+            let elems: Vec<String> = arr.iter().map(canonical).collect();
+            format!("[{}]", elems.join(", "))
+        }
+        other => {
+            let mut v = other.clone();
+            *v.decor_mut() = Decor::new("", "");
+            v.to_string().trim().to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +263,30 @@ mod tests {
              clipboard_to_selection = true\n\
              selection_to_clipboard = false\n"
         );
+    }
+
+    #[test]
+    fn extract_collects_present_keys_decor_stripped() {
+        let text = "\
+listen = \"x\"
+psk = \"s\"
+debounce_ms = 250   # inline comment dropped
+max_payload_size=\"8MiB\"
+peers = [\n  \"a\",\n  \"b\",\n]
+
+[link_selections]
+clipboard_to_selection = true
+";
+        let v = extract_values(text).unwrap();
+        assert_eq!(v.scalars.get("listen").unwrap(), "\"x\"");
+        assert_eq!(v.scalars.get("debounce_ms").unwrap(), "250");
+        // value is decor-stripped (no inline comment, canonical spacing)
+        assert_eq!(v.scalars.get("max_payload_size").unwrap(), "\"8MiB\"");
+        // multi-line array normalized to one line
+        assert_eq!(v.scalars.get("peers").unwrap(), "[\"a\", \"b\"]");
+        // the table is captured separately, not as a scalar
+        assert!(!v.scalars.contains_key("link_selections"));
+        // absent table key defaults to false
+        assert_eq!(v.link, Some((true, false)));
     }
 }
