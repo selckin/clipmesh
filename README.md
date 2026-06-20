@@ -3,6 +3,9 @@
 Encrypted clipboard sync for a mesh of Wayland machines on a LAN.
 Copy on one host, paste on all of them.
 
+> **Note:** This project is entirely LLM/Claude-coded — I haven't hand-written
+> any of the code. That said, I run it daily across my own machines.
+
 - Full peer mesh over TCP, every node dials every other; duplicate
   connections are tolerated by design (node-ID based dedup). Peers are
   connected point-to-point and clipmesh does not forward between them, so
