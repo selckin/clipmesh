@@ -4,6 +4,7 @@
 pub mod backoff;
 pub mod clipboard;
 pub mod config;
+pub mod config_template;
 pub mod fsutil;
 pub mod fswatch;
 pub mod mesh;
