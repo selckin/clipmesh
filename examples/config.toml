@@ -1,105 +1,89 @@
-# clipmesh example configuration
-# Copy to ~/.config/clipmesh/config.toml and edit.
-# clipmesh watches this file and restarts to apply any change.
+# clipmesh configuration. Generate/refresh with `clipmesh --sync-config`:
+# it fills in every option (commented = default) and these comments,
+# keeping the values you've set. clipmesh watches this file and restarts
+# to apply a change.
 
 # 0.0.0.0 binds every interface; restrict to a specific LAN address (or
 # firewall the port) on hosts reachable from untrusted networks. Traffic is
 # Noise-encrypted, so peers without the psk can neither read nor inject.
 listen = "0.0.0.0"
 
-# Port to listen on (default 48100). Peers in the list below that omit their own
-# port reuse this one, so the common all-same-port setup needs only the
-# hostnames. Put the port here, not in `listen` above.
+# Port to listen on (default 48100). Peers below that omit their own port
+# reuse this one. Put the port here, not in `listen`.
 port = 48100
 
-# List every other node directly. clipmesh connects peers point-to-point and
-# does not forward between them, so leaving a node out here means copies won't
-# reach it, even via a shared third node. Add ":port" to a peer to override the
-# shared port above for that one.
+# List every other node directly. clipmesh connects peers point-to-point
+# and never forwards between them, so a node left out here won't receive
+# copies. Add ":port" to override the shared port for one peer.
 peers = ["host-b", "host-c"]
 
-# Exactly one of psk, psk_file, psk_env:
-psk_file = "~/.config/clipmesh/psk"   # file containing the shared secret
-# psk = "supersecret"                  # inline secret
-# psk_env = "CLIPMESH_PSK"             # name of an environment variable
+# Exactly one of psk_file / psk / psk_env must be set: psk_file points to a
+# file holding the shared secret, psk is the secret inline, psk_env names an
+# environment variable holding it.
+psk_file = "~/.config/clipmesh/psk"
+# psk = "supersecret"
+# psk_env = "CLIPMESH_PSK"
 
-# Everything below is optional (defaults shown):
-# max_payload_size = "32MiB"  # skip clipboard contents larger than this (whole offer)
-# debounce_ms = 100           # quiet period before broadcasting
-# sync_selection = false      # also sync the middle-click selection across the mesh
-# link_selections: locally mirror between the clipboard and the middle-click
-#                  selection on THIS host (separate from sync_selection, which is
-#                  mesh-wide). Configured as a [link_selections] table — see the
-#                  bottom of this file (a TOML table header must come last).
-# direction = "both"          # "both" | "send_only" | "receive_only"
-# exclude_sensitive = true    # skip password-manager-flagged contents
-# resync_on_connect = true    # push current clipboard to peers when they (re)connect
-# share_mime_rules = true    # share the MIME-rules file across the mesh (below)
-# log_level = "info"          # overridable with RUST_LOG
-# verbose = false             # log a one-line summary (at info level, so needs
-#                             # log_level >= info) per detected copy and received
-#                             # update: the mimetypes plus whether it synced
+# Everything below is optional; the commented value is the default.
 
-# Which MIME types sync is controlled per-type by a separate rules file (see
-# below). unknown_mime decides what happens to a type with no rule yet:
-# "deny" (default) means nothing syncs until you allow it; "allow" syncs
-# everything not explicitly denied.
+# Skip clipboard contents larger than this (whole offer).
+# max_payload_size = "32MiB"
+
+# Quiet period (ms) before broadcasting, to coalesce rapid copies.
+# debounce_ms = 100
+
+# Also sync the middle-click selection across the mesh.
+# sync_selection = false
+
+# "both" | "send_only" | "receive_only".
+# direction = "both"
+
+# Skip password-manager-flagged contents.
+# exclude_sensitive = true
+
+# Push current clipboard to peers when they (re)connect.
+# resync_on_connect = true
+
+# Share the MIME-rules file across the mesh (whole-file last-writer-wins:
+# the most recently edited file wins outright and replaces the others, not
+# a per-type merge). Turn off to keep each host's rules independent.
+# share_mime_rules = true
+
+# Log a one-line summary (at info level, so needs log_level >= info) per
+# detected copy and received update.
+# verbose = false
+
+# Overridable with RUST_LOG.
+# log_level = "info"
+
+# What to do with a MIME type that has no rule yet: "deny" (default) syncs
+# nothing until you allow it; "allow" syncs everything not explicitly denied.
 # unknown_mime = "deny"
 
 # When a copied selection offers only a legacy X11 plain-text atom
-# (UTF8_STRING, STRING, or TEXT) and no text/plain* representation, synthesize
-# text/plain;charset=utf-8 and text/plain from it (re-encoded to UTF-8: STRING
-# is latin-1, TEXT is sniffed) so Wayland-native apps that only understand
-# text/plain can paste it. Off by default. The synthesized types go through the
-# MIME rules below, so with unknown_mime = "deny" you must allow text/plain* or
-# they are stripped.
+# (UTF8_STRING/STRING/TEXT) and no text/plain* rep, synthesize
+# text/plain;charset=utf-8 and text/plain from it so Wayland-native apps
+# can paste it. The synthesized types go through the MIME rules below.
 # synthesize_text_plain = false
 
-# After a local copy, re-offer the selection so clipmesh owns it. The clipboard
-# then survives the source app exiting (clipboard-manager behavior), and — with
-# synthesize_text_plain above — the re-offered set includes the synthesized
-# text/plain, so X11-sourced content pastes on THIS host too (not just peers).
-# Applies to every watched selection (clipboard, and the selection when
-# sync_selection or a selection bridge is on). Off by default. Engages on copies
-# made while clipmesh runs, not on content already present when it starts. While
-# exclude_sensitive is on (the default), password-manager-flagged content is not
-# re-owned (so it can't outlive the manager clearing the clipboard); with
-# exclude_sensitive = false it would be.
+# After a local copy, re-offer the selection so clipmesh owns it: the
+# clipboard then survives the source app exiting, and (with
+# synthesize_text_plain) X11-sourced content pastes on THIS host too. Never
+# re-owns password-manager-flagged content while exclude_sensitive is on.
 # take_ownership = false
 
-# Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside this
-# config. Each entry under [rules] is, e.g.:
-#     [rules]
-#     "text/plain" = "allow"
-#     "image/png"  = { rule = "allow", max = "4MiB" }
-#     "image/bmp"  = "deny"
-# Keys are quoted TOML strings, so MIME types with spaces or punctuation are
-# fine. A key may also be a glob ('*' = any run, '?' = one char, no escape), e.g.
-# "JAVA_DATATRANSFER*" = "deny"; matching is case-insensitive (ASCII) and the most
-# specific matching key wins. clipmesh creates the file, appends any new type it
-# sees (using unknown_mime, unless a glob already covers it), keeps the [rules]
-# entries sorted, and reloads it when it changes — edit it to choose what syncs,
-# or run `clipmesh --allow/--deny "<glob>"` (and `clipmesh --rules` to list
-# them and flag overlapping globs). Comments above [rules] are kept;
-# notes among the entries are dropped on save. An optional per-type max-size
-# caps that type on top of max_payload_size.
+# Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside
+# this config. clipmesh creates it, appends any new type it sees (per
+# unknown_mime), keeps it sorted, and reloads on change. Edit it or run
+# `clipmesh --allow/--deny "<glob>"` (and `clipmesh --rules` to list).
 # mime_rules_file = "~/.config/clipmesh/mimetypes"
 
-# When share_mime_rules is on (default), clipmesh keeps the MIME-rules file in
-# sync across the mesh: edit it on one host and the others converge to it. It is
-# whole-file last-writer-wins — the most recently edited file wins outright and
-# replaces the others (it does not merge per-type), and clipmesh stamps the file
-# with a managed [clipmesh] table (version + origin) to order edits. Turn it off
-# to keep each host's rules independent.
-
-# Local selection linking (see the note up top). Mirror between the Ctrl+C
-# clipboard and the mouse-highlight / middle-click selection on THIS host. Each
-# direction is independent and off unless set true; omit the whole table for no
-# linking. This is local-only, separate from sync_selection (which is mesh-wide).
-# A TOML table header captures every key below it, so keep this LAST in the file.
+# Locally mirror between the Ctrl+C clipboard and the mouse-highlight /
+# middle-click selection on THIS host (separate from sync_selection, which
+# is mesh-wide). Each direction is independent and off unless true.
+# WARNING: selection_to_clipboard makes selecting any text overwrite your
+# clipboard — and, because the clipboard is always synced when this node
+# sends, your peers' clipboards too.
 # [link_selections]
-# clipboard_to_selection = true   # Ctrl+C copy    -> also middle-click pasteable
-# selection_to_clipboard = true   # mouse-highlight -> also Ctrl+V pasteable
-#   WARNING: selection_to_clipboard makes selecting any text overwrite your
-#   clipboard — and, because the clipboard is always synced when this node sends,
-#   your peers' clipboards too (regardless of sync_selection).
+# clipboard_to_selection = false
+# selection_to_clipboard = false
