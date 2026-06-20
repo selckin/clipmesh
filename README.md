@@ -74,6 +74,18 @@ Distribute the same psk file to every host, then:
 
 See `examples/config.toml` for all options and defaults.
 
+### Keeping the config up to date
+
+`clipmesh --sync-config` rewrites your `config.toml` so it lists every option
+with its documentation: options you've set stay active with your values, and
+any option you haven't set is added as a commented default. Run it after
+upgrading to discover new options. It only normalizes a config that already
+loads — a config that doesn't parse is left untouched.
+
+Note: if the daemon is running while you do this, the config-file change makes
+it restart (to re-read the config). The restart is harmless — only comments and
+commented-out defaults changed, so the effective configuration is identical.
+
 clipmesh watches `config.toml` and restarts itself when it changes (most
 settings — listen, peers, psk, ... — can't be applied live), so editing the
 config takes effect automatically, no manual `systemctl restart` needed. A
