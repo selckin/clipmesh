@@ -1,15 +1,34 @@
 use anyhow::{bail, Context, Result};
 use clipmesh::clipboard::wayland::WaylandClipboard;
-use clipmesh::config::{Config, MimePolicy};
+use clipmesh::config::{self, Config, MimePolicy};
 use clipmesh::config_template;
 use clipmesh::mime::{MimeRules, Relation, Verdict};
-use clipmesh::node;
+use clipmesh::{node, paste};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const USAGE: &str =
-    "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob> | --rules | --sync-config]";
+    "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob> | --rules | --sync-config]\n\
+     \x20      clipmesh --paste [-t <mime>] [-l] [-n] [-p] [--node <host[:port]>]  (wl-paste mode)";
+
+/// Decide paste mode from the program name and the args (everything after
+/// argv[0]). Paste mode is entered when the binary is invoked as `wl-paste`
+/// (a symlink), or when `--paste` appears in the args. Returns the wl-paste-style
+/// args (with any `--paste` stripped) in that case, else `None` for the daemon /
+/// normal CLI. Checked before the daemon flag loop so wl-paste flags (`-t`,
+/// `-l`, …), which that loop would reject, reach the paste parser instead.
+fn paste_mode_args(prog: &str, args: &[String]) -> Option<Vec<String>> {
+    let invoked_as_wl_paste = Path::new(prog)
+        .file_name()
+        .is_some_and(|f| f.to_string_lossy() == "wl-paste");
+    let has_paste_flag = args.iter().any(|a| a == "--paste");
+    if invoked_as_wl_paste || has_paste_flag {
+        Some(args.iter().filter(|a| *a != "--paste").cloned().collect())
+    } else {
+        None
+    }
+}
 
 /// A one-shot CLI action (none = run the daemon).
 enum CliAction {
@@ -20,6 +39,19 @@ enum CliAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // wl-paste impersonation is a distinct mode: detect it before the daemon
+    // flag loop (which would reject wl-paste's own flags) and delegate.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(paste_args) = paste_mode_args(
+        argv.first().map(String::as_str).unwrap_or("clipmesh"),
+        argv.get(1..).unwrap_or(&[]),
+    ) {
+        // Quiet stderr-only logging (clipboard bytes go to stdout): surfaces a
+        // warning from the reused connection stack without polluting the output.
+        init_cli_logging();
+        return paste::run(paste_args).await;
+    }
+
     let mut config_path: Option<PathBuf> = None;
     let mut action: Option<CliAction> = None;
     let mut args = std::env::args().skip(1);
@@ -42,9 +74,7 @@ async fn main() -> Result<()> {
             _ => bail!(USAGE),
         }
     }
-    let config_path = config_path.unwrap_or_else(|| {
-        PathBuf::from(shellexpand::tilde("~/.config/clipmesh/config.toml").into_owned())
-    });
+    let config_path = config_path.unwrap_or_else(config::default_config_path);
 
     // The CLI actions are one-shot (not the daemon): apply and exit. A running
     // daemon picks up an edit through its file watcher.
@@ -306,4 +336,38 @@ fn init_cli_logging() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn paste_mode_via_flag_strips_the_paste_marker() {
+        let got = paste_mode_args("clipmesh", &args(&["--paste", "-t", "text/plain"]));
+        assert_eq!(got, Some(args(&["-t", "text/plain"])));
+    }
+
+    #[test]
+    fn paste_mode_via_wl_paste_symlink() {
+        // a symlink named wl-paste anywhere on PATH enters paste mode
+        assert_eq!(
+            paste_mode_args("/usr/local/bin/wl-paste", &args(&["-l"])),
+            Some(args(&["-l"]))
+        );
+    }
+
+    #[test]
+    fn normal_invocations_are_not_paste_mode() {
+        assert_eq!(paste_mode_args("clipmesh", &args(&["--rules"])), None);
+        assert_eq!(paste_mode_args("clipmesh", &[]), None);
+        assert_eq!(
+            paste_mode_args("/usr/bin/clipmesh", &args(&["--config", "/c"])),
+            None
+        );
+    }
 }

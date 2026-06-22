@@ -143,6 +143,9 @@ fn default_unknown_mime() -> MimePolicy {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: String,
+    /// The configured port — the default applied to any peer (or `--node`
+    /// paste target) given without an explicit port.
+    pub port: u16,
     pub peers: Vec<String>,
     /// 32-byte Noise PSK, derived from the configured secret via BLAKE3.
     pub psk: [u8; 32],
@@ -223,10 +226,16 @@ fn port_of(addr: &str) -> Option<&str> {
     }
 }
 
+/// The default config path (`~/.config/clipmesh/config.toml`, tilde-expanded),
+/// used by `main` (daemon + CLI actions) and the paste mode alike.
+pub fn default_config_path() -> PathBuf {
+    PathBuf::from(shellexpand::tilde("~/.config/clipmesh/config.toml").into_owned())
+}
+
 /// Append `default_port` to an address that lacks one (bracketing a bare IPv6
 /// literal so the result stays a valid `host:port`). Addresses that already
 /// carry a port are returned unchanged.
-fn with_default_port(addr: &str, default_port: &str) -> String {
+pub(crate) fn with_default_port(addr: &str, default_port: &str) -> String {
     if port_of(addr).is_some() {
         return addr.to_string();
     }
@@ -314,6 +323,7 @@ impl Config {
             .collect();
         Ok(Config {
             listen,
+            port: raw.port,
             peers,
             psk: *blake3::hash(secret.as_bytes()).as_bytes(),
             max_payload_size: match parse_size(&raw.max_payload_size)? {
@@ -342,6 +352,7 @@ impl Config {
     pub fn for_test(secret: &str) -> Config {
         Config {
             listen: "127.0.0.1:0".into(),
+            port: default_port(),
             peers: vec![],
             psk: *blake3::hash(secret.as_bytes()).as_bytes(),
             max_payload_size: 32 * 1024 * 1024,
@@ -426,6 +437,7 @@ selection_to_clipboard = true
 "#;
         let cfg = Config::from_toml(toml).unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:48100"); // listen + port combined
+        assert_eq!(cfg.port, 48100);
         assert_eq!(cfg.peers, vec!["host-b:48100", "host-c:48100"]);
         assert_eq!(cfg.psk, *blake3::hash(b"supersecret").as_bytes());
         assert_eq!(cfg.max_payload_size, 2 * 1024 * 1024);
@@ -448,6 +460,7 @@ selection_to_clipboard = true
         let cfg = Config::from_toml("listen = \"0.0.0.0\"\npsk = \"s\"\n").unwrap();
         assert!(cfg.peers.is_empty());
         assert_eq!(cfg.listen, "0.0.0.0:48100"); // port defaults to 48100
+        assert_eq!(cfg.port, 48100);
         assert_eq!(cfg.max_payload_size, 32 * 1024 * 1024);
         assert_eq!(cfg.debounce_ms, 100);
         assert!(!cfg.sync_selection);
