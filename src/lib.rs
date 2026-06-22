@@ -10,6 +10,7 @@ pub mod fswatch;
 pub mod mesh;
 pub mod mime;
 pub mod node;
+pub mod paste;
 pub mod peer;
 pub mod protocol;
 pub mod sync;

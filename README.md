@@ -73,6 +73,42 @@ Distribute the same psk file to every host, then:
 
 </details>
 
+## Pasting from a node (wl-paste mode)
+
+`clipmesh --paste` prints a node's current clipboard to stdout — a drop-in
+`wl-paste` for a host with **no Wayland compositor** (a server, a container, an
+SSH session, a script). It connects to a node over the same encrypted protocol,
+takes the clipboard the node already pushes on connect, and writes it out:
+
+    clipmesh --paste                        # best text type (else first offered)
+    clipmesh --paste -t image/png > x.png   # a specific MIME type
+    clipmesh --paste -l                     # list the offered types
+    clipmesh --paste -p                     # the middle-click selection
+    clipmesh --paste --node desktop:48100   # one specific node
+
+Flags mirror `wl-paste`: `-t/--type`, `-l/--list-types`, `-n/--no-newline`,
+`-p/--primary`. The PSK comes from the usual config (`--config <path>` to
+override), so the host still needs a `config.toml` with the psk and at least one
+peer — but no compositor.
+
+By default (no `--node`) it tries **every** configured peer concurrently and
+uses the first that responds, so a headless host needn't know which of its
+desktops is up. Pass `--node <host[:port]>` to target one specific node instead.
+
+Symlink the binary as `wl-paste` to make it a true drop-in on `PATH` (it detects
+being invoked under that name):
+
+    ln -s "$(command -v clipmesh)" ~/.local/bin/wl-paste
+
+Two caveats, both inherent to pulling a clipboard the node already pushes:
+
+- The target must run with `resync_on_connect` on (the default) and not be
+  `direction = "receive_only"`, or there is nothing to push and the paste times
+  out.
+- `-p`/`--primary` only works against a node that has `sync_selection = true`.
+
+This is a one-shot read: there is no `wl-paste --watch` and no `wl-copy`.
+
 ## Configuration
 
 See `examples/config.toml` for all options and defaults.
