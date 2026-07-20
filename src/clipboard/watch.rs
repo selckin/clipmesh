@@ -41,7 +41,7 @@ pub fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, watch_selection: 
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
 fn run(tx: mpsc::UnboundedSender<SelectionKind>, watch_selection: bool) {
-    let mut delay = crate::backoff::RESTART_MIN;
+    let mut backoff = crate::backoff::watcher_restart();
     loop {
         let started = Instant::now();
         match watch_once(&tx, watch_selection) {
@@ -54,7 +54,8 @@ fn run(tx: mpsc::UnboundedSender<SelectionKind>, watch_selection: bool) {
         if tx.is_closed() {
             return;
         }
-        delay = crate::backoff::restart_delay(delay, started.elapsed());
+        backoff.reset_if_stable(started.elapsed(), crate::backoff::RESTART_STABLE_AFTER);
+        let delay = backoff.next_delay();
         warn!("restarting the clipboard watcher in {delay:?}");
         thread::sleep(delay);
     }

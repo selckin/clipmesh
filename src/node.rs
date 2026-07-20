@@ -1,3 +1,4 @@
+use crate::backoff::Backoff;
 use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::mesh::Mesh;
@@ -5,7 +6,6 @@ use crate::mime::MimeRules;
 use crate::peer;
 use crate::sync::SyncEngine;
 use anyhow::{anyhow, Result};
-use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -150,7 +150,10 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
     // reconnection latency after a peer restart or a healed partition.
     const CAP: Duration = Duration::from_secs(5);
     const HEALTHY: Duration = Duration::from_secs(30);
-    let mut backoff = INITIAL;
+    // Jitter so peers that lost a switch (or a laptop waking) don't all redial
+    // in lockstep. The watchers are per-host and have nothing to desynchronise
+    // from, which is why only this loop asks for it.
+    let mut backoff = Backoff::new(INITIAL, CAP).with_jitter(2);
     let mut dial_failures: u32 = 0;
     loop {
         match TcpStream::connect(&addr).await {
@@ -175,9 +178,7 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                     }
                     Err(e) => warn!("connection to {addr} ended: {e:#}"),
                 }
-                if started.elapsed() >= HEALTHY {
-                    backoff = INITIAL;
-                }
+                backoff.reset_if_stable(started.elapsed(), HEALTHY);
             }
             Err(e) => {
                 // first failure of a streak at warn so a dead peer is
@@ -190,9 +191,7 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                 dial_failures += 1;
             }
         }
-        let jitter_ms = rand::thread_rng().gen_range(0..=backoff.as_millis() as u64 / 2);
-        sleep(backoff + Duration::from_millis(jitter_ms)).await;
-        backoff = (backoff * 2).min(CAP);
+        sleep(backoff.next_delay()).await;
     }
 }
 

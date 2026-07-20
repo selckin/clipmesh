@@ -137,7 +137,7 @@ fn watch_forever(
     rules: &Arc<Mutex<MimeRules>>,
     rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) {
-    let mut delay = crate::backoff::RESTART_MIN;
+    let mut backoff = crate::backoff::watcher_restart();
     loop {
         let started = Instant::now();
         let mut on_config_change = || restart_on_config_change(config_path, original_config);
@@ -151,7 +151,8 @@ fn watch_forever(
         ) {
             warn!("file watcher error ({e:#}); reconnecting");
         }
-        delay = crate::backoff::restart_delay(delay, started.elapsed());
+        backoff.reset_if_stable(started.elapsed(), crate::backoff::RESTART_STABLE_AFTER);
+        let delay = backoff.next_delay();
         warn!("restarting the file watcher in {delay:?}");
         thread::sleep(delay);
     }
