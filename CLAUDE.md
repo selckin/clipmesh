@@ -7,6 +7,7 @@ clipmesh is a Rust daemon that syncs Wayland clipboards across a LAN mesh of hos
 ## Commands
 
 ```bash
+./build.sh                  # every CI gate, in CI order -- run before pushing
 cargo build                 # debug build
 cargo build --release       # release build (CI gate)
 cargo test                  # all tests (lib unit tests + tests/two_nodes.rs + tests/paste.rs)
