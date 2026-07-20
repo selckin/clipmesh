@@ -14,6 +14,7 @@
 //! `fswatch`) and reloaded as soon as it changes.
 
 use crate::config::{parse_size, MimePolicy};
+use crate::protocol::Version;
 use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -469,7 +470,7 @@ impl MimeRules {
     /// present; otherwise falls back to a baseline of (file mtime in ms, own_id)
     /// so enabling sharing converges on the most-recently-edited file. mtime is 0
     /// if unreadable or there is no path.
-    pub fn version(&self, own_id: Uuid) -> (u64, Uuid) {
+    pub fn version(&self, own_id: Uuid) -> Version {
         let cm = self.doc.get("clipmesh");
         // Reject a negative integer (e.g. a hand-edit typo): `as u64` would turn
         // it into a huge value that no peer could ever beat, isolating the node.
@@ -482,8 +483,8 @@ impl MimeRules {
             .and_then(Item::as_str)
             .and_then(|s| s.parse::<Uuid>().ok());
         match (stamp, origin) {
-            (Some(s), Some(o)) => (s as u64, o),
-            _ => (self.file_mtime_ms(), own_id),
+            (Some(s), Some(o)) => Version::new(s as u64, o),
+            _ => Version::new(self.file_mtime_ms(), own_id),
         }
     }
 
@@ -497,11 +498,11 @@ impl MimeRules {
 
     /// Set (or replace) the managed version in the `[clipmesh]` table and mark
     /// dirty.
-    pub fn set_version(&mut self, stamp: u64, origin: Uuid) {
+    pub fn set_version(&mut self, v: Version) {
         let cm = table_mut(&mut self.doc, "clipmesh");
         // TOML integers are i64; HLC stamps are wall-clock-ms bounded so they fit.
-        cm["version"] = value(stamp as i64);
-        cm["origin"] = value(origin.to_string());
+        cm["version"] = value(v.stamp as i64);
+        cm["origin"] = value(v.origin.to_string());
         self.dirty = true;
     }
 
@@ -1220,7 +1221,7 @@ mod tests {
             &format!("[clipmesh]\nversion = 1234\norigin = \"{origin}\"\n[rules]\n\"image/png\" = \"allow\"\n"),
         );
         let rules = MimeRules::load(Some(path), MimePolicy::Deny);
-        assert_eq!(rules.version(Uuid::nil()), (1234, origin));
+        assert_eq!(rules.version(Uuid::nil()), Version::new(1234, origin));
         assert!(rules.has_version_header());
     }
 
@@ -1231,7 +1232,7 @@ mod tests {
         write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
         let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let own = Uuid::from_u128(9);
-        let (stamp, origin) = rules.version(own);
+        let Version { stamp, origin } = rules.version(own);
         assert!(stamp > 0, "mtime baseline should be a real epoch-ms value");
         assert_eq!(origin, own);
         assert!(!rules.has_version_header());
@@ -1244,13 +1245,13 @@ mod tests {
         write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
         let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
         let o = Uuid::from_u128(3);
-        rules.set_version(100, o);
+        rules.set_version(Version::new(100, o));
         rules.persist();
-        rules.set_version(200, o); // replace, not duplicate
+        rules.set_version(Version::new(200, o)); // replace, not duplicate
         rules.persist();
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.matches("version =").count(), 1, "one version:\n{body}");
-        assert_eq!(rules.version(Uuid::nil()), (200, o));
+        assert_eq!(rules.version(Uuid::nil()), Version::new(200, o));
         assert!(rules.allows("image/png", 1), "rules survive version writes");
     }
 
@@ -1370,7 +1371,7 @@ mod tests {
         let path = dir.path().join("mimetypes");
         write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
         let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
-        rules.set_version(999, Uuid::from_u128(1));
+        rules.set_version(Version::new(999, Uuid::from_u128(1)));
         assert!(rules.has_version_header());
         rules.revert_to_loaded();
         assert!(

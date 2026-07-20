@@ -19,6 +19,27 @@ pub enum SelectionKind {
     Selection,
 }
 
+/// The hybrid-logical-clock value that orders one piece of shared state.
+///
+/// Higher `stamp` wins; `origin` — the node that created the content — breaks
+/// ties, so every node comparing the same pair reaches the same answer without
+/// coordinating. Both clipboard updates and the shared MIME-rules file are
+/// ordered by this, so the two can never order differently.
+///
+/// Field order is the comparison order: `derive(Ord)` compares `stamp` first,
+/// then `origin`. Don't reorder them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    pub stamp: u64,
+    pub origin: Uuid,
+}
+
+impl Version {
+    pub fn new(stamp: u64, origin: Uuid) -> Self {
+        Version { stamp, origin }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     /// First message on every connection: announces the sender's node ID and

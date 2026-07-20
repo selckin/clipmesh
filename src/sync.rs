@@ -2,7 +2,9 @@ use crate::clipboard::Clipboard;
 use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{lock_rules, MimeRules};
-use crate::protocol::{content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind};
+use crate::protocol::{
+    content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind, Version,
+};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -181,15 +183,14 @@ fn now_ms() -> u64 {
 #[derive(Clone, Copy)]
 struct ContentState {
     hash: [u8; 32],
-    /// Hybrid logical stamp; ordered with `origin` as `(stamp, origin)`.
-    stamp: u64,
-    origin: Uuid,
+    /// Orders this content against any other; see [`Version`].
+    version: Version,
 }
 
 impl ContentState {
-    /// True if `(stamp, origin)` strictly supersedes this state's order.
-    fn superseded_by(&self, stamp: u64, origin: Uuid) -> bool {
-        (stamp, origin) > (self.stamp, self.origin)
+    /// True if `v` strictly supersedes this state's order.
+    fn superseded_by(&self, v: Version) -> bool {
+        v > self.version
     }
 }
 
@@ -386,12 +387,15 @@ impl<C: Clipboard> SyncEngine<C> {
     /// stamps before they reach it, so one peer with a broken clock can't poison
     /// ordering for this node, then fold an accepted stamp in. `what` names the
     /// message kind for the warning. Returns whether the stamp was accepted.
-    fn accept_stamp(&self, stamp: u64, from: Uuid, what: &str) -> bool {
-        if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
-            warn!("rejecting {what} from peer {from}: timestamp {stamp} is implausibly far in the future (peer clock skew?)");
+    fn accept_stamp(&self, v: Version, from: Uuid, what: &str) -> bool {
+        if v.stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
+            warn!(
+                "rejecting {what} from peer {from}: timestamp {} is implausibly far in the future (peer clock skew?)",
+                v.stamp
+            );
             return false;
         }
-        self.observe(stamp);
+        self.observe(v.stamp);
         true
     }
 
@@ -410,7 +414,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // local edit outranks it after a restart.
         {
             let own_id = self.mesh.own_id();
-            let (stamp, _) = lock_rules(&self.mime_rules).version(own_id);
+            let stamp = lock_rules(&self.mime_rules).version(own_id).stamp;
             self.observe(stamp);
         }
 
@@ -549,8 +553,7 @@ impl<C: Clipboard> SyncEngine<C> {
                     .entry(kind)
                     .or_insert(ContentState {
                         hash,
-                        stamp: 0,
-                        origin: self.mesh.own_id(),
+                        version: Version::new(0, self.mesh.own_id()),
                     });
             }
         }
@@ -706,16 +709,12 @@ impl<C: Clipboard> SyncEngine<C> {
             debug!("ignoring local {kind:?} change: identical to what's already on the mesh (echo suppressed)");
             return;
         }
-        let stamp = self.tick();
-        let origin = self.mesh.own_id();
-        self.current.lock().unwrap().insert(
-            kind,
-            ContentState {
-                hash,
-                stamp,
-                origin,
-            },
-        );
+        let version = Version::new(self.tick(), self.mesh.own_id());
+        let stamp = version.stamp;
+        self.current
+            .lock()
+            .unwrap()
+            .insert(kind, ContentState { hash, version });
         if let Some(copied) = &copied {
             info!("copied {kind:?} [{copied}]: broadcast (stamp {stamp})");
         }
@@ -727,8 +726,8 @@ impl<C: Clipboard> SyncEngine<C> {
             kind,
             hash,
             offer,
-            stamp,
-            origin,
+            stamp: version.stamp,
+            origin: version.origin,
         });
     }
 
@@ -901,32 +900,35 @@ impl<C: Clipboard> SyncEngine<C> {
             return;
         }
         let own_id = self.mesh.own_id();
-        let (stamp, origin, body) = {
+        let (version, body) = {
             let mut rules = lock_rules(&self.mime_rules);
             // Read the version once; set_version below stores exactly this, so
             // it is also what we send.
-            let (stamp, origin) = rules.version(own_id);
+            let version = rules.version(own_id);
             if !rules.has_version_header() {
                 // Pin the current (baseline) version to disk; do NOT bump. If
                 // the write fails, roll back and don't push a version we didn't
                 // durably persist (consistent with on_local_rules_changed).
-                rules.set_version(stamp, origin);
+                rules.set_version(version);
                 if !rules.persist() {
                     rules.revert_to_loaded();
                     return;
                 }
             }
-            (stamp, origin, rules.body())
+            (version, rules.body())
         };
         if !self.rules_body_ok(body.len(), || format!(" for peer {peer}")) {
             return;
         }
-        debug!("pushing shared MIME-rules to peer {peer} (stamp {stamp})");
+        debug!(
+            "pushing shared MIME-rules to peer {peer} (stamp {})",
+            version.stamp
+        );
         self.mesh.send_to(
             peer,
             &Message::Rules {
-                stamp,
-                origin,
+                stamp: version.stamp,
+                origin: version.origin,
                 body,
             },
         );
@@ -961,8 +963,8 @@ impl<C: Clipboard> SyncEngine<C> {
                     kind,
                     hash: state.hash,
                     offer,
-                    stamp: state.stamp,
-                    origin: state.origin,
+                    stamp: state.version.stamp,
+                    origin: state.version.origin,
                 },
             );
         }
@@ -1035,7 +1037,8 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!("dropping update from peer {from}: content hash doesn't match (corrupted or tampered)");
             return "rejected (content hash mismatch)";
         }
-        if !self.accept_stamp(stamp, from, "update") {
+        let version = Version::new(stamp, origin);
+        if !self.accept_stamp(version, from, "update") {
             return "rejected (timestamp too far in the future)";
         }
         // Apply the receiver's own content policy: configs can differ
@@ -1057,20 +1060,19 @@ impl<C: Clipboard> SyncEngine<C> {
                     // current content; keeping a stale stamp would let a later
                     // update stamped between ours and a peer's newer one win
                     // here yet lose on that peer, diverging the mesh.
-                    if state.superseded_by(stamp, origin) {
+                    if state.superseded_by(version) {
                         current.insert(
                             kind,
                             ContentState {
                                 hash: applied_hash,
-                                stamp,
-                                origin,
+                                version,
                             },
                         );
                     }
                     debug!("inbound {kind:?} from peer {from} is already our current content; nothing to do");
                     return "already our current content";
                 }
-                if !state.superseded_by(stamp, origin) {
+                if !state.superseded_by(version) {
                     debug!("ignoring an older {kind:?} update from peer {from} (stamp {stamp}); we already hold newer content");
                     return "ignored (older than our content)";
                 }
@@ -1091,8 +1093,7 @@ impl<C: Clipboard> SyncEngine<C> {
                     kind,
                     ContentState {
                         hash: applied_hash,
-                        stamp,
-                        origin,
+                        version,
                     },
                 );
                 // Mark this as engine-written so the resulting watch echo is not
@@ -1129,7 +1130,7 @@ impl<C: Clipboard> SyncEngine<C> {
         let origin = self.mesh.own_id();
         let body = {
             let mut rules = lock_rules(&self.mime_rules);
-            rules.set_version(stamp, origin);
+            rules.set_version(Version::new(stamp, origin));
             // Measure the real (post-stamp) body, then persist. If it's over the
             // wire limit or the write fails, roll the stamp back: we must not
             // keep or announce a version that isn't durably on disk (it would
@@ -1165,22 +1166,23 @@ impl<C: Clipboard> SyncEngine<C> {
         if !self.rules_body_ok(body.len(), || format!(" from peer {from}")) {
             return;
         }
-        if !self.accept_stamp(stamp, from, "MIME-rules") {
+        let incoming = Version::new(stamp, origin);
+        if !self.accept_stamp(incoming, from, "MIME-rules") {
             return;
         }
         let own_id = self.mesh.own_id();
         let mut rules = lock_rules(&self.mime_rules);
         let current = rules.version(own_id);
-        if (stamp, origin) > current {
+        if incoming > current {
             debug!(
                 "adopting shared MIME-rules from peer {from} (stamp {stamp}); replaces our (stamp {}, origin {})",
-                current.0, current.1
+                current.stamp, current.origin
             );
             rules.replace_from(body);
             // Stamp the adopted version explicitly so version() reflects
             // (stamp, origin) even if the peer body lacked the header line —
             // otherwise it would fall back to the new file's mtime and diverge.
-            rules.set_version(stamp, origin);
+            rules.set_version(Version::new(stamp, origin));
             if !rules.persist() {
                 // Couldn't durably write the adoption; roll back so memory
                 // matches disk rather than silently diverging (which would be
@@ -1190,7 +1192,7 @@ impl<C: Clipboard> SyncEngine<C> {
         } else {
             debug!(
                 "ignoring shared MIME-rules from peer {from} (stamp {stamp}); we hold a newer-or-equal version (stamp {})",
-                current.0
+                current.stamp
             );
         }
     }
@@ -2597,14 +2599,14 @@ mod tests {
         let hi = Uuid::from_u128(2);
         let s = ContentState {
             hash: [0u8; 32],
-            stamp: 5,
-            origin: lo,
+            version: Version::new(5, lo),
         };
-        assert!(s.superseded_by(6, lo)); // higher stamp wins
-        assert!(!s.superseded_by(4, hi)); // lower stamp loses despite higher origin
-        assert!(s.superseded_by(5, hi)); // equal stamp: higher origin wins (converges)
-        assert!(!s.superseded_by(5, lo)); // identical: not superseded
-        assert!(!s.superseded_by(5, Uuid::from_u128(0))); // equal stamp, lower origin loses
+        let v = Version::new;
+        assert!(s.superseded_by(v(6, lo))); // higher stamp wins
+        assert!(!s.superseded_by(v(4, hi))); // lower stamp loses despite higher origin
+        assert!(s.superseded_by(v(5, hi))); // equal stamp: higher origin wins (converges)
+        assert!(!s.superseded_by(v(5, lo))); // identical: not superseded
+        assert!(!s.superseded_by(v(5, Uuid::from_u128(0)))); // equal stamp, lower origin loses
     }
 
     #[tokio::test(start_paused = true)]
