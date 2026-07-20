@@ -82,11 +82,21 @@ pub fn is_machinery(mime: &str) -> bool {
 /// living here: the engine asks for "a text value from this offer" without
 /// knowing what ICCCM is.
 pub fn text_value(offer: &Offer) -> Option<(&'static str, Vec<u8>)> {
-    PLAINTEXT.iter().find_map(|atom| {
-        offer
-            .get(*atom)
-            .map(|bytes| (*atom, clean(reencode(atom, bytes))))
-    })
+    let atom = text_source(offer.keys().map(String::as_str))?;
+    let bytes = offer.get(atom)?;
+    Some((atom, clean(reencode(atom, bytes))))
+}
+
+/// The atom [`text_value`] would derive from, chosen from type *names* alone.
+///
+/// A caller holding only the advertised type list — deciding what is worth
+/// reading, before paying for the read — needs the same priority order that
+/// `text_value` applies to a full offer. Asking here rather than re-deriving it
+/// is what keeps the two from disagreeing about which atom the synthesized
+/// `text/plain` comes from; `text_value` is defined in terms of this.
+pub fn text_source<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+    let names: Vec<&str> = names.into_iter().collect();
+    PLAINTEXT.iter().copied().find(|atom| names.contains(atom))
 }
 
 /// Decode an atom's bytes to UTF-8 according to the encoding it declares:

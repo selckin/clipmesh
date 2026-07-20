@@ -4,8 +4,8 @@ use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
-    describe_offer, encode_frame, human_bytes, is_text_plain, GetResult, GetWant, Hashed, Message,
-    Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
+    describe_offer, encode_frame, human_bytes, is_text_plain, type_matches, GetResult, GetWant,
+    Hashed, Message, Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -66,6 +66,20 @@ fn synthesize_text_plain(content: Hashed) -> Hashed {
         out.insert(k, v);
     }
     Hashed::new(out)
+}
+
+/// Keep only the representations matching a narrowed request, or `None` if that
+/// leaves nothing.
+///
+/// The backend read is narrowed too, so this is usually a no-op — but synthesis
+/// derives `text/plain` from a legacy atom that had to be read to get there, and
+/// the requester asked for neither the atom nor the second `text/plain` variant.
+fn narrow_to(offer: Offer, wanted: &str) -> Option<Offer> {
+    let kept: Offer = offer
+        .into_iter()
+        .filter(|(mime, _)| type_matches(mime, wanted))
+        .collect();
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// Trim the offer to `max` bytes, dropping individual representations that don't
@@ -1176,42 +1190,127 @@ impl<C: Clipboard> SyncEngine<C> {
     /// so `TypesOnly` reads no contents at all and `One` reads exactly one.
     /// Narrowing only the reply would leave `wl-paste -l` pulling a 30 MB image
     /// off the compositor to print a list of names.
+    ///
+    /// Every shape of request therefore starts from the advertised type *names*,
+    /// which cost one names-only roundtrip and no representation contents. That
+    /// is what lets the narrowing stay while the answer stays correct: the two
+    /// decisions a narrowed read would otherwise destroy — is this content
+    /// sensitive, and would `text/plain` be synthesized rather than offered —
+    /// are both answerable from names, before anything is read. Deciding them
+    /// after the read meant `-t` and `-l` each silently skipped a stage the
+    /// un-narrowed path runs, and `-t text/plain` served secrets a push refuses.
     async fn serve_get(&self, kind: SelectionKind, want: GetWant) -> GetResult {
         if !self.policies.get(kind).send {
             return GetResult::Unavailable(Unavailable::NotSynced);
         }
-        // Names are not content, so they bypass the content pipeline entirely.
-        // The rules still govern what leaves this host, so the list is filtered
-        // to the types this node would actually serve.
+        let Some(types) = self.io.list_types(kind).await else {
+            return GetResult::Unavailable(Unavailable::Unreadable);
+        };
+        if types.is_empty() {
+            return GetResult::Unavailable(Unavailable::Empty);
+        }
+        // Gated for every shape of request, and before any content is read — so
+        // a secret's bytes are never pulled off the compositor at all.
+        if self.serving_is_sensitive(kind, &types).await {
+            debug!("not serving: clipboard is flagged sensitive (password-manager contents)");
+            return GetResult::Unavailable(Unavailable::Sensitive);
+        }
+        // Names are not content, so they bypass the content pipeline. The rules
+        // still govern what leaves this host, so the list is filtered to the
+        // types this node would actually serve.
         if want == GetWant::TypesOnly {
-            let Some(types) = self.io.list_types(kind).await else {
-                return GetResult::Unavailable(Unavailable::Unreadable);
-            };
-            let had_types = !types.is_empty();
             let allowed = self.filter_names(types).await;
-            return match (allowed.is_empty(), had_types) {
-                (false, _) => GetResult::Types(allowed),
-                // The distinction the reason exists for: nothing offered at all,
-                // versus types offered and all of them denied by our rules.
-                (true, true) => GetResult::Unavailable(Unavailable::Denied),
-                (true, false) => GetResult::Unavailable(Unavailable::Empty),
+            return match allowed.is_empty() {
+                false => GetResult::Types(allowed),
+                // Types were offered (checked above) and every one is denied —
+                // the distinction the reason exists for.
+                true => GetResult::Unavailable(Unavailable::Denied),
             };
         }
-        let only = match &want {
+        let wanted = match &want {
             GetWant::One(t) => Some(t.as_str()),
             _ => None,
         };
-        let served = match self.read_for_serve(kind, only).await {
+        let source = wanted.map(|t| self.serve_source(t, &types));
+        let served = match self.read_for_serve(kind, source).await {
             Ok(raw) => self.apply_stages(raw, Pipeline::Serve).await,
             Err(reason) => Err(reason),
         };
-        match (served, only) {
-            (Ok(content), _) => GetResult::Offer(content.into_offer()),
-            // A narrowed request that came back with nothing: the type wasn't
-            // offered, or it was and the rules/cap dropped it. Either way the
-            // useful answer names what this node *would* serve.
-            (Err(_), Some(_)) => self.not_offered(kind).await,
+        match (served, wanted) {
+            // Synthesis can add representations the request didn't name (the
+            // atom they were derived from had to be read to get there), so a
+            // narrowed reply is trimmed to the request rather than assumed to
+            // already match it.
+            (Ok(content), Some(t)) => match narrow_to(content.into_offer(), t) {
+                Some(offer) => GetResult::Offer(offer),
+                None => self.narrowed_failure(t, types, Unavailable::Denied).await,
+            },
+            (Ok(content), None) => GetResult::Offer(content.into_offer()),
+            (Err(reason), Some(t)) => self.narrowed_failure(t, types, reason).await,
             (Err(reason), None) => GetResult::Unavailable(reason),
+        }
+    }
+
+    /// Whether this selection is password-manager content that must be withheld.
+    ///
+    /// The hint is advertised as a type, so its presence is visible in `types`;
+    /// only its *value* marks the content secret, so exactly one (tiny) extra
+    /// representation is read, and only when the hint is there at all. Ordinary
+    /// content therefore pays nothing for this, which is what makes it
+    /// affordable to check before deciding what else to read — the position that
+    /// lets a narrowed or names-only request be gated at all.
+    async fn serving_is_sensitive(&self, kind: SelectionKind, types: &[String]) -> bool {
+        if !self.cfg.exclude_sensitive || !types.iter().any(|t| t == SENSITIVE_MIME) {
+            return false;
+        }
+        match self.io.read_one(kind, SENSITIVE_MIME).await {
+            Some(hint) => is_sensitive(hint.offer()),
+            // The marker is advertised but unreadable. Withholding content we
+            // cannot clear is the safe direction for a secret.
+            None => true,
+        }
+    }
+
+    /// The type to *read* in order to answer a request for `wanted`.
+    ///
+    /// Normally `wanted` itself. But `Pipeline::Serve` synthesizes `text/plain`
+    /// from a legacy X11 atom, and reading the request verbatim would come back
+    /// empty for a type this node does serve — the same clipboard answered
+    /// `text/plain` over the mesh and "not offered" to `--paste -t text/plain`.
+    /// The atom is what has to be read; the pipeline derives the request from it.
+    fn serve_source<'a>(&self, wanted: &'a str, types: &[String]) -> &'a str {
+        let synthesizable = self.cfg.synthesize_text_plain
+            && is_text_plain(wanted)
+            && !types.iter().any(|t| type_matches(t, wanted));
+        if !synthesizable {
+            return wanted;
+        }
+        crate::clipboard::atoms::text_source(types.iter().map(String::as_str)).unwrap_or(wanted)
+    }
+
+    /// The answer to a narrowed request that produced nothing.
+    ///
+    /// `NotOffered` is emitted only when the requested type really is absent
+    /// from what this node would serve — so that is checked, not assumed.
+    /// Answering it for every failure produced a reply that listed the requested
+    /// type as available while claiming it was not offered, and threw away the
+    /// reason (`Unreadable`, `TooLarge`) that the un-narrowed path reports.
+    async fn narrowed_failure(
+        &self,
+        wanted: &str,
+        types: Vec<String>,
+        reason: Unavailable,
+    ) -> GetResult {
+        let available = self.filter_names(types).await;
+        if available.iter().any(|t| type_matches(t, wanted)) {
+            // We would serve that type; something else stopped us. Say what.
+            return GetResult::Unavailable(reason);
+        }
+        match available.is_empty() {
+            false => GetResult::NotOffered { available },
+            // Types were offered — `serve_get` returns Empty before this is
+            // reachable otherwise — so all of them are denied.
+            true => GetResult::Unavailable(Unavailable::Denied),
         }
     }
 
@@ -1236,23 +1335,6 @@ impl<C: Clipboard> SyncEngine<C> {
             return Err(Unavailable::Empty);
         }
         Ok(raw)
-    }
-
-    /// `GetResult::NotOffered` carrying the types this node would serve, so the
-    /// paster can say what *was* available. Costs one names-only roundtrip.
-    ///
-    /// Degrades to a plain reason when there is nothing to list: "that type is
-    /// not offered (available: none)" is a worse answer than naming why the
-    /// node has nothing.
-    async fn not_offered(&self, kind: SelectionKind) -> GetResult {
-        let types = self.io.list_types(kind).await.unwrap_or_default();
-        let had_types = !types.is_empty();
-        let available = self.filter_names(types).await;
-        match (available.is_empty(), had_types) {
-            (false, _) => GetResult::NotOffered { available },
-            (true, true) => GetResult::Unavailable(Unavailable::Denied),
-            (true, false) => GetResult::Unavailable(Unavailable::Empty),
-        }
     }
 
     /// Drop the type names this node's MIME rules would not send.
@@ -1980,6 +2062,110 @@ mod tests {
             GetResult::Unavailable(Unavailable::Sensitive),
             "a pull must refuse secrets, and say that is why"
         );
+    }
+
+    #[tokio::test]
+    async fn every_shape_of_pull_refuses_a_secret() {
+        // "A pull must not expose what a push wouldn't" has to hold for all three
+        // invocations, not just the un-narrowed one. The hint is advertised as a
+        // type, so narrowing the read at the backend filtered it out before the
+        // pipeline could see it, and a names-only request read no content at all:
+        // `-t text/plain` served the password that a broadcast refuses, and `-l`
+        // announced that this host was holding text.
+        let kind = SelectionKind::Clipboard;
+        let secret = || {
+            crate::protocol::test_support::offer(&[
+                ("text/plain", b"hunter2"),
+                (SENSITIVE_MIME, b"secret"),
+            ])
+        };
+        for want in [
+            GetWant::All,
+            GetWant::One("text/plain".to_string()),
+            GetWant::TypesOnly,
+        ] {
+            let clip = MockClipboard::new();
+            clip.seed(kind, secret());
+            let w = engine(clip, Config::for_test("s"));
+            assert_eq!(
+                w.engine.serve_get(kind, want.clone()).await,
+                GetResult::Unavailable(Unavailable::Sensitive),
+                "{want:?} served password-manager content"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_pull_names_the_reason_it_cannot_serve() {
+        // `NotOffered` is only true when the requested type is genuinely absent
+        // from what this node would serve. Answering it for every failure
+        // produced a reply that listed the requested type as available while
+        // claiming it was not offered, and hid the real reason.
+        let kind = SelectionKind::Clipboard;
+        let one = || GetWant::One("text/plain".to_string());
+
+        // Offered and rule-allowed, but over the payload budget: the type IS one
+        // we serve, so "not offered" would contradict the list it carries.
+        let clip = MockClipboard::new();
+        clip.seed(
+            kind,
+            crate::protocol::test_support::offer(&[("text/plain", b"a giant payload")]),
+        );
+        let mut cfg = Config::for_test("s");
+        cfg.max_payload_size = 4;
+        let w = engine(clip, cfg);
+        assert_eq!(
+            w.engine.serve_get(kind, one()).await,
+            GetResult::Unavailable(Unavailable::TooLarge),
+        );
+
+        // Genuinely not offered: the node has other content, so naming it is
+        // the useful answer.
+        let clip = MockClipboard::new();
+        clip.seed(
+            kind,
+            crate::protocol::test_support::offer(&[("image/png", b"png")]),
+        );
+        let mut cfg = Config::for_test("s");
+        let (_dir, _) = with_rules(&mut cfg, MimePolicy::Allow, &[]);
+        let w = engine(clip, cfg);
+        assert_eq!(
+            w.engine.serve_get(kind, one()).await,
+            GetResult::NotOffered {
+                available: vec!["image/png".to_string()]
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_synthesized_text_plain_is_servable_through_a_narrowed_pull() {
+        // `Pipeline::Serve` declares `synthesize: true`, but narrowing the read
+        // to the requested type stripped the legacy atom it would be derived
+        // from — so the one clipboard answered "text/plain" over the mesh and
+        // "not offered" to `--paste -t text/plain`.
+        let kind = SelectionKind::Clipboard;
+        let clip = MockClipboard::new();
+        clip.seed(
+            kind,
+            crate::protocol::test_support::offer(&[("UTF8_STRING", b"hello")]),
+        );
+        let mut cfg = Config::for_test("s");
+        cfg.synthesize_text_plain = true;
+        let w = engine(clip, cfg);
+
+        let GetResult::Offer(served) = w
+            .engine
+            .serve_get(kind, GetWant::One("text/plain".to_string()))
+            .await
+        else {
+            panic!("the synthesized text/plain was not served");
+        };
+        assert_eq!(
+            served.keys().collect::<Vec<_>>(),
+            vec!["text/plain"],
+            "a narrowed pull must carry only what it asked for"
+        );
+        assert_eq!(served["text/plain"], b"hello");
     }
 
     #[tokio::test]
