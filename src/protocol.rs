@@ -5,7 +5,9 @@ use uuid::Uuid;
 /// Wire protocol version. Bumped whenever the on-wire message format changes.
 /// bincode is not self-describing, so mismatched versions cannot interoperate —
 /// all nodes must run a compatible build. Logged at startup for diagnosis.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// v5: `Clip`/`Rules` carry a single `Version` instead of loose `stamp`/`origin`.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// All MIME representations of one clipboard state, in the source compositor's
 /// advertise order (preference order — richest first), which `IndexMap`
@@ -28,7 +30,12 @@ pub enum SelectionKind {
 ///
 /// Field order is the comparison order: `derive(Ord)` compares `stamp` first,
 /// then `origin`. Don't reorder them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// This type — not the two fields loose — is what crosses the wire, so the only
+/// thing a receiver can write is a comparison of the whole `Version`. Splitting
+/// it would let a site compare `stamp` alone, which compiles cleanly and
+/// silently diverges the mesh on a tie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
     pub stamp: u64,
     pub origin: Uuid,
@@ -56,24 +63,14 @@ pub enum Message {
         kind: SelectionKind,
         hash: [u8; 32],
         offer: Offer,
-        /// Hybrid logical stamp at the originating node: the max of its
-        /// wall-clock ms and the highest stamp it has seen. Higher wins;
-        /// `origin` breaks ties. Used to order every update (live and
-        /// reconnect resync) by the same rule.
-        stamp: u64,
-        /// Node ID that created this content; deterministic tiebreaker
-        /// when two updates carry the same stamp.
-        origin: Uuid,
+        /// Orders this update against every other, live or reconnect resync.
+        version: Version,
     },
     /// The full MIME-rules file, shared across the mesh under whole-file
     /// last-writer-wins. `body` is the entire file text (including the
-    /// `# clipmesh-version:` header line); `(stamp, origin)` order it the same
-    /// way a clipboard update is ordered.
-    Rules {
-        stamp: u64,
-        origin: Uuid,
-        body: String,
-    },
+    /// `# clipmesh-version:` header line); `version` orders it the same way a
+    /// clipboard update is ordered.
+    Rules { version: Version, body: String },
 }
 
 /// BLAKE3 over the (mime, bytes) pairs, length-prefixed to avoid boundary
@@ -153,7 +150,7 @@ pub fn decode(buf: &[u8]) -> anyhow::Result<Message> {
 /// keeps them out of the public API.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{content_hash, Message, Offer, SelectionKind};
+    use super::{content_hash, Message, Offer, SelectionKind, Version};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -196,8 +193,7 @@ pub(crate) mod test_support {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&offer),
             offer,
-            stamp: 0,
-            origin: Uuid::nil(),
+            version: Version::new(0, Uuid::nil()),
         }
     }
 }
@@ -245,8 +241,7 @@ mod tests {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&o),
             offer: o,
-            stamp: 123,
-            origin: Uuid::new_v4(),
+            version: Version::new(123, Uuid::new_v4()),
         };
         assert_eq!(decode(&encode(&clip)).unwrap(), clip);
     }
@@ -278,8 +273,7 @@ mod tests {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&o),
             offer: o,
-            stamp: 1,
-            origin: Uuid::new_v4(),
+            version: Version::new(1, Uuid::new_v4()),
         };
         let Message::Clip { offer, .. } = decode(&encode(&clip)).unwrap() else {
             panic!("expected a Clip");
@@ -312,8 +306,7 @@ mod tests {
     #[test]
     fn rules_message_round_trips() {
         let msg = Message::Rules {
-            stamp: 42,
-            origin: Uuid::new_v4(),
+            version: Version::new(42, Uuid::new_v4()),
             body: "# clipmesh-version: 42 x\nimage/png allow\n".to_string(),
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);

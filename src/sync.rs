@@ -875,8 +875,7 @@ impl<C: Clipboard> SyncEngine<C> {
             kind,
             hash,
             offer,
-            stamp: version.stamp,
-            origin: version.origin,
+            version,
         });
     }
 
@@ -1059,8 +1058,7 @@ impl<C: Clipboard> SyncEngine<C> {
                 self.mesh.send_to(
                     peer,
                     &Message::Rules {
-                        stamp: s.version.stamp,
-                        origin: s.version.origin,
+                        version: s.version,
                         body: s.body,
                     },
                 );
@@ -1098,8 +1096,7 @@ impl<C: Clipboard> SyncEngine<C> {
                     kind,
                     hash: state.hash,
                     offer,
-                    stamp: state.version.stamp,
-                    origin: state.version.origin,
+                    version: state.version,
                 },
             );
         }
@@ -1112,17 +1109,9 @@ impl<C: Clipboard> SyncEngine<C> {
                 kind,
                 hash,
                 offer,
-                stamp,
-                origin,
-            } => {
-                self.on_inbound_clip(from, kind, hash, offer, stamp, origin)
-                    .await
-            }
-            Message::Rules {
-                stamp,
-                origin,
-                body,
-            } => self.on_inbound_rules(from, stamp, origin, body),
+                version,
+            } => self.on_inbound_clip(from, kind, hash, offer, version).await,
+            Message::Rules { version, body } => self.on_inbound_rules(from, version, body),
             Message::Hello { .. } => {
                 warn!("ignoring an unexpected Hello from peer {from} after handshake")
             }
@@ -1135,13 +1124,13 @@ impl<C: Clipboard> SyncEngine<C> {
         kind: SelectionKind,
         hash: [u8; 32],
         offer: Offer,
-        stamp: u64,
-        origin: Uuid,
+        version: Version,
     ) {
         // Describe before the offer is filtered/moved, for the verbose summary.
         let received = self.cfg.verbose.then(|| describe_offer(&offer));
+        let stamp = version.stamp;
         let outcome = self
-            .apply_inbound_clip(from, kind, hash, offer, stamp, origin)
+            .apply_inbound_clip(from, kind, hash, offer, version)
             .await;
         if let Some(received) = received {
             info!("received {kind:?} from peer {from} [{received}], stamp {stamp}: {outcome}");
@@ -1157,12 +1146,12 @@ impl<C: Clipboard> SyncEngine<C> {
         kind: SelectionKind,
         hash: [u8; 32],
         offer: Offer,
-        stamp: u64,
-        origin: Uuid,
+        version: Version,
     ) -> &'static str {
         debug!(
-            "received {kind:?} update from peer {from} ({}, stamp {stamp})",
-            describe_offer(&offer)
+            "received {kind:?} update from peer {from} ({}, stamp {})",
+            describe_offer(&offer),
+            version.stamp
         );
         if !self.may_recv(kind) {
             debug!("ignoring inbound {kind:?} from peer {from}: blocked by direction/sync_selection config");
@@ -1172,7 +1161,6 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!("dropping update from peer {from}: content hash doesn't match (corrupted or tampered)");
             return "rejected (content hash mismatch)";
         }
-        let version = Version::new(stamp, origin);
         if !self.accept_stamp(version, from, "update") {
             return "rejected (timestamp too far in the future)";
         }
@@ -1208,14 +1196,15 @@ impl<C: Clipboard> SyncEngine<C> {
                     return "already our current content";
                 }
                 if !state.superseded_by(version) {
-                    debug!("ignoring an older {kind:?} update from peer {from} (stamp {stamp}); we already hold newer content");
+                    debug!("ignoring an older {kind:?} update from peer {from} (stamp {}); we already hold newer content", version.stamp);
                     return "ignored (older than our content)";
                 }
             }
         }
         debug!(
-            "applying {kind:?} update from peer {from} ({}, stamp {stamp})",
-            describe_offer(&offer)
+            "applying {kind:?} update from peer {from} ({}, stamp {})",
+            describe_offer(&offer),
+            version.stamp
         );
         // `write_selection` marks this as engine-written, so the resulting watch
         // echo is not treated by the bridge as a fresh local change: mesh-received
@@ -1260,8 +1249,7 @@ impl<C: Clipboard> SyncEngine<C> {
             Ok(s) => {
                 debug!("broadcasting shared MIME-rules (stamp {})", s.version.stamp);
                 self.mesh.broadcast(&Message::Rules {
-                    stamp: s.version.stamp,
-                    origin: s.version.origin,
+                    version: s.version,
                     body: s.body,
                 });
             }
@@ -1274,7 +1262,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// implausibly-future stamps and `observe()`s the stamp so a later local
     /// edit outranks the adopted version (otherwise a local edit stamped below
     /// it would revert to the version it just replaced).
-    fn on_inbound_rules(&self, from: Uuid, stamp: u64, origin: Uuid, body: String) {
+    fn on_inbound_rules(&self, from: Uuid, incoming: Version, body: String) {
         if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
             return;
         }
@@ -1284,7 +1272,6 @@ impl<C: Clipboard> SyncEngine<C> {
         if !self.inbound_rules_body_ok(body.len(), from) {
             return;
         }
-        let incoming = Version::new(stamp, origin);
         if !self.accept_stamp(incoming, from, "MIME-rules") {
             return;
         }
@@ -1293,8 +1280,8 @@ impl<C: Clipboard> SyncEngine<C> {
         let current = rules.version(own_id);
         if incoming > current {
             debug!(
-                "adopting shared MIME-rules from peer {from} (stamp {stamp}); replaces our (stamp {}, origin {})",
-                current.stamp, current.origin
+                "adopting shared MIME-rules from peer {from} (stamp {}); replaces our (stamp {}, origin {})",
+                incoming.stamp, current.stamp, current.origin
             );
             rules.replace_from(body);
             // Stamp the adopted version explicitly so version() reflects it even
@@ -1308,8 +1295,8 @@ impl<C: Clipboard> SyncEngine<C> {
             }
         } else {
             debug!(
-                "ignoring shared MIME-rules from peer {from} (stamp {stamp}); we hold a newer-or-equal version (stamp {})",
-                current.stamp
+                "ignoring shared MIME-rules from peer {from} (stamp {}); we hold a newer-or-equal version (stamp {})",
+                incoming.stamp, current.stamp
             );
         }
     }
@@ -1623,8 +1610,7 @@ mod tests {
                     kind: SelectionKind::Clipboard,
                     hash: content_hash(&o),
                     offer: o.clone(),
-                    stamp: now_ms() + 10_000,
-                    origin: remote_id,
+                    version: Version::new(now_ms() + 10_000, remote_id),
                 },
             ))
             .await
@@ -1733,35 +1719,36 @@ mod tests {
         let a = offer("hello");
         let ha = content_hash(&a);
         assert_eq!(
-            e.apply_inbound_clip(from, kind, ha, a.clone(), 1000, from)
+            e.apply_inbound_clip(from, kind, ha, a.clone(), Version::new(1000, from))
                 .await,
             "applied"
         );
         assert_eq!(
-            e.apply_inbound_clip(from, kind, ha, a, 1000, from).await,
+            e.apply_inbound_clip(from, kind, ha, a, Version::new(1000, from))
+                .await,
             "already our current content"
         );
         let b = offer("older");
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&b), b, 1, from)
+            e.apply_inbound_clip(from, kind, content_hash(&b), b, Version::new(1, from))
                 .await,
             "ignored (older than our content)"
         );
         assert_eq!(
-            e.apply_inbound_clip(from, kind, [0u8; 32], offer("x"), 2000, from)
+            e.apply_inbound_clip(from, kind, [0u8; 32], offer("x"), Version::new(2000, from))
                 .await,
             "rejected (content hash mismatch)"
         );
         let f = offer("future");
         let future = now_ms() + MAX_FUTURE_SKEW_MS + 60_000;
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&f), f, future, from)
+            e.apply_inbound_clip(from, kind, content_hash(&f), f, Version::new(future, from))
                 .await,
             "rejected (timestamp too far in the future)"
         );
         // Exercise the verbose logging wrapper end-to-end (must not panic).
         let g = offer("newer");
-        e.on_inbound_clip(from, kind, content_hash(&g), g, 5000, from)
+        e.on_inbound_clip(from, kind, content_hash(&g), g, Version::new(5000, from))
             .await;
 
         // Send-only engine: inbound is dropped by the direction policy.
@@ -1770,7 +1757,7 @@ mod tests {
         let e = standalone(cfg);
         let c = offer("blocked");
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&c), c, 1000, from)
+            e.apply_inbound_clip(from, kind, content_hash(&c), c, Version::new(1000, from))
                 .await,
             "dropped (blocked by direction/sync_selection config)"
         );
@@ -1781,7 +1768,7 @@ mod tests {
         let e = standalone(cfg);
         let d = offer("denied");
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&d), d, 1000, from)
+            e.apply_inbound_clip(from, kind, content_hash(&d), d, Version::new(1000, from))
                 .await,
             "dropped (content filters removed everything)"
         );
@@ -1797,9 +1784,8 @@ mod tests {
                     kind,
                     hash,
                     offer,
-                    stamp,
-                    ..
-                } => return (kind, hash, offer, stamp),
+                    version,
+                } => return (kind, hash, offer, version.stamp),
                 Message::Rules { .. } => continue,
                 other => panic!("expected Clip, got {other:?}"),
             }
@@ -1838,8 +1824,7 @@ mod tests {
             kind,
             hash: content_hash(&o),
             offer: o,
-            stamp,
-            origin: h.remote_id,
+            version: Version::new(stamp, h.remote_id),
         };
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
     }
@@ -1851,8 +1836,7 @@ mod tests {
             .send((
                 h.remote_id,
                 Message::Rules {
-                    stamp,
-                    origin,
+                    version: Version::new(stamp, origin),
                     body,
                 },
             ))
@@ -2298,8 +2282,7 @@ mod tests {
             kind: SelectionKind::Clipboard,
             hash: [9u8; 32],
             offer: o,
-            stamp: 1,
-            origin: h.remote_id,
+            version: Version::new(1, h.remote_id),
         };
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2689,10 +2672,10 @@ mod tests {
         h.mesh.register(Uuid::new_v4(), tx2);
         match recv_from(&mut rx2).await {
             Message::Clip {
-                offer: o, stamp, ..
+                offer: o, version, ..
             } => {
                 assert_eq!(o, offer("restored"));
-                assert_eq!(stamp, 0, "restored content must resync at stamp 0");
+                assert_eq!(version.stamp, 0, "restored content must resync at stamp 0");
             }
             other => panic!("expected resync Clip, got {other:?}"),
         }
@@ -3198,8 +3181,8 @@ mod tests {
         h.clip.local_copy(SelectionKind::Clipboard, o);
         let mut stamp = None;
         for _ in 0..3 {
-            if let Message::Rules { stamp: s, .. } = recv_msg(&mut h).await {
-                stamp = Some(s);
+            if let Message::Rules { version, .. } = recv_msg(&mut h).await {
+                stamp = Some(version.stamp);
                 break;
             }
         }
