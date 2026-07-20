@@ -10,7 +10,7 @@
 //! through the link (e.g. into a dotfiles repo) are seen.
 
 use crate::config::Config;
-use crate::fsutil::{is_symlink, resolve_link_target};
+use crate::fsutil::{is_symlink, parent_dir, resolve_link_target};
 use crate::mime::{lock_rules, MimeRules};
 use anyhow::{Context, Result};
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
@@ -60,7 +60,7 @@ enum TargetSite {
 }
 
 /// One registered watch. `path` is the watched file — its directory
-/// (`watch_dir(path)`) is what inotify watches and `path.file_name()` is what
+/// (`parent_dir(path)`) is what inotify watches and `path.file_name()` is what
 /// events are matched against; `wd` is that directory's descriptor. Storing the
 /// single path keeps the directory and the name from ever disagreeing.
 struct Entry {
@@ -91,7 +91,7 @@ fn target_site(path: &Path) -> TargetSite {
     // would fold a transient stat failure (EACCES/EIO) into "broken" silently;
     // distinguish a genuinely-missing dir from a stat error and log the latter
     // (it self-heals on the next link-site event), mirroring `is_symlink`.
-    match fs::metadata(watch_dir(&resolved)) {
+    match fs::metadata(parent_dir(&resolved)) {
         Ok(m) if m.is_dir() => TargetSite::Watch(resolved),
         Ok(_) => TargetSite::Broken(resolved),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => TargetSite::Broken(resolved),
@@ -190,7 +190,7 @@ fn add_file_watches(
     // symlink(2) (e.g. stow's `ln -sf`), which emits no CLOSE_WRITE/MOVED_TO.
     let link_mask = target_mask() | WatchMask::CREATE;
 
-    let link_dir = watch_dir(path);
+    let link_dir = parent_dir(path);
     let wd = ensure_watch(inotify, masks, &link_dir, link_mask)?;
     entries.push(Entry {
         target,
@@ -201,7 +201,7 @@ fn add_file_watches(
 
     match target_site(path) {
         TargetSite::Watch(target_path) => {
-            let dir = watch_dir(&target_path);
+            let dir = parent_dir(&target_path);
             let wd = ensure_watch(inotify, masks, &dir, target_mask())?;
             info!(
                 "{} {} is a symlink; also watching its target directory {}",
@@ -271,7 +271,7 @@ fn reconcile_target(
 
     let old = pos.map(|i| entries.remove(i));
     if let Some(target_path) = desired {
-        let dir = watch_dir(&target_path);
+        let dir = parent_dir(&target_path);
         match ensure_watch(inotify, masks, &dir, target_mask()) {
             Ok(wd) => {
                 info!(
@@ -301,7 +301,7 @@ fn reconcile_target(
         if !entries.iter().any(|e| e.wd == old.wd) {
             // Drop the directory's mask bookkeeping too, so `masks` doesn't grow
             // unbounded as a symlink is repointed across directories over time.
-            masks.remove(&watch_dir(&old.path));
+            masks.remove(&parent_dir(&old.path));
             if let Err(e) = inotify.watches().remove(old.wd) {
                 debug!(
                     "removing the stale watch for {} failed ({e}); likely already auto-removed",
@@ -496,13 +496,6 @@ fn restart_on_config_change(config_path: &Path, original: &str) {
 
 /// The directory to watch for a file: its parent, or "." when the path is a
 /// bare file name.
-fn watch_dir(path: &Path) -> PathBuf {
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +521,27 @@ mod tests {
         panic!("{what}");
     }
 
+    /// Run the inotify loop under test on its own thread with a no-op
+    /// config-change callback.
+    ///
+    /// A test that needs to observe the config-change callback firing spawns
+    /// `run` inline with its own closure instead.
+    fn spawn_watcher(
+        config: &Path,
+        rules_path: Option<&Path>,
+        rules: &Arc<Mutex<MimeRules>>,
+        tx: &tokio::sync::mpsc::Sender<()>,
+    ) {
+        let config = config.to_path_buf();
+        let rules_path = rules_path.map(Path::to_path_buf);
+        let rules = rules.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut noop = || {};
+            let _ = run(&config, rules_path.as_deref(), &rules, &mut noop, &tx);
+        });
+    }
+
     #[test]
     fn target_site_resolves_a_symlinked_file_to_its_real_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -539,7 +553,7 @@ mod tests {
         let TargetSite::Watch(p) = target_site(&link) else {
             panic!("a symlink yields a watchable target site");
         };
-        assert_eq!(watch_dir(&p), real_dir);
+        assert_eq!(parent_dir(&p), real_dir);
         assert_eq!(p.file_name(), Some(std::ffi::OsStr::new("mimetypes")));
     }
 
@@ -554,7 +568,7 @@ mod tests {
         let TargetSite::Watch(p) = target_site(&link) else {
             panic!("dir exists → expected a watchable target site");
         };
-        assert_eq!(watch_dir(&p), real_dir);
+        assert_eq!(parent_dir(&p), real_dir);
     }
 
     #[test]
@@ -598,14 +612,7 @@ mod tests {
         )));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let link_w = rules_link.clone();
-        let tx_w = tx.clone();
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&link_w), &rules_w, &mut noop, &tx_w);
-        });
+        spawn_watcher(&config_path, Some(&rules_link), &rules, &tx);
 
         // Edit the REAL file (in the dotfiles dir), not the symlink path.
         poll_until(
@@ -628,14 +635,7 @@ mod tests {
         )));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let rp_w = rules_path.clone();
-        let tx_w = tx.clone();
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&rp_w), &rules_w, &mut noop, &tx_w);
-        });
+        spawn_watcher(&config_path, Some(&rules_path), &rules, &tx);
 
         // 1. Establish the watch is live: rewrite until a ping lands, then drain.
         poll_until(
@@ -687,14 +687,7 @@ mod tests {
             MimePolicy::Deny,
         )));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let link_w = link.clone();
-        let tx_w = tx.clone();
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&link_w), &rules_w, &mut noop, &tx_w);
-        });
+        spawn_watcher(&config_path, Some(&link), &rules, &tx);
 
         // Let the watch go live on A (edit A until a ping lands), then drain.
         poll_until(
@@ -774,14 +767,7 @@ mod tests {
             MimePolicy::Deny,
         )));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let link_w = link.clone();
-        let tx_w = tx.clone();
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&link_w), &rules_w, &mut noop, &tx_w);
-        });
+        spawn_watcher(&config_path, Some(&link), &rules, &tx);
 
         // Repair: create the target's dir + file, then re-point the link in a
         // retry loop. Each re-point (unlink + symlink) fires a link-site CREATE
@@ -797,13 +783,6 @@ mod tests {
             || rx.try_recv().is_ok(),
             "the repaired broken symlink was not picked up",
         );
-    }
-
-    #[test]
-    fn watch_dir_uses_the_parent_or_falls_back_to_dot() {
-        assert_eq!(watch_dir(Path::new("/a/b/c")), PathBuf::from("/a/b"));
-        // A bare file name has an empty parent; watch the current directory.
-        assert_eq!(watch_dir(Path::new("config.toml")), PathBuf::from("."));
     }
 
     #[test]
@@ -852,14 +831,7 @@ mod tests {
         )));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let rules_path_w = rules_path.clone();
-        let tx_w = tx.clone();
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx_w);
-        });
+        spawn_watcher(&config_path, Some(&rules_path), &rules, &tx);
 
         poll_until(
             || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
@@ -884,14 +856,7 @@ mod tests {
         )));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let rules_path_w = rules_path.clone();
-        let tx_w = tx.clone();
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx_w);
-        });
+        spawn_watcher(&config_path, Some(&rules_path), &rules, &tx);
 
         // Establish the watch and confirm a real change pings (this also makes
         // the watcher's loaded snapshot become "image/png allow\n").
@@ -926,14 +891,8 @@ mod tests {
         )));
         assert!(!rules.lock().unwrap().allows("image/png", 1));
 
-        let rules_w = rules.clone();
-        let cfg_w = config_path.clone();
-        let rules_path_w = rules_path.clone();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx);
-        });
+        spawn_watcher(&config_path, Some(&rules_path), &rules, &tx);
 
         // Rewrite the file each iteration rather than sleeping a fixed amount
         // and writing once: if the watch isn't registered yet, a later write's

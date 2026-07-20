@@ -55,8 +55,9 @@ impl Backoff {
         }
     }
 
-    /// Drop back to the minimum: the last attempt is judged a success.
-    pub fn reset(&mut self) {
+    /// Drop back to the minimum: the last attempt is judged a success. Private:
+    /// callers express success through `reset_if_stable`, which is the policy.
+    fn reset(&mut self) {
         self.current = self.min;
     }
 

@@ -268,16 +268,18 @@ pub async fn fetch_from_any(
 /// The bytes paste mode writes to stdout for a fetched offer: either the type
 /// listing (`-l`) or the selected representation (rendered with the newline
 /// rule). Kept pure so the output decision is testable without a node or stdout.
-fn output_bytes(pa: &PasteArgs, offer: &Offer) -> Result<Vec<u8>> {
+fn output_bytes(pa: &PasteArgs, mut offer: Offer) -> Result<Vec<u8>> {
     if pa.list {
-        return Ok(list_types(offer).into_bytes());
+        return Ok(list_types(&offer).into_bytes());
     }
-    let mime = select_type(pa.type_.as_deref(), offer)?;
+    // Take the chosen representation out of the offer rather than copying it:
+    // the offer is dropped immediately after, and a rep can be max_payload_size
+    // large. `select_type` borrows from `offer`, so settle on the key first.
+    let mime = select_type(pa.type_.as_deref(), &offer)?.to_string();
     let data = offer
-        .get(mime)
-        .cloned()
+        .swap_remove(&mime)
         .ok_or_else(|| anyhow!("selected type {mime:?} is unexpectedly absent from the offer"))?;
-    Ok(render(data, mime, pa.no_newline))
+    Ok(render(data, &mime, pa.no_newline))
 }
 
 /// Write `bytes` to stdout, treating a downstream-closed pipe (e.g. `… | head`)
@@ -310,7 +312,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         PASTE_TIMEOUT,
     )
     .await?;
-    write_stdout(&output_bytes(&pa, &offer)?)
+    write_stdout(&output_bytes(&pa, offer)?)
 }
 
 #[cfg(test)]
@@ -541,14 +543,14 @@ mod tests {
     fn output_bytes_lists_types_with_l() {
         let o = offer(&[("text/html", b"<b>"), ("text/plain", b"x")]);
         let pa = paste_args(None, true, false);
-        assert_eq!(output_bytes(&pa, &o).unwrap(), b"text/html\ntext/plain\n");
+        assert_eq!(output_bytes(&pa, o).unwrap(), b"text/html\ntext/plain\n");
     }
 
     #[test]
     fn output_bytes_auto_selects_and_appends_newline() {
         let o = offer(&[("image/png", b"\x89"), ("text/plain", b"hi")]);
         let pa = paste_args(None, false, false);
-        assert_eq!(output_bytes(&pa, &o).unwrap(), b"hi\n");
+        assert_eq!(output_bytes(&pa, o).unwrap(), b"hi\n");
     }
 
     #[test]
@@ -558,13 +560,13 @@ mod tests {
             .into_iter()
             .collect();
         let pa = paste_args(Some("image/png"), false, false);
-        assert_eq!(output_bytes(&pa, &o).unwrap(), png);
+        assert_eq!(output_bytes(&pa, o).unwrap(), png);
     }
 
     #[test]
     fn output_bytes_errors_when_requested_type_absent() {
         let o = offer(&[("text/plain", b"x")]);
         let pa = paste_args(Some("image/png"), false, false);
-        assert!(output_bytes(&pa, &o).is_err());
+        assert!(output_bytes(&pa, o).is_err());
     }
 }

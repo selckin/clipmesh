@@ -202,19 +202,13 @@ mod tests {
 
     const MAX: usize = 8 * 1024 * 1024;
 
-    async fn pair(
-        psk_a: [u8; 32],
-        psk_b: [u8; 32],
-    ) -> (
-        anyhow::Result<(
-            SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-            RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-        )>,
-        anyhow::Result<(
-            SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-            RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-        )>,
-    ) {
+    /// What `handshake` yields for one end of an in-memory duplex pair.
+    type Halves = Result<(
+        SendHalf<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+        RecvHalf<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    )>;
+
+    async fn pair(psk_a: [u8; 32], psk_b: [u8; 32]) -> (Halves, Halves) {
         let (a, b) = tokio::io::duplex(4 * 1024 * 1024);
         tokio::join!(
             handshake(a, &psk_a, true, MAX),

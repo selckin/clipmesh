@@ -238,16 +238,6 @@ pub(crate) fn with_default_port(addr: &str, default_port: &str) -> String {
 }
 
 impl Config {
-    /// Whether the SELECTION must be observed by the clipboard watcher:
-    /// either it is mesh-synced (`sync_selection`), or the local bridge needs
-    /// SELECTION changes so it can mirror them into CLIPBOARD
-    /// (`selection_to_clipboard`/`both`). Feeds the engine's `watched_kinds`,
-    /// which is what the engine hands to `Clipboard::watch` — so the backend
-    /// learns the set from the engine rather than deciding it separately.
-    pub fn watch_selection(&self) -> bool {
-        self.sync_selection || self.link_selections.selection_to_clipboard
-    }
-
     pub fn load(path: &Path) -> Result<Config> {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
@@ -269,8 +259,7 @@ impl Config {
         // Default the rules file to live beside the config (e.g.
         // ~/.config/clipmesh/mimetypes) unless the user set an explicit path.
         if cfg.mime_rules_path.is_none() {
-            let dir = path.parent().unwrap_or_else(|| Path::new("."));
-            cfg.mime_rules_path = Some(dir.join("mimetypes"));
+            cfg.mime_rules_path = Some(crate::fsutil::parent_dir(path).join("mimetypes"));
         }
         Ok(cfg)
     }
@@ -640,23 +629,6 @@ selection_to_clipboard = true
             assert_eq!(link.clipboard_to_selection, clip_to_sel, "{link:?}");
             assert_eq!(link.selection_to_clipboard, sel_to_clip, "{link:?}");
         }
-    }
-
-    #[test]
-    fn watch_selection_tracks_sync_selection_and_the_selection_bridge() {
-        let mut cfg = Config::for_test("s");
-        assert!(!cfg.watch_selection()); // default: neither
-        cfg.sync_selection = true;
-        assert!(cfg.watch_selection()); // mesh-synced
-        cfg.sync_selection = false;
-        cfg.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD;
-        assert!(cfg.watch_selection()); // bridge needs SELECTION observed
-        cfg.link_selections = LinkSelections::BOTH;
-        assert!(cfg.watch_selection());
-        // clipboard_to_selection alone never needs SELECTION watched (it only
-        // *writes* SELECTION); CLIPBOARD is always observed.
-        cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
-        assert!(!cfg.watch_selection());
     }
 
     #[test]

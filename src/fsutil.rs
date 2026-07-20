@@ -23,6 +23,17 @@ pub fn is_symlink(path: &Path) -> bool {
     }
 }
 
+/// The directory holding `path`, falling back to the current directory. A bare
+/// file name has an *empty* parent rather than none, and an empty path is not
+/// something a caller can open, watch, or join against meaningfully — so both
+/// cases collapse to `.` here instead of at each call site.
+pub fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// Follow a symlink to the file it ultimately names, resolving each relative
 /// hop against the directory of the link being followed (stow's default links
 /// are relative). Stops at the first non-symlink or unreadable component and
@@ -48,6 +59,13 @@ pub fn resolve_link_target(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_dir_uses_the_parent_or_falls_back_to_dot() {
+        assert_eq!(parent_dir(Path::new("/a/b/c")), PathBuf::from("/a/b"));
+        // A bare file name has an empty parent; use the current directory.
+        assert_eq!(parent_dir(Path::new("config.toml")), PathBuf::from("."));
+    }
 
     #[test]
     fn resolve_link_target_follows_a_relative_symlink_against_its_own_dir() {

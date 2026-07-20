@@ -393,11 +393,16 @@ impl Policies {
         Policies(Self::ORDER.map(|k| SelectionPolicy::for_kind(k, cfg)))
     }
 
+    /// `ORDER` is the single definition of the array layout: `new` fills the
+    /// slots through it and `get` looks them up through it, so reordering it
+    /// can't silently hand one selection another's policy. The scan is over two
+    /// elements; `ORDER` covers every variant, so the lookup always succeeds.
     fn get(&self, kind: SelectionKind) -> &SelectionPolicy {
-        match kind {
-            SelectionKind::Clipboard => &self.0[0],
-            SelectionKind::Selection => &self.0[1],
-        }
+        let slot = Self::ORDER
+            .iter()
+            .position(|&k| k == kind)
+            .expect("ORDER covers every SelectionKind");
+        &self.0[slot]
     }
 
     /// The selections satisfying `pick`, in a stable order (CLIPBOARD first).
@@ -446,32 +451,30 @@ fn plan_batch(
     // partner still reaches the mesh, as today). The caller applies may_send +
     // content filters + mesh-current dedup, so a non-synced or unchanged
     // selection yields no actual send.
-    let mut broadcasts = Vec::new();
-    for (&kind, raw) in reads {
-        broadcasts.push((kind, raw.clone()));
-    }
-    for (&kind, raw) in &mirror_targets {
-        broadcasts.push((kind, raw.clone()));
-    }
+    let broadcasts = reads
+        .iter()
+        .chain(&mirror_targets)
+        .map(|(&kind, raw)| (kind, raw.clone()))
+        .collect();
 
     // Writes, each selection at most once:
     //  - own on  -> Own (unconditional) for every genuine change AND every mirror
     //    target (the mirror+own merge: one owned write, no separate mirror write).
+    //    Same set as the broadcasts, which the shared iterator makes explicit.
     //  - own off -> Mirror (reconciled) for mirror targets only; genuine changes
     //    are broadcast but not written locally.
-    let mut writes = Vec::new();
-    if own {
-        for (&kind, raw) in reads {
-            writes.push((kind, raw.clone(), Provenance::Own));
-        }
-        for (&kind, raw) in &mirror_targets {
-            writes.push((kind, raw.clone(), Provenance::Own));
-        }
+    let writes = if own {
+        reads
+            .iter()
+            .chain(&mirror_targets)
+            .map(|(&kind, raw)| (kind, raw.clone(), Provenance::Own))
+            .collect()
     } else {
-        for (&kind, raw) in &mirror_targets {
-            writes.push((kind, raw.clone(), Provenance::Mirror));
-        }
-    }
+        mirror_targets
+            .iter()
+            .map(|(&kind, raw)| (kind, raw.clone(), Provenance::Mirror))
+            .collect()
+    };
 
     BatchPlan { broadcasts, writes }
 }
@@ -592,19 +595,15 @@ impl<C: Clipboard> SyncEngine<C> {
         let mut armed = false;
 
         loop {
+            // Set by the two arms that observe a local change, so the debounce
+            // policy below is stated once rather than per arm.
+            let mut local_change = false;
             tokio::select! {
                 // Priming finished (or its task died); broadcast anything that
                 // changed locally while we were priming.
                 _ = &mut primed_rx, if !primed => {
                     primed = true;
-                    if !pending.is_empty() {
-                        if self.cfg.debounce_ms == 0 {
-                            self.handle_batch(std::mem::take(&mut pending)).await;
-                        } else {
-                            deadline.as_mut().reset(tokio::time::Instant::now() + window);
-                            armed = true;
-                        }
-                    }
+                    local_change = !pending.is_empty();
                 },
                 kind = watch.recv() => match kind {
                     Some(kind) => {
@@ -613,14 +612,7 @@ impl<C: Clipboard> SyncEngine<C> {
                         }
                         // Until priming records the restored clipboard, just
                         // buffer — broadcasting now would re-send it as fresh.
-                        if primed {
-                            if self.cfg.debounce_ms == 0 {
-                                self.handle_batch(std::mem::take(&mut pending)).await;
-                            } else {
-                                deadline.as_mut().reset(tokio::time::Instant::now() + window);
-                                armed = true;
-                            }
-                        }
+                        local_change = primed;
                     }
                     None => {
                         warn!("clipboard watcher stopped; shutting down the sync engine");
@@ -655,6 +647,19 @@ impl<C: Clipboard> SyncEngine<C> {
                         break;
                     }
                 },
+            }
+            // The debounce policy, in one place: with no window, drain the batch
+            // immediately; otherwise (re)start the window and let the deadline
+            // arm above drain it.
+            if local_change {
+                if self.cfg.debounce_ms == 0 {
+                    self.handle_batch(std::mem::take(&mut pending)).await;
+                } else {
+                    deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + window);
+                    armed = true;
+                }
             }
         }
     }
@@ -748,15 +753,16 @@ impl<C: Clipboard> SyncEngine<C> {
                 offer
             }
         };
-        if stages.cap {
-            let offer = cap_to_payload_size(offer, self.cfg.max_payload_size);
-            if offer.is_empty() {
-                debug!("nothing to sync: everything was over the max_payload_size budget");
-                return None;
-            }
+        if !stages.cap {
+            // Nothing below can empty the offer, so it is still non-empty here.
             return Some(offer);
         }
-        (!offer.is_empty()).then_some(offer)
+        let offer = cap_to_payload_size(offer, self.cfg.max_payload_size);
+        if offer.is_empty() {
+            debug!("nothing to sync: everything was over the max_payload_size budget");
+            return None;
+        }
+        Some(offer)
     }
 
     fn apply_mime_rules(&self, offer: Offer, record_unseen: bool) -> Offer {
@@ -874,11 +880,27 @@ impl<C: Clipboard> SyncEngine<C> {
         });
     }
 
-    /// Whether any local sink would act on a change to `kind`: the mesh (if this
-    /// node sends it), the selection bridge, or the ownership rewrite. When none
-    /// would, `handle_batch` skips the read entirely.
-    fn has_local_sink(&self, kind: SelectionKind) -> bool {
-        self.policies.get(kind).has_local_sink()
+    /// Write `offer` to `kind` on behalf of the engine, recording it in
+    /// `last_written` so the watch echo it provokes is dropped rather than
+    /// re-driving propagation. THE single path from the engine to
+    /// `Clipboard::write_offer`: every engine write — an inbound apply, an
+    /// ownership rewrite, a bridge mirror — goes through here, so none can
+    /// forget the record and re-broadcast its own write. Records before the
+    /// write (the echo can arrive as soon as it lands) and rolls the marker back
+    /// on failure, since no echo will follow a write that never happened.
+    /// Returns whether the write succeeded.
+    async fn write_selection(&self, kind: SelectionKind, offer: Offer, hash: [u8; 32]) -> bool {
+        self.last_written.lock().unwrap().insert(kind, hash);
+        match self.clipboard.write_offer(kind, offer).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("couldn't write the {kind:?} selection: {e:#}");
+                // Drop the marker so a later genuine copy of identical bytes
+                // isn't wrongly suppressed.
+                self.last_written.lock().unwrap().remove(&kind);
+                false
+            }
+        }
     }
 
     /// Drain one debounce batch: read each fired selection once, plan every
@@ -898,7 +920,7 @@ impl<C: Clipboard> SyncEngine<C> {
         let mut reads: IndexMap<SelectionKind, Offer> = IndexMap::new();
         let mut read_cache: HashMap<SelectionKind, Offer> = HashMap::new();
         for kind in batch {
-            if !self.has_local_sink(kind) {
+            if !self.policies.get(kind).has_local_sink() {
                 if self.cfg.verbose {
                     info!("copied {kind:?}: not sent (this node does not send)");
                 }
@@ -974,19 +996,9 @@ impl<C: Clipboard> SyncEngine<C> {
             }
         }
         let copied = self.cfg.verbose.then(|| describe_offer(&final_offer));
-        // Record BEFORE the write so the watch echo it produces is recognised.
-        self.last_written.lock().unwrap().insert(kind, h);
-        match self.clipboard.write_offer(kind, final_offer).await {
-            Ok(()) => {
-                if let (Provenance::Mirror, Some(copied)) = (prov, copied) {
-                    info!("mirrored into {kind:?} [{copied}]");
-                }
-            }
-            Err(e) => {
-                warn!("couldn't write the {kind:?} selection: {e:#}");
-                // No echo will arrive; drop the marker so a later genuine copy of
-                // identical bytes isn't wrongly suppressed.
-                self.last_written.lock().unwrap().remove(&kind);
+        if self.write_selection(kind, final_offer, h).await {
+            if let (Provenance::Mirror, Some(copied)) = (prov, copied) {
+                info!("mirrored into {kind:?} [{copied}]");
             }
         }
     }
@@ -1205,34 +1217,27 @@ impl<C: Clipboard> SyncEngine<C> {
             "applying {kind:?} update from peer {from} ({}, stamp {stamp})",
             describe_offer(&offer)
         );
+        // `write_selection` marks this as engine-written, so the resulting watch
+        // echo is not treated by the bridge as a fresh local change: mesh-received
+        // content must not be re-mirrored to the partner selection nor
+        // re-broadcast to the mesh under our own origin. `link_selections` is a
+        // purely *local* coupling; cross-host propagation is `sync_selection`'s job.
+        if !self.write_selection(kind, offer, applied_hash).await {
+            return "clipboard write failed";
+        }
         // Record as current only on a successful write, so a transient
         // failure doesn't permanently block this content from re-applying.
         // The whole handler runs to completion on the single engine task
         // (it is awaited inline in run()'s select), so `current` cannot be
         // mutated across this await — the post-write insert is not a TOCTOU.
-        match self.clipboard.write_offer(kind, offer).await {
-            Ok(()) => {
-                self.current.lock().unwrap().insert(
-                    kind,
-                    ContentState {
-                        hash: applied_hash,
-                        version,
-                    },
-                );
-                // Mark this as engine-written so the resulting watch echo is not
-                // treated by the bridge as a fresh local change: mesh-received
-                // content must not be re-mirrored to the partner selection nor
-                // re-broadcast to the mesh under our own origin. `link_selections`
-                // is a purely *local* coupling; cross-host propagation is
-                // `sync_selection`'s job.
-                self.last_written.lock().unwrap().insert(kind, applied_hash);
-                "applied"
-            }
-            Err(e) => {
-                warn!("couldn't write to the clipboard: {e:#}");
-                "clipboard write failed"
-            }
-        }
+        self.current.lock().unwrap().insert(
+            kind,
+            ContentState {
+                hash: applied_hash,
+                version,
+            },
+        );
+        "applied"
     }
 
     /// Signal the run loop that the rules file changed locally, so it bumps the
@@ -1319,7 +1324,7 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    use crate::protocol::test_support::text_offer as offer;
+    use crate::protocol::test_support::{text_offer as offer, wait_for};
 
     fn pairs(offer: &Offer) -> Vec<(&str, &[u8])> {
         offer
@@ -1532,6 +1537,40 @@ mod tests {
         dir
     }
 
+    /// A wired-up engine plus the channel ends a test needs to drive and observe
+    /// it: `engine.run(in_rx, connect_rx, rules_rx)` consumes the three
+    /// receivers, `in_tx` injects peer messages, and `mesh` registers peers.
+    struct Wiring<C> {
+        engine: Arc<SyncEngine<C>>,
+        mesh: Arc<Mesh>,
+        in_tx: mpsc::Sender<(Uuid, Message)>,
+        in_rx: mpsc::Receiver<(Uuid, Message)>,
+        connect_rx: mpsc::Receiver<Uuid>,
+        rules_rx: mpsc::Receiver<()>,
+    }
+
+    /// Build an engine over `clip` with a fresh node ID and the MIME rules `cfg`
+    /// points at — the wiring every engine test needs, in one place.
+    fn engine<C: Clipboard>(clip: Arc<C>, cfg: Config) -> Wiring<C> {
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (connect_tx, connect_rx) = mpsc::channel(64);
+        let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone(), connect_tx);
+        let mime_rules = Arc::new(Mutex::new(MimeRules::load(
+            cfg.mime_rules_path.clone(),
+            cfg.unknown_mime,
+        )));
+        let (rules_tx, rules_rx) = mpsc::channel(8);
+        let engine = SyncEngine::new(clip, mesh.clone(), Arc::new(cfg), mime_rules, rules_tx);
+        Wiring {
+            engine,
+            mesh,
+            in_tx,
+            in_rx,
+            connect_rx,
+            rules_rx,
+        }
+    }
+
     /// A clipboard whose `read_offer` blocks until released, modelling a
     /// slow/unresponsive selection owner at startup. Used to prove that priming
     /// must not gate the engine's inbound/connect handling.
@@ -1569,15 +1608,10 @@ mod tests {
             watchers: Mutex::new(Vec::new()),
             applied: Mutex::new(None),
         });
-        let (in_tx, in_rx) = mpsc::channel(64);
-        let (connect_tx, connect_rx) = mpsc::channel(64);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone(), connect_tx);
         let remote_id = Uuid::new_v4();
-        let cfg = Arc::new(Config::for_test("s"));
-        let mime_rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Allow)));
-        let (rules_tx, rules_rx) = mpsc::channel(8);
-        let engine = SyncEngine::new(clip.clone(), mesh, cfg, mime_rules, rules_tx);
-        tokio::spawn(engine.run(in_rx, connect_rx, rules_rx));
+        let w = engine(clip.clone(), Config::for_test("s"));
+        let in_tx = w.in_tx.clone();
+        tokio::spawn(w.engine.run(w.in_rx, w.connect_rx, w.rules_rx));
 
         // prime() is now awaiting read_offer (gated). A peer update should still
         // be applied to the local clipboard.
@@ -1617,14 +1651,8 @@ mod tests {
             watchers: Mutex::new(Vec::new()),
             applied: Mutex::new(None),
         });
-        let (in_tx, _in_rx) = mpsc::channel(64);
-        let (connect_tx, _connect_rx) = mpsc::channel::<Uuid>(64);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx, connect_tx);
-        let cfg = Arc::new(Config::for_test("s"));
-        let mime_rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Allow)));
-        let (rules_tx, _rules_rx) = mpsc::channel(8);
-        let engine = SyncEngine::new(clip, mesh, cfg, mime_rules, rules_tx);
-        assert_eq!(engine.capture_offer(SelectionKind::Clipboard).await, None);
+        let w = engine(clip, Config::for_test("s"));
+        assert_eq!(w.engine.capture_offer(SelectionKind::Clipboard).await, None);
     }
 
     struct Harness {
@@ -1639,41 +1667,29 @@ mod tests {
         start_seeded_with(cfg, &[]).await
     }
 
-    /// Start the engine, optionally with clipboard content already present
-    /// before it primes (models a daemon restart over an existing clipboard).
-    async fn start_seeded(cfg: Config, seed: Option<Offer>) -> Harness {
-        let seeds: Vec<(SelectionKind, Offer)> = seed
-            .into_iter()
-            .map(|o| (SelectionKind::Clipboard, o))
-            .collect();
-        start_seeded_with(cfg, &seeds).await
+    /// Start the engine with clipboard content already present before it primes
+    /// (models a daemon restart over an existing clipboard).
+    async fn start_seeded(cfg: Config, seed: Offer) -> Harness {
+        start_seeded_with(cfg, &[(SelectionKind::Clipboard, seed)]).await
     }
 
     /// Like `start_seeded` but seeds arbitrary selections before priming, so a
     /// restart over existing SELECTION content can be modelled too.
     async fn start_seeded_with(cfg: Config, seeds: &[(SelectionKind, Offer)]) -> Harness {
-        let (in_tx, in_rx) = mpsc::channel(64);
-        let (connect_tx, connect_rx) = mpsc::channel(64);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx.clone(), connect_tx);
-        let (conn_tx, conn_rx) = mpsc::channel(64);
-        let remote_id = Uuid::new_v4();
-        mesh.register(remote_id, conn_tx);
-        // drain the connect event from the initial registration so tests
-        // that don't care about resync aren't affected
-        let mut connect_rx = connect_rx;
-        let _ = connect_rx.try_recv();
         let clip = MockClipboard::new();
         for (kind, o) in seeds {
             clip.seed(*kind, o.clone());
         }
-        let cfg = Arc::new(cfg);
-        let mime_rules = Arc::new(Mutex::new(MimeRules::load(
-            cfg.mime_rules_path.clone(),
-            cfg.unknown_mime,
-        )));
-        let (rules_tx, rules_rx) = mpsc::channel(8);
-        let engine = SyncEngine::new(clip.clone(), mesh.clone(), cfg, mime_rules, rules_tx);
-        tokio::spawn(engine.run(in_rx, connect_rx, rules_rx));
+        let mut w = engine(clip.clone(), cfg);
+        let (conn_tx, conn_rx) = mpsc::channel(64);
+        let remote_id = Uuid::new_v4();
+        w.mesh.register(remote_id, conn_tx);
+        // drain the connect event from the initial registration so tests
+        // that don't care about resync aren't affected
+        let _ = w.connect_rx.try_recv();
+        let mesh = w.mesh.clone();
+        let in_tx = w.in_tx.clone();
+        tokio::spawn(w.engine.run(w.in_rx, w.connect_rx, w.rules_rx));
         // wait until the engine has subscribed to the watcher
         while clip.watcher_count() == 0 {
             tokio::task::yield_now().await;
@@ -1705,25 +1721,14 @@ mod tests {
     async fn apply_inbound_clip_reports_each_outcome() {
         // A standalone engine (not driven by run()), so we can call the inbound
         // handler directly and assert the one-line verbose summary's outcome.
-        fn engine(cfg: Config) -> Arc<SyncEngine<MockClipboard>> {
-            let clip = MockClipboard::new();
-            let (in_tx, _in_rx) = mpsc::channel(64);
-            let (connect_tx, _connect_rx) = mpsc::channel(64);
-            let mesh = Mesh::new(Uuid::new_v4(), in_tx, connect_tx);
-            let mime_rules = Arc::new(Mutex::new(MimeRules::load(
-                cfg.mime_rules_path.clone(),
-                cfg.unknown_mime,
-            )));
-            let (rules_tx, _rules_rx) = mpsc::channel(8);
-            SyncEngine::new(clip, mesh, Arc::new(cfg), mime_rules, rules_tx)
-        }
+        let standalone = |cfg| engine(MockClipboard::new(), cfg).engine;
         let kind = SelectionKind::Clipboard;
         let from = Uuid::new_v4();
 
         // Default (allow) engine, verbose on so the logging wrapper runs too.
         let mut cfg = Config::for_test("s");
         cfg.verbose = true;
-        let e = engine(cfg);
+        let e = standalone(cfg);
 
         let a = offer("hello");
         let ha = content_hash(&a);
@@ -1762,7 +1767,7 @@ mod tests {
         // Send-only engine: inbound is dropped by the direction policy.
         let mut cfg = Config::for_test("s");
         cfg.direction = Direction::SendOnly;
-        let e = engine(cfg);
+        let e = standalone(cfg);
         let c = offer("blocked");
         assert_eq!(
             e.apply_inbound_clip(from, kind, content_hash(&c), c, 1000, from)
@@ -1773,7 +1778,7 @@ mod tests {
         // Deny-everything rules: the content filters remove all of it.
         let mut cfg = Config::for_test("s");
         let _dir = with_rules(&mut cfg, MimePolicy::Deny, &[]);
-        let e = engine(cfg);
+        let e = standalone(cfg);
         let d = offer("denied");
         assert_eq!(
             e.apply_inbound_clip(from, kind, content_hash(&d), d, 1000, from)
@@ -1782,29 +1787,32 @@ mod tests {
         );
     }
 
-    /// The stamp of the next clipboard broadcast/resync message. Skips rules
-    /// pushes (present when share_mime_rules is on) so the helper stays usable
-    /// in sharing-enabled tests.
-    async fn recv_stamp(h: &mut Harness) -> u64 {
+    /// The next clipboard broadcast/resync message. Skips rules pushes (present
+    /// when share_mime_rules is on) so the helpers below stay usable in
+    /// sharing-enabled tests.
+    async fn recv_next_clip(h: &mut Harness) -> (SelectionKind, [u8; 32], Offer, u64) {
         loop {
             match recv_msg(h).await {
-                Message::Clip { stamp, .. } => return stamp,
+                Message::Clip {
+                    kind,
+                    hash,
+                    offer,
+                    stamp,
+                    ..
+                } => return (kind, hash, offer, stamp),
                 Message::Rules { .. } => continue,
                 other => panic!("expected Clip, got {other:?}"),
             }
         }
     }
 
+    async fn recv_stamp(h: &mut Harness) -> u64 {
+        recv_next_clip(h).await.3
+    }
+
     async fn recv_clip(h: &mut Harness) -> (SelectionKind, [u8; 32], Offer) {
-        loop {
-            match recv_msg(h).await {
-                Message::Clip {
-                    kind, hash, offer, ..
-                } => return (kind, hash, offer),
-                Message::Rules { .. } => continue,
-                other => panic!("expected Clip, got {other:?}"),
-            }
-        }
+        let (kind, hash, offer, _) = recv_next_clip(h).await;
+        (kind, hash, offer)
     }
 
     async fn assert_no_broadcast(h: &mut Harness) {
@@ -1836,16 +1844,29 @@ mod tests {
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
     }
 
-    /// Poll `cond` every 5ms until true, panicking after 1s with `label`. The one
-    /// place the harness waits on engine-driven state.
-    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
-        timeout(Duration::from_secs(1), async {
-            while !cond() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+    /// Deliver an inbound `Rules` push from the peer, with the given version and
+    /// body. `origin` is explicit because the tiebreak tests need to control it.
+    async fn send_rules(h: &Harness, stamp: u64, origin: Uuid, body: String) {
+        h.in_tx
+            .send((
+                h.remote_id,
+                Message::Rules {
+                    stamp,
+                    origin,
+                    body,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Poll the rules file at `path` until it contains `needle`, panicking with
+    /// `label` on timeout.
+    async fn wait_rules_contain(path: &std::path::Path, needle: &str, label: &str) {
+        wait_for(label, || {
+            std::fs::read_to_string(path).unwrap().contains(needle)
         })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+        .await;
     }
 
     async fn wait_applied(h: &Harness, kind: SelectionKind, o: &Offer) {
@@ -2126,7 +2147,7 @@ mod tests {
             owned.keys().map(String::as_str).collect::<Vec<_>>(),
             ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
         );
-        let total: usize = owned.iter().map(|(m, d)| m.len() + d.len()).sum();
+        let total = offer_size(&owned);
         assert!(total <= 150, "over budget: {total}");
         assert_no_broadcast(&mut h).await;
         assert_eq!(h.clip.write_count(), 1, "ownership rewrite must not loop");
@@ -2640,7 +2661,7 @@ mod tests {
     async fn primed_content_loses_resync_to_real_remote_content() {
         // a restarted node's restored clipboard (stamp 0) must yield to a
         // peer's genuinely-stamped content
-        let h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
+        let h = start_seeded(Config::for_test("s"), offer("restored")).await;
         send_inbound_full(
             &h,
             SelectionKind::Clipboard,
@@ -2655,7 +2676,7 @@ mod tests {
     async fn primed_content_is_not_rebroadcast_as_fresh() {
         // the compositor's subscribe-time event for restored content (modelled
         // by a local_copy of the same bytes) must be suppressed, not broadcast
-        let mut h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
+        let mut h = start_seeded(Config::for_test("s"), offer("restored")).await;
         h.clip
             .local_copy(SelectionKind::Clipboard, offer("restored"));
         assert_no_broadcast(&mut h).await;
@@ -2663,7 +2684,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn primed_content_resyncs_with_stamp_zero() {
-        let h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
+        let h = start_seeded(Config::for_test("s"), offer("restored")).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         h.mesh.register(Uuid::new_v4(), tx2);
         match recv_from(&mut rx2).await {
@@ -2888,17 +2909,14 @@ mod tests {
         let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
-        h.in_tx
-            .send((
-                h.remote_id,
-                Message::Rules {
-                    stamp: future_stamp(1000),
-                    origin: h.remote_id,
-                    body: rules_toml(&[("image/png", "allow")]), // well over the 8-byte cap
-                },
-            ))
-            .await
-            .unwrap();
+        // the body is well over the 8-byte cap
+        send_rules(
+            &h,
+            future_stamp(1000),
+            h.remote_id,
+            rules_toml(&[("image/png", "allow")]),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -2914,27 +2932,19 @@ mod tests {
         let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let mut h = start(cfg).await;
-        h.in_tx
-            .send((
-                h.remote_id,
-                Message::Rules {
-                    stamp: future_stamp(1000),
-                    origin: h.remote_id,
-                    body: rules_toml(&[("image/png", "allow")]),
-                },
-            ))
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), async {
-            while !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\"image/png\" = \"allow\"")
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("newer rules were not adopted");
+        send_rules(
+            &h,
+            future_stamp(1000),
+            h.remote_id,
+            rules_toml(&[("image/png", "allow")]),
+        )
+        .await;
+        wait_rules_contain(
+            &path,
+            "\"image/png\" = \"allow\"",
+            "newer rules to be adopted",
+        )
+        .await;
         // The adopted version is stamped into the header (so version() is
         // authoritative, not the file's mtime).
         assert!(
@@ -2965,27 +2975,13 @@ mod tests {
         cfg.mime_rules_path = Some(path.clone());
         let h = start(cfg).await;
         let high = Uuid::from_u128(2);
-        h.in_tx
-            .send((
-                h.remote_id,
-                Message::Rules {
-                    stamp: 5000,
-                    origin: high,
-                    body: rules_toml(&[("image/png", "allow")]),
-                },
-            ))
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), async {
-            while !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\"image/png\" = \"allow\"")
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("equal-stamp higher-origin peer should win the tiebreak");
+        send_rules(&h, 5000, high, rules_toml(&[("image/png", "allow")])).await;
+        wait_rules_contain(
+            &path,
+            "\"image/png\" = \"allow\"",
+            "the equal-stamp higher-origin peer to win the tiebreak",
+        )
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2996,17 +2992,7 @@ mod tests {
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
         // our baseline is the file's (recent) mtime, so stamp 1 must lose
-        h.in_tx
-            .send((
-                h.remote_id,
-                Message::Rules {
-                    stamp: 1,
-                    origin: h.remote_id,
-                    body: rules_toml(&[("image/png", "deny")]),
-                },
-            ))
-            .await
-            .unwrap();
+        send_rules(&h, 1, h.remote_id, rules_toml(&[("image/png", "deny")])).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -3021,17 +3007,13 @@ mod tests {
         let dir = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
-        h.in_tx
-            .send((
-                h.remote_id,
-                Message::Rules {
-                    stamp: future_stamp(1000),
-                    origin: h.remote_id,
-                    body: rules_toml(&[("image/png", "allow")]),
-                },
-            ))
-            .await
-            .unwrap();
+        send_rules(
+            &h,
+            future_stamp(1000),
+            h.remote_id,
+            rules_toml(&[("image/png", "allow")]),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -3048,17 +3030,13 @@ mod tests {
         let path = dir.path().join("mimetypes");
         let h = start(cfg).await;
         let insane = now_ms() + 48 * 60 * 60 * 1000; // past the skew bound
-        h.in_tx
-            .send((
-                h.remote_id,
-                Message::Rules {
-                    stamp: insane,
-                    origin: h.remote_id,
-                    body: rules_toml(&[("image/png", "allow")]),
-                },
-            ))
-            .await
-            .unwrap();
+        send_rules(
+            &h,
+            insane,
+            h.remote_id,
+            rules_toml(&[("image/png", "allow")]),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -3376,7 +3354,7 @@ mod tests {
         let mut cfg = Config::for_test("s");
         cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
         // restart over an existing clipboard
-        let mut h = start_seeded(cfg, Some(offer("restored"))).await;
+        let mut h = start_seeded(cfg, offer("restored")).await;
         // the watcher re-reports the restored clipboard (as a subscribe-time
         // event would); priming recorded it in last_written, so it must NOT bridge.
         h.clip

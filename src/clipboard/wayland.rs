@@ -210,7 +210,7 @@ impl Clipboard for WaylandClipboard {
         let (tx, rx) = mpsc::unbounded_channel();
         // One in-process data-control listener covers both selections; see
         // clipboard::watch. (Was a wl-paste --watch subprocess per kind.)
-        spawn_watcher(tx, kinds.contains(&SelectionKind::Selection));
+        spawn_watcher(tx, kinds.to_vec());
         rx
     }
 

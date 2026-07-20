@@ -833,13 +833,24 @@ fn render_entry(key: &str, item: &Item) -> String {
     if let Item::Table(t) = item {
         item = Item::Value(Value::InlineTable(t.into_inline_table()));
     }
+    let mut table = Table::new();
+    insert_canonical(&mut table, key, item);
+    table.to_string().trim().to_string()
+}
+
+/// Insert `item` under a quoted `key` with the canonical entry layout: one space
+/// before the value, no trailing inline comment, and every key quoted (even
+/// bare-valid ones like `STRING`) for a consistent file.
+///
+/// The single definition of how a `[rules]` entry is rendered. `normalize`
+/// (what gets saved) and `render_entry` (what `--allow`/`--deny` echoes back)
+/// both go through it, so the echoed line cannot drift from the written one.
+fn insert_canonical(table: &mut Table, key: &str, mut item: Item) {
     if let Some(val) = item.as_value_mut() {
         val.decor_mut().set_prefix(" ");
         val.decor_mut().set_suffix("");
     }
-    let mut table = Table::new();
     table.insert_formatted(&quoted_key(key), item);
-    table.to_string().trim().to_string()
 }
 
 /// Normalise the `[rules]` table for writing: sort entries by MIME key and drop
@@ -855,15 +866,8 @@ fn normalize(doc: &mut DocumentMut) {
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     rules.clear();
-    for (k, mut v) in entries {
-        // Drop any trailing inline comment on the value; the per-line layout is
-        // re-applied by the fresh key that `insert_formatted` creates.
-        if let Some(val) = v.as_value_mut() {
-            val.decor_mut().set_prefix(" ");
-            val.decor_mut().set_suffix("");
-        }
-        // Quote every key (even bare-valid ones like STRING) for a consistent file.
-        rules.insert_formatted(&quoted_key(&k), v);
+    for (k, v) in entries {
+        insert_canonical(rules, &k, v);
     }
 }
 
@@ -966,15 +970,29 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
-    #[test]
-    fn allows_respects_rules_and_size_caps() {
+    /// A `MimeRules` loaded from a temp file holding `body`, with the file's
+    /// path. The returned `TempDir` must stay alive for the test's duration —
+    /// bind it, don't drop it.
+    fn loaded_at(body: &str, unknown: MimePolicy) -> (tempfile::TempDir, PathBuf, MimeRules) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        write(&path, body);
+        let rules = MimeRules::load(Some(path.clone()), unknown);
+        (dir, path, rules)
+    }
+
+    /// `loaded_at` for the tests that never touch the file again.
+    fn loaded(body: &str, unknown: MimePolicy) -> (tempfile::TempDir, MimeRules) {
+        let (dir, _path, rules) = loaded_at(body, unknown);
+        (dir, rules)
+    }
+
+    #[test]
+    fn allows_respects_rules_and_size_caps() {
+        let (_dir, rules) = loaded(
             "[rules]\n\"image/png\" = { rule = \"allow\", max = \"100B\" }\n\"image/bmp\" = \"deny\"\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(rules.allows("image/png", 100)); // exactly at the cap
         assert!(!rules.allows("image/png", 101)); // over the cap
         assert!(!rules.allows("image/bmp", 1)); // denied outright
@@ -983,15 +1001,12 @@ mod tests {
 
     #[test]
     fn mime_keys_with_spaces_and_punctuation_parse() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         let java = "JAVA_DATAFLAVOR:application/x-java-serialized-object; \
                     class=com.intellij.openapi.editor.impl.EditorCopyPasteHelperImpl$CopyPasteOptionsTransferableData";
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             &format!("[rules]\n\"{java}\" = \"deny\"\n\"text/plain;charset=utf-8\" = \"allow\"\n"),
+            MimePolicy::Allow,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Allow);
         assert!(
             !rules.allows(java, 1),
             "spaced/punctuated MIME key must parse"
@@ -1008,51 +1023,39 @@ mod tests {
 
     #[test]
     fn zero_size_cap_is_ignored_so_allow_still_allows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"image/png\" = { rule = \"allow\", max = \"0B\" }\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(rules.allows("image/png", 1));
         assert!(rules.allows("image/png", 10_000));
     }
 
     #[test]
     fn deny_rule_with_a_cap_still_denies_regardless_of_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"image/png\" = { rule = \"deny\", max = \"100B\" }\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(!rules.allows("image/png", 1));
         assert!(!rules.allows("image/png", 50));
     }
 
     #[test]
     fn a_bad_max_size_keeps_the_allow_deny_and_drops_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"image/png\" = { rule = \"allow\", max = \"notasize\" }\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(rules.allows("image/png", 999_999));
     }
 
     #[test]
     fn an_invalid_rule_value_is_ignored_and_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, path, rules) = loaded_at(
             "[rules]\n\"image/png\" = \"allwo\"\n\"text/plain\" = \"deny\"\n",
+            MimePolicy::Allow,
         );
-        let rules = MimeRules::load(Some(path.clone()), MimePolicy::Allow);
         // the typo'd entry falls back to the unknown policy (allow here)...
         assert!(rules.allows("image/png", 1));
         assert!(!rules.allows("text/plain", 1));
@@ -1062,13 +1065,10 @@ mod tests {
 
     #[test]
     fn save_sorts_rules_strips_inner_comments_and_keeps_the_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, path, mut rules) = loaded_at(
             "# my notes\n[rules]\n# inner note\n\"text/plain\" = \"deny\"\n\"image/png\" = \"allow\"  # keep this\n",
+            MimePolicy::Deny,
         );
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
         assert!(rules.allows("image/png", 1));
         assert!(!rules.allows("text/plain", 1));
         assert!(rules.ensure([&s("image/gif")]));
@@ -1112,11 +1112,9 @@ mod tests {
 
     #[test]
     fn an_old_line_format_file_is_replaced_with_a_fresh_skeleton() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         // Old format isn't valid TOML.
-        write(&path, "image/png allow\ntext/plain deny\n");
-        let _rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, _rules) =
+            loaded_at("image/png allow\ntext/plain deny\n", MimePolicy::Deny);
         // It's overwritten with a fresh TOML skeleton (no backup is kept).
         assert!(std::fs::read_to_string(&path).unwrap().contains("[rules]"));
         assert!(
@@ -1141,19 +1139,14 @@ mod tests {
 
     #[test]
     fn empty_existing_file_gets_the_skeleton() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "");
-        let _rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, _rules) = loaded_at("", MimePolicy::Deny);
         assert!(std::fs::read_to_string(&path).unwrap().contains("[rules]"));
     }
 
     #[test]
     fn reload_if_changed_rereads_after_an_edit() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         assert!(!rules.allows("image/png", 1));
         write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
         assert!(rules.reload_if_changed());
@@ -1162,10 +1155,8 @@ mod tests {
 
     #[test]
     fn reload_keeps_rules_when_the_file_transiently_disappears() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         assert!(rules.allows("image/png", 1));
         std::fs::remove_file(&path).unwrap();
         assert!(!rules.reload_if_changed());
@@ -1174,10 +1165,8 @@ mod tests {
 
     #[test]
     fn reload_ignores_an_empty_read_and_keeps_rules() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         assert!(rules.allows("image/png", 1));
         write(&path, ""); // transient empty mid-save
         assert!(!rules.reload_if_changed(), "empty read must be no-change");
@@ -1192,10 +1181,8 @@ mod tests {
 
     #[test]
     fn reload_keeps_rules_when_the_new_content_is_not_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         write(&path, "this is = = not toml");
         assert!(
             !rules.reload_if_changed(),
@@ -1210,19 +1197,13 @@ mod tests {
 
     #[test]
     fn ensure_does_not_duplicate_a_type_already_present_as_an_invalid_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allwo\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"allwo\"\n", MimePolicy::Deny);
         assert!(!rules.ensure([&s("image/png")]), "ensure duplicated a type");
     }
 
     #[test]
     fn persist_only_writes_when_dirty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         assert!(!rules.is_dirty());
         assert!(rules.ensure([&s("text/plain")]));
         assert!(rules.is_dirty());
@@ -1232,10 +1213,7 @@ mod tests {
 
     #[test]
     fn has_unseen_reports_types_without_a_rule() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, rules) = loaded("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         assert!(!rules.has_unseen([&s("image/png")]));
         assert!(rules.has_unseen([&s("text/plain")]));
     }
@@ -1250,10 +1228,7 @@ mod tests {
     /// outrank what peers actually hold, then vanish on restart.
     #[test]
     fn a_snapshot_that_cannot_persist_rolls_the_version_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         let own = Uuid::from_u128(9);
         let before = rules.version(own);
 
@@ -1285,14 +1260,11 @@ mod tests {
     /// one — it is used to share what we already have, not to win a race.
     #[test]
     fn snapshot_baseline_does_not_bump_the_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         let origin = Uuid::from_u128(3);
-        write(
-            &path,
+        let (_dir, mut rules) = loaded(
             &format!("[clipmesh]\nversion = 42\norigin = \"{origin}\"\n\n[rules]\n"),
+            MimePolicy::Deny,
         );
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let s = rules
             .snapshot_baseline(Uuid::from_u128(99), usize::MAX)
             .expect("should persist");
@@ -1301,10 +1273,7 @@ mod tests {
 
     #[test]
     fn recompiling_after_a_rule_change_sees_the_new_verdict() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         assert!(rules.compile().allows("image/png", 1));
 
         rules.set_rule("image/png", false);
@@ -1324,24 +1293,18 @@ mod tests {
 
     #[test]
     fn version_reads_the_clipmesh_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         let origin = Uuid::from_u128(7);
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             &format!("[clipmesh]\nversion = 1234\norigin = \"{origin}\"\n[rules]\n\"image/png\" = \"allow\"\n"),
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert_eq!(rules.version(Uuid::nil()), Version::new(1234, origin));
         assert!(rules.has_version_header());
     }
 
     #[test]
     fn version_falls_back_to_mtime_baseline_without_a_clipmesh_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, rules) = loaded("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         let own = Uuid::from_u128(9);
         let Version { stamp, origin } = rules.version(own);
         assert!(stamp > 0, "mtime baseline should be a real epoch-ms value");
@@ -1351,10 +1314,8 @@ mod tests {
 
     #[test]
     fn set_version_writes_and_replaces_a_single_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         let o = Uuid::from_u128(3);
         rules.set_version(Version::new(100, o));
         rules.persist();
@@ -1368,13 +1329,10 @@ mod tests {
 
     #[test]
     fn normalised_layout_is_clean_and_sorted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"image/png\" = \"deny\"\n\"image/gif\" = \"allow\"\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert_eq!(
             rules.body(),
             "[rules]\n\"image/gif\" = \"allow\"\n\"image/png\" = \"deny\"\n"
@@ -1383,10 +1341,10 @@ mod tests {
 
     #[test]
     fn body_keeps_the_header_and_renders_valid_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "# note\n[rules]\n\"image/png\" = \"allow\"\n");
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, rules) = loaded(
+            "# note\n[rules]\n\"image/png\" = \"allow\"\n",
+            MimePolicy::Deny,
+        );
         let body = rules.body();
         assert!(body.contains("# note"), "header lost:\n{body}");
         assert!(
@@ -1401,10 +1359,7 @@ mod tests {
 
     #[test]
     fn replace_from_swaps_the_whole_ruleset() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         assert!(!rules.allows("image/png", 1));
         rules.replace_from(
             "[rules]\n\"image/png\" = \"allow\"\n\"text/plain\" = \"allow\"\n".to_string(),
@@ -1416,10 +1371,7 @@ mod tests {
 
     #[test]
     fn replace_from_ignores_a_non_toml_body() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         rules.replace_from("not toml = =".to_string());
         assert!(
             !rules.allows("image/png", 1),
@@ -1429,10 +1381,8 @@ mod tests {
 
     #[test]
     fn reload_if_changed_reports_whether_it_changed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         assert!(
             !rules.reload_if_changed(),
             "no change immediately after load"
@@ -1447,10 +1397,8 @@ mod tests {
 
     #[test]
     fn reload_if_changed_is_a_noop_after_our_own_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, path, mut rules) =
+            loaded_at("[rules]\n\"image/png\" = \"allow\"\n", MimePolicy::Deny);
         assert!(rules.ensure([&s("text/plain")]));
         rules.persist();
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -1464,10 +1412,10 @@ mod tests {
         // persist() writes the normalized (sorted) body and records it as
         // `loaded`, so when the watcher sees our own write the content matches
         // and no reload fires — even though the file started unsorted.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"z/z\" = \"allow\"\n\"a/a\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded(
+            "[rules]\n\"z/z\" = \"allow\"\n\"a/a\" = \"deny\"\n",
+            MimePolicy::Deny,
+        );
         assert!(rules.ensure([&s("m/m")]));
         rules.persist(); // disk is now sorted: a/a, m/m, z/z
         assert!(
@@ -1478,10 +1426,7 @@ mod tests {
 
     #[test]
     fn revert_to_loaded_discards_in_memory_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         rules.set_version(Version::new(999, Uuid::from_u128(1)));
         assert!(rules.has_version_header());
         rules.revert_to_loaded();
@@ -1525,13 +1470,10 @@ mod tests {
 
     #[test]
     fn globs_decide_types_case_insensitively() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n\"*;charset=utf-16BE\" = \"deny\"\n",
+            MimePolicy::Allow,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Allow);
         assert!(!rules.allows("JAVA_DATATRANSFER_COOKIE_9147594d", 1));
         // pattern's case differs from the type's — must still match
         assert!(!rules.allows("text/plain;charset=utf-16be", 1));
@@ -1540,14 +1482,11 @@ mod tests {
 
     #[test]
     fn an_exact_rule_beats_a_matching_glob() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         // glob denies the family; an exact key carves out an allow exception
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"*;charset=utf-16*\" = \"deny\"\n\"text/uri-list;charset=utf-16\" = \"allow\"\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(
             rules.allows("text/uri-list;charset=utf-16", 1),
             "exact key must win over the glob"
@@ -1560,14 +1499,11 @@ mod tests {
 
     #[test]
     fn the_more_specific_glob_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         // "text/plain*" has 10 literals; "*plain*" has 5, so the former wins overlap
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"text/plain*\" = \"deny\"\n\"*plain*\" = \"allow\"\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(
             !rules.allows("text/plain;charset=utf-8", 1),
             "text/plain* (10 literals) wins over *plain* (5)"
@@ -1580,14 +1516,11 @@ mod tests {
 
     #[test]
     fn deny_breaks_a_specificity_tie() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         // both globs: 3 literals and 1 wildcard each -> a genuine tie -> deny wins
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\"a/x*\" = \"allow\"\n\"a/*y\" = \"deny\"\n",
+            MimePolicy::Allow,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Allow);
         assert!(
             !rules.allows("a/xy", 1),
             "tie on specificity -> deny is chosen"
@@ -1596,10 +1529,10 @@ mod tests {
 
     #[test]
     fn a_glob_suppresses_appending_covered_types() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded(
+            "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n",
+            MimePolicy::Deny,
+        );
         let covered = s("JAVA_DATATRANSFER_COOKIE_f9e96042");
         assert!(!rules.has_unseen([&covered]), "the glob already covers it");
         assert!(!rules.ensure([&covered]), "so nothing is appended");
@@ -1613,16 +1546,13 @@ mod tests {
 
     #[test]
     fn remove_matching_collapses_entries_and_echoes_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, mut rules) = loaded(
             "[rules]\n\
              \"text/uri-list;charset=utf-16\" = \"deny\"\n\
              \"text/uri-list;charset=utf-16be\" = \"deny\"\n\
              \"text/uri-list;charset=utf-8\" = \"allow\"\n",
+            MimePolicy::Deny,
         );
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let removed = rules.remove_matching("*;charset=utf-16*");
         assert_eq!(
             removed,
@@ -1647,13 +1577,10 @@ mod tests {
 
     #[test]
     fn remove_matching_does_not_list_the_pattern_itself() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, mut rules) = loaded(
             "[rules]\n\"JAVA*\" = \"deny\"\n\"JAVA_X\" = \"allow\"\n",
+            MimePolicy::Deny,
         );
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let removed = rules.remove_matching("JAVA*");
         // Keys are always quoted on output (even bare-valid ones); the equal-key
         // "JAVA*" glob is excluded from removal.
@@ -1666,10 +1593,7 @@ mod tests {
 
     #[test]
     fn set_rule_adds_and_replaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         rules.set_rule("image/png", true); // replace
         rules.set_rule("image/*", false); // add a glob
         assert!(rules.allows("image/png", 1), "exact replace took effect");
@@ -1678,13 +1602,10 @@ mod tests {
 
     #[test]
     fn apply_glob_flips_an_existing_glob_in_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, mut rules) = loaded(
             "[rules]\n\"JAVA*\" = \"allow\"\n\"JAVA_X\" = \"allow\"\n",
+            MimePolicy::Deny,
         );
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let removed = rules.apply_glob(false, "JAVA*");
         // The equal "JAVA*" key is flipped in place (not removed); only the
         // now-covered "JAVA_X" is dropped and echoed.
@@ -1701,10 +1622,7 @@ mod tests {
 
     #[test]
     fn rules_report_flags_redundant_overrides_and_invalid() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(
-            &path,
+        let (_dir, rules) = loaded(
             "[rules]\n\
              \"*;charset=utf-16*\" = \"deny\"\n\
              \"text/plain;charset=utf-16\" = \"deny\"\n\
@@ -1712,8 +1630,8 @@ mod tests {
              \"image/*\" = \"deny\"\n\
              \"image/png\" = \"allow\"\n\
              \"text/html\" = \"nope\"\n",
+            MimePolicy::Deny,
         );
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let report = rules.rules_report();
         let find = |k: &str| {
             report
@@ -1746,11 +1664,11 @@ mod tests {
 
     #[test]
     fn bare_valid_keys_are_quoted_on_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         // STRING/TEXT are valid bare TOML keys; toml_edit would leave them unquoted.
-        write(&path, "[rules]\nSTRING = \"allow\"\nTEXT = \"deny\"\n");
-        let rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, rules) = loaded(
+            "[rules]\nSTRING = \"allow\"\nTEXT = \"deny\"\n",
+            MimePolicy::Deny,
+        );
         let body = rules.body();
         assert!(
             body.contains("\"STRING\" = \"allow\""),
@@ -1765,10 +1683,7 @@ mod tests {
 
     #[test]
     fn ensure_does_not_re_append_a_type_seen_in_a_different_case() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
-        write(&path, "[rules]\n\"TEXT/PLAIN\" = \"deny\"\n");
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let (_dir, mut rules) = loaded("[rules]\n\"TEXT/PLAIN\" = \"deny\"\n", MimePolicy::Deny);
         let seen = s("text/plain"); // same type, different case
         assert!(
             !rules.has_unseen([&seen]),
@@ -1780,14 +1695,11 @@ mod tests {
 
     #[test]
     fn remove_matching_renders_a_subtable_rule_not_a_blank_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mimetypes");
         // A per-type cap hand-written as a [rules."x"] block rather than inline.
-        write(
-            &path,
+        let (_dir, mut rules) = loaded(
             "[rules]\n[rules.\"image/tiff\"]\nrule = \"allow\"\nmax = \"16MiB\"\n",
+            MimePolicy::Deny,
         );
-        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
         let removed = rules.remove_matching("image/*");
         assert_eq!(
             removed,

@@ -30,21 +30,22 @@ use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1:
 
 /// Spawn the watcher on a dedicated OS thread (wayland-client's
 /// `blocking_dispatch` is blocking, so it can't live on the tokio runtime).
-/// A single connection handles both the clipboard and the middle-click
-/// selection; the latter's events are forwarded to `tx` only when
-/// `watch_selection` is true.
-pub fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, watch_selection: bool) {
-    thread::spawn(move || run(tx, watch_selection));
+/// A single connection handles every selection the compositor exposes; only
+/// changes to a selection in `watched` are forwarded to `tx`. Taking the set
+/// (rather than a per-selection flag) keeps the backend free of any assumption
+/// about which selections the engine cares about.
+pub fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, watched: Vec<SelectionKind>) {
+    thread::spawn(move || run(tx, watched));
 }
 
 /// Reconnect loop: the same backoff the old subprocess watcher used, so a
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
-fn run(tx: mpsc::UnboundedSender<SelectionKind>, watch_selection: bool) {
+fn run(tx: mpsc::UnboundedSender<SelectionKind>, watched: Vec<SelectionKind>) {
     let mut backoff = crate::backoff::watcher_restart();
     loop {
         let started = Instant::now();
-        match watch_once(&tx, watch_selection) {
+        match watch_once(&tx, &watched) {
             Ok(StopReason::ReceiverGone) => return, // engine gone; stop watching
             Ok(StopReason::Finished) => {
                 warn!("compositor closed the clipboard watcher; reconnecting")
@@ -70,7 +71,7 @@ enum StopReason {
 
 fn watch_once(
     tx: &mpsc::UnboundedSender<SelectionKind>,
-    watch_selection: bool,
+    watched: &[SelectionKind],
 ) -> Result<StopReason> {
     let conn = Connection::connect_to_env().context("connecting to the Wayland display")?;
     let (globals, mut queue) =
@@ -113,7 +114,7 @@ fn watch_once(
 
     let mut state = State {
         tx: tx.clone(),
-        watch_selection,
+        watched: watched.to_vec(),
         dead: false,
         finished: false,
     };
@@ -150,14 +151,14 @@ enum Device {
 
 struct State {
     tx: mpsc::UnboundedSender<SelectionKind>,
-    watch_selection: bool,
+    watched: Vec<SelectionKind>,
     dead: bool,
     finished: bool,
 }
 
 impl State {
     fn notify(&mut self, kind: SelectionKind) {
-        if kind == SelectionKind::Selection && !self.watch_selection {
+        if !self.watched.contains(&kind) {
             return;
         }
         if self.tx.send(kind).is_err() {

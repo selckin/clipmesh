@@ -8,7 +8,7 @@
 use clipmesh::clipboard::mock::MockClipboard;
 use clipmesh::config::Config;
 use clipmesh::node::{spawn_node, NodeHandle};
-use clipmesh::protocol::Offer;
+use clipmesh::protocol::{Offer, SelectionKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -18,6 +18,14 @@ pub fn offer(text: &str) -> Offer {
     [("text/plain".to_string(), text.as_bytes().to_vec())]
         .into_iter()
         .collect()
+}
+
+/// A test config that dials the given already-started nodes.
+pub fn peered(secret: &str, peers: &[&NodeHandle]) -> Config {
+    Config {
+        peers: peers.iter().map(|p| p.local_addr.to_string()).collect(),
+        ..Config::for_test(secret)
+    }
 }
 
 /// Start a node and wait until its engine has subscribed to the clipboard.
@@ -41,6 +49,18 @@ pub async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// Poll until `clip`'s `kind` selection holds exactly `want`.
+pub async fn wait_applied(
+    clip: &Arc<MockClipboard>,
+    kind: SelectionKind,
+    want: &Offer,
+    what: &str,
+) {
+    let clip = clip.clone();
+    let want = want.clone();
+    wait_for(move || clip.get(kind).as_ref() == Some(&want), what).await;
 }
 
 /// Reserve a free port by binding and dropping (small reuse race, fine for tests).

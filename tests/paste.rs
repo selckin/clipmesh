@@ -6,19 +6,40 @@ mod common;
 
 use clipmesh::clipboard::mock::MockClipboard;
 use clipmesh::config::Config;
+use clipmesh::node::NodeHandle;
 use clipmesh::paste::{fetch_from_any, fetch_offer};
 use clipmesh::protocol::{Offer, SelectionKind};
 use common::{offer, start};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
-/// Retry `fetch_offer` until the node has recorded the copy and resyncs it.
+/// One `fetch_offer` against an in-process node, taking the address, psk and
+/// payload cap from the node and its own config — everything a paste call site
+/// derives mechanically. Tests that need a *different* psk call `fetch_offer`
+/// directly, so the difference stays visible where it matters.
+async fn fetch(
+    node: &NodeHandle,
+    cfg: &Config,
+    kind: SelectionKind,
+    timeout: Duration,
+) -> anyhow::Result<Offer> {
+    fetch_offer(
+        &node.local_addr.to_string(),
+        cfg.psk,
+        cfg.max_payload_size,
+        kind,
+        timeout,
+    )
+    .await
+}
+
+/// Retry `fetch` until the node has recorded the copy and resyncs it.
 /// Avoids a connect-before-record race: each attempt is a fresh connect, and the
 /// node pushes the content on whichever connect lands after it recorded it.
-async fn fetch_eventually(addr: &str, psk: [u8; 32], max: usize, kind: SelectionKind) -> Offer {
+async fn fetch_eventually(node: &NodeHandle, cfg: &Config, kind: SelectionKind) -> Offer {
     timeout(Duration::from_secs(10), async {
         loop {
-            match fetch_offer(addr, psk, max, kind, Duration::from_millis(500)).await {
+            match fetch(node, cfg, kind, Duration::from_millis(500)).await {
                 Ok(o) => break o,
                 Err(_) => sleep(Duration::from_millis(50)).await,
             }
@@ -36,13 +57,7 @@ async fn paste_pulls_the_current_clipboard_from_a_node() {
 
     clip.local_copy(SelectionKind::Clipboard, offer("from the mesh"));
 
-    let got = fetch_eventually(
-        &node.local_addr.to_string(),
-        cfg.psk,
-        cfg.max_payload_size,
-        SelectionKind::Clipboard,
-    )
-    .await;
+    let got = fetch_eventually(&node, &cfg, SelectionKind::Clipboard).await;
     assert_eq!(got, offer("from the mesh"));
 }
 
@@ -55,13 +70,7 @@ async fn paste_pulls_the_selection_when_the_node_syncs_it() {
 
     clip.local_copy(SelectionKind::Selection, offer("middle click"));
 
-    let got = fetch_eventually(
-        &node.local_addr.to_string(),
-        cfg.psk,
-        cfg.max_payload_size,
-        SelectionKind::Selection,
-    )
-    .await;
+    let got = fetch_eventually(&node, &cfg, SelectionKind::Selection).await;
     assert_eq!(got, offer("middle click"));
 }
 
@@ -75,15 +84,11 @@ async fn paste_times_out_when_the_node_does_not_resync() {
     clip.local_copy(SelectionKind::Clipboard, offer("present but not pushed"));
     sleep(Duration::from_millis(200)).await; // let the node record it
 
-    let err = fetch_offer(
-        &node.local_addr.to_string(),
-        cfg.psk,
-        cfg.max_payload_size,
-        SelectionKind::Clipboard,
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap_err();
+    // a short timeout on purpose: this fetch is expected to expire
+    let short = Duration::from_secs(1);
+    let err = fetch(&node, &cfg, SelectionKind::Clipboard, short)
+        .await
+        .unwrap_err();
     assert!(
         format!("{err:#}").contains("within"),
         "expected a timeout error, got: {err:#}"
@@ -99,6 +104,8 @@ async fn paste_with_the_wrong_psk_fails_fast_with_a_connection_error() {
 
     let wrong_psk = Config::for_test("wrong-secret").psk;
     let started = std::time::Instant::now();
+    // spelled out rather than via `fetch`: the whole point is a psk that is
+    // *not* the node's, plus a timeout long enough to prove we fail before it
     let err = fetch_offer(
         &node.local_addr.to_string(),
         wrong_psk,
@@ -133,15 +140,11 @@ async fn paste_primary_times_out_when_the_node_does_not_sync_selection() {
     clip.local_copy(SelectionKind::Selection, offer("selection content"));
     sleep(Duration::from_millis(200)).await; // let the node record both
 
-    let err = fetch_offer(
-        &node.local_addr.to_string(),
-        cfg.psk,
-        cfg.max_payload_size,
-        SelectionKind::Selection,
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap_err();
+    // a short timeout on purpose: this fetch is expected to expire
+    let short = Duration::from_secs(1);
+    let err = fetch(&node, &cfg, SelectionKind::Selection, short)
+        .await
+        .unwrap_err();
     assert!(
         format!("{err:#}").contains("within"),
         "expected a timeout (the node never resyncs SELECTION), got: {err:#}"
@@ -162,13 +165,7 @@ async fn paste_skips_a_rules_message_and_returns_the_clip() {
 
     clip.local_copy(SelectionKind::Clipboard, offer("after the rules"));
 
-    let got = fetch_eventually(
-        &node.local_addr.to_string(),
-        cfg.psk,
-        cfg.max_payload_size,
-        SelectionKind::Clipboard,
-    )
-    .await;
+    let got = fetch_eventually(&node, &cfg, SelectionKind::Clipboard).await;
     assert_eq!(got, offer("after the rules"));
 }
 
@@ -185,13 +182,7 @@ async fn paste_skips_the_unwanted_kind_and_returns_the_requested_one() {
     clip.local_copy(SelectionKind::Clipboard, offer("the clipboard"));
     clip.local_copy(SelectionKind::Selection, offer("the selection"));
 
-    let got = fetch_eventually(
-        &node.local_addr.to_string(),
-        cfg.psk,
-        cfg.max_payload_size,
-        SelectionKind::Selection,
-    )
-    .await;
+    let got = fetch_eventually(&node, &cfg, SelectionKind::Selection).await;
     assert_eq!(got, offer("the selection"));
 }
 

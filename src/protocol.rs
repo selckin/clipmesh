@@ -154,7 +154,26 @@ pub fn decode(buf: &[u8]) -> anyhow::Result<Message> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{content_hash, Message, Offer, SelectionKind};
+    use std::time::Duration;
     use uuid::Uuid;
+
+    /// How long `wait_for` polls before giving up, and how often it re-checks.
+    /// One setting for the whole crate's unit tests: a flaky-timing tweak
+    /// belongs here, not in per-module copies that drift apart.
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+    const WAIT_POLL: Duration = Duration::from_millis(5);
+
+    /// Poll `cond` until it holds, panicking after `WAIT_TIMEOUT` with `label`.
+    /// The one place a unit test waits on asynchronously-driven state.
+    pub(crate) async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            while !cond() {
+                tokio::time::sleep(WAIT_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
 
     /// An offer with the given MIME/bytes pairs, in the order given.
     pub(crate) fn offer(pairs: &[(&str, &[u8])]) -> Offer {

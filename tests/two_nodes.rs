@@ -3,7 +3,7 @@ mod common;
 use clipmesh::clipboard::mock::MockClipboard;
 use clipmesh::config::Config;
 use clipmesh::protocol::SelectionKind;
-use common::{offer, reserve_port, start, wait_for};
+use common::{offer, peered, reserve_port, start, wait_applied, wait_for};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -13,9 +13,7 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
     let clip_b = MockClipboard::new();
 
     let node_a = start(Config::for_test("shared-secret"), clip_a.clone()).await;
-    let mut cfg_b = Config::for_test("shared-secret");
-    cfg_b.peers = vec![node_a.local_addr.to_string()];
-    let node_b = start(cfg_b, clip_b.clone()).await;
+    let node_b = start(peered("shared-secret", &[&node_a]), clip_b.clone()).await;
 
     // mesh forms
     let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
@@ -28,13 +26,7 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
     // A -> B
     let o1 = offer("hello from a");
     clip_a.local_copy(SelectionKind::Clipboard, o1.clone());
-    let cb = clip_b.clone();
-    let expected = o1.clone();
-    wait_for(
-        move || cb.get(SelectionKind::Clipboard).as_ref() == Some(&expected),
-        "A's copy on B",
-    )
-    .await;
+    wait_applied(&clip_b, SelectionKind::Clipboard, &o1, "A's copy on B").await;
     assert_eq!(clip_b.write_count(), 1);
     assert_eq!(
         clip_a.write_count(),
@@ -45,13 +37,7 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
     // B -> A
     let o2 = offer("hello from b");
     clip_b.local_copy(SelectionKind::Clipboard, o2.clone());
-    let ca = clip_a.clone();
-    let expected = o2.clone();
-    wait_for(
-        move || ca.get(SelectionKind::Clipboard).as_ref() == Some(&expected),
-        "B's copy on A",
-    )
-    .await;
+    wait_applied(&clip_a, SelectionKind::Clipboard, &o2, "B's copy on A").await;
     assert_eq!(clip_a.write_count(), 1);
 
     // quiet period: no echo storm
@@ -72,14 +58,12 @@ async fn content_copied_while_peer_offline_resyncs_on_connect() {
     clip_a.local_copy(SelectionKind::Clipboard, o.clone());
     sleep(Duration::from_millis(200)).await; // broadcast goes to nobody
 
-    let mut cfg_b = Config::for_test("resync");
-    cfg_b.peers = vec![node_a.local_addr.to_string()];
-    start(cfg_b, clip_b.clone()).await;
+    start(peered("resync", &[&node_a]), clip_b.clone()).await;
 
-    let cb = clip_b.clone();
-    let expected = o.clone();
-    wait_for(
-        move || cb.get(SelectionKind::Clipboard).as_ref() == Some(&expected),
+    wait_applied(
+        &clip_b,
+        SelectionKind::Clipboard,
+        &o,
         "offline copy to resync onto B",
     )
     .await;
@@ -96,12 +80,8 @@ async fn three_node_mesh_copy_reaches_all_without_storms() {
     let clip_c = MockClipboard::new();
 
     let node_a = start(Config::for_test("trio"), clip_a.clone()).await;
-    let mut cfg_b = Config::for_test("trio");
-    cfg_b.peers = vec![node_a.local_addr.to_string()];
-    let node_b = start(cfg_b, clip_b.clone()).await;
-    let mut cfg_c = Config::for_test("trio");
-    cfg_c.peers = vec![node_a.local_addr.to_string(), node_b.local_addr.to_string()];
-    let node_c = start(cfg_c, clip_c.clone()).await;
+    let node_b = start(peered("trio", &[&node_a]), clip_b.clone()).await;
+    let node_c = start(peered("trio", &[&node_a, &node_b]), clip_c.clone()).await;
 
     let (ma, mb, mc) = (
         node_a.mesh.clone(),
@@ -116,15 +96,8 @@ async fn three_node_mesh_copy_reaches_all_without_storms() {
 
     let o = offer("from a");
     clip_a.local_copy(SelectionKind::Clipboard, o.clone());
-    let (cb, cc, eb, ec) = (clip_b.clone(), clip_c.clone(), o.clone(), o.clone());
-    wait_for(
-        move || {
-            cb.get(SelectionKind::Clipboard).as_ref() == Some(&eb)
-                && cc.get(SelectionKind::Clipboard).as_ref() == Some(&ec)
-        },
-        "A's copy on B and C",
-    )
-    .await;
+    wait_applied(&clip_b, SelectionKind::Clipboard, &o, "A's copy on B").await;
+    wait_applied(&clip_c, SelectionKind::Clipboard, &o, "A's copy on C").await;
     sleep(Duration::from_millis(300)).await; // no storm
     assert_eq!(clip_a.write_count(), 0, "A must not receive its own copy");
     assert_eq!(clip_b.write_count(), 1);
@@ -181,9 +154,8 @@ async fn wrong_psk_peers_never_form_a_mesh() {
     let clip_a = MockClipboard::new();
     let clip_b = MockClipboard::new();
     let node_a = start(Config::for_test("secret-one"), clip_a).await;
-    let mut cfg_b = Config::for_test("secret-two");
-    cfg_b.peers = vec![node_a.local_addr.to_string()];
-    let node_b = start(cfg_b, clip_b).await;
+    // deliberately a different psk: the handshake must never succeed
+    let node_b = start(peered("secret-two", &[&node_a]), clip_b).await;
 
     sleep(Duration::from_millis(500)).await;
     assert_eq!(node_a.mesh.peer_count(), 0);
@@ -218,10 +190,9 @@ async fn mime_rules_converge_on_connect() {
     cfg_a.mime_rules_path = Some(path_a.clone());
     let node_a = start(cfg_a, clip_a.clone()).await;
 
-    let mut cfg_b = Config::for_test("rules");
+    let mut cfg_b = peered("rules", &[&node_a]);
     cfg_b.share_mime_rules = true;
     cfg_b.mime_rules_path = Some(path_b.clone());
-    cfg_b.peers = vec![node_a.local_addr.to_string()];
     start(cfg_b, clip_b.clone()).await;
 
     let pb = path_b.clone();

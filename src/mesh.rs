@@ -136,8 +136,41 @@ impl Mesh {
     }
 }
 
+/// Mesh construction shared by the unit tests across the crate.
+///
+/// Not reachable from `tests/*.rs` — those compile the library without
+/// `cfg(test)` and have their own `tests/common`. Keeping this `cfg(test)`
+/// keeps it out of the public API.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::Mesh;
+    use crate::protocol::Message;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    /// A mesh with a fresh node ID, together with its inbound and connect
+    /// receivers.
+    ///
+    /// **Both receivers must stay alive for the test's duration**, even when
+    /// the test never reads them — bind them to `_`-prefixed names rather than
+    /// `_`. `Mesh::register` `try_send`s a connect event and warns when that
+    /// fails, so a dropped connect receiver makes every registration log a
+    /// spurious "couldn't queue a resync".
+    pub(crate) fn new_mesh() -> (
+        Arc<Mesh>,
+        mpsc::Receiver<(Uuid, Message)>,
+        mpsc::Receiver<Uuid>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let (ctx, crx) = mpsc::channel(8);
+        (Mesh::new(Uuid::new_v4(), tx, ctx), rx, crx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::new_mesh;
     use super::*;
     use crate::protocol::test_support::clip;
     use crate::protocol::Message;
@@ -151,25 +184,9 @@ mod tests {
             .expect("frame did not decode")
     }
 
-    fn new_mesh() -> (std::sync::Arc<Mesh>, mpsc::Receiver<(Uuid, Message)>) {
-        let (tx, rx) = mpsc::channel(8);
-        let (ctx, _crx) = mpsc::channel(8);
-        (Mesh::new(Uuid::new_v4(), tx, ctx), rx)
-    }
-
-    fn new_mesh_with_connects() -> (
-        std::sync::Arc<Mesh>,
-        mpsc::Receiver<(Uuid, Message)>,
-        mpsc::Receiver<Uuid>,
-    ) {
-        let (tx, rx) = mpsc::channel(8);
-        let (ctx, crx) = mpsc::channel(8);
-        (Mesh::new(Uuid::new_v4(), tx, ctx), rx, crx)
-    }
-
     #[tokio::test]
     async fn first_connection_emits_a_connect_event_standby_does_not() {
-        let (mesh, _rx, mut connects) = new_mesh_with_connects();
+        let (mesh, _rx, mut connects) = new_mesh();
         let peer = Uuid::new_v4();
         let (tx1, _rx1) = mpsc::channel(8);
         let (tx2, _rx2) = mpsc::channel(8);
@@ -182,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_reaches_only_the_target_peer() {
-        let (mesh, _rx) = new_mesh();
+        let (mesh, _rx, _c) = new_mesh();
         let peer_a = Uuid::new_v4();
         let peer_b = Uuid::new_v4();
         let (tx_a, mut rx_a) = mpsc::channel(8);
@@ -196,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_uses_only_the_designated_connection_per_peer() {
-        let (mesh, _rx) = new_mesh();
+        let (mesh, _rx, _c) = new_mesh();
         let peer = Uuid::new_v4();
         let (tx1, mut rx1) = mpsc::channel(8);
         let (tx2, mut rx2) = mpsc::channel(8);
@@ -218,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_reaches_each_peer_exactly_once() {
-        let (mesh, _rx) = new_mesh();
+        let (mesh, _rx, _c) = new_mesh();
         let (tx_a, mut rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
         mesh.register(Uuid::new_v4(), tx_a);
@@ -233,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregistering_the_last_connection_removes_the_peer() {
-        let (mesh, _rx) = new_mesh();
+        let (mesh, _rx, _c) = new_mesh();
         let peer = Uuid::new_v4();
         let (tx, _krx) = mpsc::channel(8);
         let c = mesh.register(peer, tx);
@@ -244,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_forwards_to_the_inbound_channel() {
-        let (mesh, mut rx) = new_mesh();
+        let (mesh, mut rx, _c) = new_mesh();
         let from = Uuid::new_v4();
         mesh.deliver(from, clip("in")).await;
         assert_eq!(rx.recv().await.unwrap(), (from, clip("in")));

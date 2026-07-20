@@ -77,6 +77,16 @@ fn render(template: &[Block], values: &Values) -> String {
     format!("{trimmed}\n")
 }
 
+/// Emit one optional option line: active at the user's value when they set it,
+/// else the commented default. The single rule for "set stays set, unset shows
+/// its default", shared by the plain options and the psk group.
+fn push_option(key: &str, values: &Values, default: &str, out: &mut String) {
+    match values.scalars.get(key) {
+        Some(v) => out.push_str(&format!("{key} = {v}\n")),
+        None => out.push_str(&format!("# {key} = {default}\n")),
+    }
+}
+
 fn push_block(block: &Block, values: &Values, out: &mut String) {
     match block {
         Block::Prose(text) => push_comment(text, out),
@@ -99,18 +109,12 @@ fn push_block(block: &Block, values: &Values, out: &mut String) {
             default,
         } => {
             push_comment(comment, out);
-            match values.scalars.get(*key) {
-                Some(v) => out.push_str(&format!("{key} = {v}\n")),
-                None => out.push_str(&format!("# {key} = {default}\n")),
-            }
+            push_option(key, values, default, out);
         }
         Block::PskGroup { comment } => {
             push_comment(comment, out);
             for (key, sample) in PSK_SAMPLES {
-                match values.scalars.get(key) {
-                    Some(v) => out.push_str(&format!("{key} = {v}\n")),
-                    None => out.push_str(&format!("# {key} = {sample}\n")),
-                }
+                push_option(key, values, sample, out);
             }
         }
         Block::LinkSelections { comment } => {
@@ -192,12 +196,37 @@ pub fn sync_config(path: &Path) -> Result<SyncOutcome> {
     let current =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let values = extract_values(&current)?;
-    // 3. Render and compare.
+    // 3. Refuse to rewrite a file holding a key the template can't render.
+    // `render` only emits keys that have a `Block`, so such a key would be
+    // dropped from the rewritten file and the setting silently lost. Step 1
+    // already rejected keys the parser doesn't know, so reaching this means
+    // `TEMPLATE` has drifted from `RawConfig` — a bug, caught at build time by
+    // `every_config_option_has_a_template_block`. This is the belt-and-braces
+    // copy: losing a line of someone's config is not an acceptable failure mode
+    // for a normalizer, so refuse rather than write a lossy file.
+    let known = template_keys();
+    let mut unknown: Vec<&str> = values
+        .scalars
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        bail!(
+            "{} has option(s) the canonical template doesn't know: {}. \
+             Rewriting would drop them, so nothing was written — remove them, \
+             or fix the typo, and re-run.",
+            path.display(),
+            unknown.join(", ")
+        );
+    }
+    // 4. Render and compare.
     let rendered = render(TEMPLATE, &values);
     if rendered == current {
         return Ok(SyncOutcome::Unchanged);
     }
-    // 4. Which optional keys are absent (added as commented defaults)?
+    // 5. Which optional keys are absent (added as commented defaults)?
     let added = optional_keys()
         .into_iter()
         .filter(|k| !values.scalars.contains_key(*k))
@@ -205,6 +234,20 @@ pub fn sync_config(path: &Path) -> Result<SyncOutcome> {
         .collect();
     write_atomic(path, &rendered)?;
     Ok(SyncOutcome::Rewrote { added })
+}
+
+/// Every top-level scalar key the template can render. The set `sync_config`
+/// checks a user's file against, so a key with no `Block` is reported rather
+/// than quietly dropped. (`link_selections` is a table, handled separately.)
+fn template_keys() -> Vec<&'static str> {
+    TEMPLATE
+        .iter()
+        .flat_map(|b| match b {
+            Block::Required { key, .. } | Block::Optional { key, .. } => vec![*key],
+            Block::PskGroup { .. } => PSK_SAMPLES.iter().map(|(k, _)| *k).collect(),
+            Block::Prose(_) | Block::LinkSelections { .. } => Vec::new(),
+        })
+        .collect()
 }
 
 /// The optional scalar keys in the template, for the "added" summary.
@@ -237,7 +280,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
             path.display()
         );
     }
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let dir = crate::fsutil::parent_dir(&target);
     let name = target
         .file_name()
         .and_then(|s| s.to_str())
@@ -586,6 +629,52 @@ mod tests {
         assert!(sync_config(&path).is_err());
         // the broken file is left untouched
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// Every option the config parser accepts, read out of serde's own
+    /// `deny_unknown_fields` error. That message enumerates `RawConfig`'s
+    /// fields, which makes it the schema itself rather than a second list to
+    /// keep in step by hand.
+    fn config_schema_keys() -> Vec<String> {
+        // `{:#}` — the whole anyhow chain; the serde detail is a source, not the
+        // top-level "parsing config" context.
+        let err =
+            match crate::config::Config::from_toml("listen = \"x\"\npsk = \"s\"\nzz_probe = 1\n") {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("an unknown config key must be rejected"),
+            };
+        let (_, list) = err
+            .split_once("expected one of ")
+            .expect("serde's unknown-field error should enumerate the accepted fields");
+        let keys: Vec<String> = list
+            .split(',')
+            .filter_map(|s| s.trim().trim_matches('`').split('`').next())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        // Guard the scrape itself: if serde ever changes this wording, fail
+        // here rather than silently checking an empty list.
+        assert!(
+            keys.len() > 10 && keys.contains(&"listen".to_string()),
+            "couldn't scrape the field list from: {err}"
+        );
+        keys
+    }
+
+    #[test]
+    fn every_config_option_has_a_template_block() {
+        let renderable = template_keys();
+        for key in config_schema_keys() {
+            // The only table; rendered by its own block, not as a scalar.
+            if key == "link_selections" {
+                continue;
+            }
+            assert!(
+                renderable.contains(&key.as_str()),
+                "config option `{key}` has no TEMPLATE block: --sync-config would \
+                 delete it from a config that sets it"
+            );
+        }
     }
 
     #[test]

@@ -173,11 +173,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::Mesh;
-    use crate::protocol::test_support::clip;
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-    use uuid::Uuid;
+    use crate::mesh::test_support::new_mesh;
+    use crate::protocol::test_support::{clip, wait_for};
 
     const MAX: usize = 8 * 1024 * 1024;
     const PSK: [u8; 32] = [1u8; 32];
@@ -196,31 +193,20 @@ mod tests {
         );
     }
 
-    async fn wait_for(mut cond: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !cond() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("condition not met within 5s");
-    }
-
     #[tokio::test]
     async fn peers_exchange_hello_and_clip_messages() {
-        let (in_a_tx, _in_a_rx) = mpsc::channel(8);
-        let (in_b_tx, mut in_b_rx) = mpsc::channel(8);
-        let (ctx_a, _crx_a) = mpsc::channel(8);
-        let (ctx_b, _crx_b) = mpsc::channel(8);
-        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx, ctx_a);
-        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx, ctx_b);
+        let (mesh_a, _in_a_rx, _crx_a) = new_mesh();
+        let (mesh_b, mut in_b_rx, _crx_b) = new_mesh();
 
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh_a.clone()));
         tokio::spawn(run_connection(io_b, false, PSK, MAX, mesh_b.clone()));
 
         let (ma, mb) = (mesh_a.clone(), mesh_b.clone());
-        wait_for(move || ma.peer_count() == 1 && mb.peer_count() == 1).await;
+        wait_for("both nodes to see each other as a peer", move || {
+            ma.peer_count() == 1 && mb.peer_count() == 1
+        })
+        .await;
         assert_eq!(mesh_a.peer_ids(), vec![mesh_b.own_id()]);
         assert_eq!(mesh_b.peer_ids(), vec![mesh_a.own_id()]);
 
@@ -232,9 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_connection_is_rejected() {
-        let (in_tx, _in_rx) = mpsc::channel(8);
-        let (ctx, _crx) = mpsc::channel(8);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx, ctx);
+        let (mesh, _in_rx, _crx) = new_mesh();
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         let a = tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh.clone()));
         let b = tokio::spawn(run_connection(io_b, false, PSK, MAX, mesh.clone()));
@@ -255,23 +239,25 @@ mod tests {
 
     #[tokio::test]
     async fn connection_unregisters_when_the_wire_drops() {
-        let (in_a_tx, _in_a_rx) = mpsc::channel(8);
-        let (in_b_tx, _in_b_rx) = mpsc::channel(8);
-        let (ctx_a, _crx_a) = mpsc::channel(8);
-        let (ctx_b, _crx_b) = mpsc::channel(8);
-        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx, ctx_a);
-        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx, ctx_b);
+        let (mesh_a, _in_a_rx, _crx_a) = new_mesh();
+        let (mesh_b, _in_b_rx, _crx_b) = new_mesh();
 
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh_a.clone()));
         let b_task = tokio::spawn(run_connection(io_b, false, PSK, MAX, mesh_b.clone()));
 
         let (ma, mb) = (mesh_a.clone(), mesh_b.clone());
-        wait_for(move || ma.peer_count() == 1 && mb.peer_count() == 1).await;
+        wait_for("both nodes to see each other as a peer", move || {
+            ma.peer_count() == 1 && mb.peer_count() == 1
+        })
+        .await;
 
         b_task.abort(); // kill B's side; A must notice and unregister
         let ma = mesh_a.clone();
-        wait_for(move || ma.peer_count() == 0).await;
+        wait_for("A to drop the peer after B's side died", move || {
+            ma.peer_count() == 0
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -279,30 +265,27 @@ mod tests {
         // the RAII registration guard must clean up even when the
         // run_connection future is cancelled (dropped) rather than ending
         // through its own select
-        let (in_a_tx, _in_a_rx) = mpsc::channel(8);
-        let (in_b_tx, _in_b_rx) = mpsc::channel(8);
-        let (ctx_a, _crx_a) = mpsc::channel(8);
-        let (ctx_b, _crx_b) = mpsc::channel(8);
-        let mesh_a = Mesh::new(Uuid::new_v4(), in_a_tx, ctx_a);
-        let mesh_b = Mesh::new(Uuid::new_v4(), in_b_tx, ctx_b);
+        let (mesh_a, _in_a_rx, _crx_a) = new_mesh();
+        let (mesh_b, _in_b_rx, _crx_b) = new_mesh();
 
         let (io_a, io_b) = tokio::io::duplex(1 << 20);
         let a_task = tokio::spawn(run_connection(io_a, true, PSK, MAX, mesh_a.clone()));
         tokio::spawn(run_connection(io_b, false, PSK, MAX, mesh_b.clone()));
 
         let ma = mesh_a.clone();
-        wait_for(move || ma.peer_count() == 1).await;
+        wait_for("A to register its peer", move || ma.peer_count() == 1).await;
 
         a_task.abort(); // cancel A's own connection future
         let ma = mesh_a.clone();
-        wait_for(move || ma.peer_count() == 0).await;
+        wait_for("A to drop the peer after cancellation", move || {
+            ma.peer_count() == 0
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn handshake_times_out_on_a_silent_peer() {
-        let (in_tx, _in_rx) = mpsc::channel(8);
-        let (ctx, _crx) = mpsc::channel(8);
-        let mesh = Mesh::new(Uuid::new_v4(), in_tx, ctx);
+        let (mesh, _in_rx, _crx) = new_mesh();
         // the other end of the duplex never responds to the handshake
         let (io_a, _io_b) = tokio::io::duplex(1 << 16);
         let res = run_connection(io_a, true, PSK, MAX, mesh.clone()).await;
