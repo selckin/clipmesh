@@ -90,7 +90,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("clipmesh");
     let tmp = dir.join(format!(".{name}.tmp"));
-    let written = fs::write(&tmp, contents)
+    let written = write_private(&tmp, contents, &target)
         .with_context(|| format!("writing {}", tmp.display()))
         .and_then(|()| {
             fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))
@@ -102,6 +102,35 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     written
+}
+
+/// Write the temp file that [`write_atomic`] renames into place, carrying over
+/// the mode the target already had.
+///
+/// The rename replaces the target's inode, so whatever mode this file has is the
+/// one that survives — writing at the umask default would silently widen a
+/// `chmod 600` config to world-readable, and the config is one of the three
+/// documented places the preshared key can live. The temp is created 0600 and
+/// only then relaxed to the target's own mode, so the contents are not exposed
+/// for the window between write and rename either; a file being created for the
+/// first time simply stays private, which is the right default for both files
+/// clipmesh owns.
+fn write_private(tmp: &Path, contents: &str, target: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)?;
+    // Set the mode explicitly rather than leaving it to `mode()` above, which
+    // applies only when the open actually creates the file: a stale temp from an
+    // earlier failed write would otherwise keep its own, possibly wider, mode.
+    let mode = fs::metadata(target).map_or(0o600, |m| m.permissions().mode());
+    fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
+    file.write_all(contents.as_bytes())
 }
 
 /// Assert that a checked-in generated example matches what its template renders
@@ -191,6 +220,63 @@ mod tests {
                 link.display()
             );
         }
+    }
+
+    #[test]
+    fn write_atomic_keeps_the_targets_permissions() {
+        // A rename replaces the target's inode, so the temp's mode is the one
+        // that survives. The config is one of the documented homes of the
+        // preshared key, and `--sync-config` rewrites it in place: a user who
+        // chmod-600'd it must not find it world-readable afterwards.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "psk = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, "psk = \"supersecret\"\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewrite widened the file's permissions");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "psk = \"supersecret\"\n"
+        );
+    }
+
+    #[test]
+    fn write_atomic_creates_a_new_file_private() {
+        // Nothing to inherit from, so the default must be the safe one: both
+        // files clipmesh owns live in the user's own config dir, and one of
+        // them can carry the preshared key.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        write_atomic(&path, "psk = \"supersecret\"\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a file clipmesh creates must start private");
+    }
+
+    #[test]
+    fn write_atomic_keeps_the_permissions_of_a_symlinks_target() {
+        // The mode that matters is the real file's, not the link's — a
+        // stow-managed dotfile is rewritten through the link.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real = real_dir.join("config.toml");
+        std::fs::write(&real, "psk = \"old\"\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/config.toml", &link).unwrap();
+
+        write_atomic(&link, "psk = \"supersecret\"\n").unwrap();
+
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewrite widened the target's permissions");
     }
 
     #[test]

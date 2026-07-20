@@ -663,22 +663,32 @@ impl MimeRules {
     /// read or wrote (`loaded`). Used to roll back a stamp bump or an adoption
     /// after a failed `persist`, so the in-memory rules never silently diverge
     /// from what's on disk (which would otherwise be lost on restart).
+    /// A restore needs a baseline that parses, and there are two ways not to have
+    /// one: nothing of ours has ever reached disk (`loaded` is None — the very
+    /// first write failed, e.g. a read-only config dir), or the baseline somehow
+    /// won't reparse (unreachable: `loaded` is only ever set from text that
+    /// already parsed or that we rendered ourselves). Both keep the current
+    /// document, so no path here can install an empty one: this is the *rollback*
+    /// path, and an empty ruleset under the default `unknown_mime = deny` denies
+    /// every type — the node goes on running and silently stops syncing anything
+    /// until restart. What we hold is at worst the built-in template plus a stamp
+    /// we failed to write, which beats nothing.
     fn revert_to_loaded(&mut self) {
-        match self.loaded.as_deref().map(str::parse::<DocumentMut>) {
-            Some(Ok(doc)) => self.doc = doc,
-            // Unreachable: `loaded` is only ever set from text that already
-            // parsed (a file we read) or that we rendered ourselves. Keeping the
-            // current document is the safe answer if it somehow happens anyway —
-            // this is the *rollback* path, so the obvious `unwrap_or_default()`
-            // would install an EMPTY ruleset, and under the default
-            // `unknown_mime = deny` that silently stops syncing every type until
-            // restart.
+        let restored = match self.loaded.as_deref().map(str::parse::<DocumentMut>) {
+            Some(Ok(doc)) => Some(doc),
             Some(Err(e)) => {
-                warn!("couldn't restore the last-good MIME rules ({e}); keeping the current ones")
+                warn!("couldn't restore the last-good MIME rules ({e}); keeping the current ones");
+                None
             }
-            None => self.doc = DocumentMut::new(),
+            None => None,
+        };
+        // Only an actual restore makes memory match disk again. Without one the
+        // change is still pending, so leave `dirty` set for the next persist to
+        // retry rather than claiming a clean state that nothing on disk backs.
+        if let Some(doc) = restored {
+            self.doc = doc;
+            self.dirty = false;
         }
-        self.dirty = false;
     }
 
     /// The file's whole-file LWW version. Reads the managed `[clipmesh]` table if
@@ -1686,6 +1696,31 @@ mod tests {
         assert!(!rules.persist(), "a failed write must report not-in-sync");
         assert!(rules.is_dirty(), "the change must stay pending");
         assert!(path.is_dir(), "the unwritable path must be untouched");
+    }
+
+    #[test]
+    fn a_rollback_with_nothing_on_disk_keeps_the_ruleset() {
+        // A path inside a directory that doesn't exist: the bootstrap write in
+        // `materialize_fresh` fails, so the built-in template is live in memory
+        // while `loaded` is still None. A later snapshot fails to persist too and
+        // rolls back — which must not leave an EMPTY ruleset behind, because under
+        // `unknown_mime = deny` that silently denies every type until restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent").join("mimetypes");
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        assert!(
+            rules.allows("text/plain", 10),
+            "the built-in template's rules must be live"
+        );
+
+        let snapshot = rules.snapshot_baseline(Uuid::from_u128(1), 1 << 20);
+        assert!(matches!(snapshot, Err(SnapshotError::WriteFailed)));
+
+        assert!(
+            rules.allows("text/plain", 10),
+            "the rollback wiped the ruleset; every type is now denied until restart"
+        );
+        assert!(rules.is_dirty(), "the unwritten change must stay pending");
     }
 
     #[test]
