@@ -381,15 +381,26 @@ impl MimeRules {
     /// marking it dirty so a subsequent `persist` writes it. A body that isn't
     /// valid TOML is ignored (we never adopt garbage). Does not touch `loaded` —
     /// `persist` updates that once the bytes are on disk.
-    pub fn replace_from(&mut self, text: String) {
+    ///
+    /// Returns whether the body was adopted, because refusing it and then
+    /// stamping its version anyway pins *our* content under a version we did not
+    /// take: the peer's later re-pushes are all "older-or-equal" and silently
+    /// ignored, and the two hosts diverge permanently. The caller needs to know,
+    /// so this reports rather than only logging.
+    #[must_use]
+    pub fn replace_from(&mut self, text: String) -> bool {
         match text.parse::<DocumentMut>() {
             Ok(doc) => {
                 let label = self.path.clone().unwrap_or_else(|| PathBuf::from("<peer>"));
                 warn_invalid_rules(&doc, &label);
                 self.doc = doc;
                 self.dirty = true;
+                true
             }
-            Err(e) => warn!("ignoring a peer's MIME-rules update that isn't valid TOML: {e}"),
+            Err(e) => {
+                warn!("ignoring a peer's MIME-rules update that isn't valid TOML: {e}");
+                false
+            }
         }
     }
 
@@ -1875,7 +1886,7 @@ mod tests {
         );
         // The rendered body is valid TOML that reloads to the same rule.
         let mut reparsed = MimeRules::load(None, MimePolicy::Deny);
-        reparsed.replace_from(body);
+        assert!(reparsed.replace_from(body));
         assert!(reparsed.allows("image/png", 1));
     }
 
@@ -1883,9 +1894,9 @@ mod tests {
     fn replace_from_swaps_the_whole_ruleset() {
         let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
         assert!(!rules.allows("image/png", 1));
-        rules.replace_from(
+        assert!(rules.replace_from(
             "[rules]\n\"image/png\" = \"allow\"\n\"text/plain\" = \"allow\"\n".to_string(),
-        );
+        ));
         rules.persist();
         assert!(rules.allows("image/png", 1));
         assert!(rules.allows("text/plain", 1));
@@ -1894,7 +1905,10 @@ mod tests {
     #[test]
     fn replace_from_ignores_a_non_toml_body() {
         let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"deny\"\n", MimePolicy::Deny);
-        rules.replace_from("not toml = =".to_string());
+        assert!(
+            !rules.replace_from("not toml = =".to_string()),
+            "a refused body must report that it was refused"
+        );
         assert!(
             !rules.allows("image/png", 1),
             "garbage body must be ignored"

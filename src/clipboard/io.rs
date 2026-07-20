@@ -152,12 +152,20 @@ impl<C: Clipboard> ClipboardIo<C> {
     /// by *which method you called*: [`read`](ClipboardIo::read) never consumes,
     /// this always does, and there is no third option to get wrong.
     pub async fn read_classified(&self, kind: SelectionKind) -> Option<(Hashed, Origin)> {
-        let raw = self.read(kind).await?;
+        let raw = self.read(kind).await;
         // One-shot: the marker suppresses exactly the one echo its write
         // provokes, so a second identical copy by the user still propagates.
-        let origin = match self.last_written.lock().unwrap().remove(&kind) {
+        // Consumed whether or not the read succeeded — it belongs to the write
+        // that has already happened, and this is its one chance to be spent. A
+        // failed read (a timed-out compositor) that left it behind would match
+        // a later genuine copy of identical bytes and drop it as an echo, and
+        // nothing clears it but a read returning something *different*, so the
+        // window stays open indefinitely.
+        let written = self.last_written.lock().unwrap().remove(&kind);
+        let raw = raw?;
+        let origin = match written {
             // The read already carries its hash, so this is a 32-byte compare.
-            Some(written) if written == raw.hash() => Origin::Echo,
+            Some(w) if w == raw.hash() => Origin::Echo,
             _ => Origin::User,
         };
         Some((raw, origin))
@@ -208,6 +216,34 @@ mod tests {
             origin_of(&io, SelectionKind::Clipboard).await,
             Origin::Echo,
             "a plain read consumed the marker the classifier needed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_still_spends_the_echo_marker() {
+        // The marker is one-shot and belongs to the write that already happened.
+        // Returning early on a failed read left it behind, where it would match
+        // a later genuine copy of identical bytes and drop it as an echo — and
+        // only a read of *different* content clears it, so the mesh silently
+        // never sees that copy.
+        let clip = MockClipboard::new();
+        let io = ClipboardIo::new(clip.clone());
+        io.write(SelectionKind::Clipboard, Hashed::new(offer("x")))
+            .await;
+
+        clip.block_reads();
+        assert!(
+            io.read_classified(SelectionKind::Clipboard).await.is_none(),
+            "the read was supposed to fail"
+        );
+        clip.allow_reads();
+
+        // The user copies the same bytes by hand: a real change.
+        clip.local_copy(SelectionKind::Clipboard, offer("x"));
+        assert_eq!(
+            origin_of(&io, SelectionKind::Clipboard).await,
+            Origin::User,
+            "a marker left behind by a failed read swallowed a genuine copy"
         );
     }
 

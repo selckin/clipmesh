@@ -1546,7 +1546,14 @@ impl<C: Clipboard> SyncEngine<C> {
                     "adopting shared MIME-rules from peer {from} (stamp {}); replaces our (stamp {}, origin {})",
                     incoming.stamp, current.stamp, current.origin
                 );
-                rules.replace_from(body);
+                if !rules.replace_from(body) {
+                    // The body was refused, so our rules are unchanged — and a
+                    // version is a claim about content. Stamping it here would
+                    // pin our own rules under the peer's version, after which
+                    // every re-push from that peer loses the newer-or-equal
+                    // check and is dropped. It re-pushes on its next connect.
+                    return None;
+                }
                 // Stamp the adopted version explicitly so version() reflects it even
                 // if the peer's body lacked the header line — otherwise version()
                 // would fall back to the new file's mtime and diverge. On failure
@@ -3610,6 +3617,41 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             rules_toml(&[("image/png", "deny")]),
             "implausibly-future rules must be rejected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peers_unparseable_rules_body_does_not_take_its_version() {
+        // `replace_from` refuses a body that isn't TOML and leaves our rules
+        // untouched — but the version was stamped and persisted anyway, pinning
+        // our own content under the peer's version. Every later push from that
+        // peer is then "older-or-equal" and silently ignored, so the two hosts
+        // run different allow/deny rules indefinitely.
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let (_dir, path) = with_rules(&mut cfg, MimePolicy::Deny, &[("image/png", "deny")]);
+        let h = start(cfg).await;
+
+        send_rules(&h, now_ms() + 2000, h.remote_id, "not { TOML".to_string()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("deny"),
+            "a body that isn't TOML must not be adopted"
+        );
+
+        // A genuine update at a LOWER stamp than the rejected one must still
+        // win: rejecting the body has to mean rejecting its version too.
+        send_rules(
+            &h,
+            now_ms() + 1000,
+            h.remote_id,
+            rules_toml(&[("image/png", "allow")]),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("allow"),
+            "the rejected body's version was kept, so a real update lost to it"
         );
     }
 
