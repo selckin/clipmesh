@@ -38,6 +38,14 @@ fn offer_size(offer: &Offer) -> usize {
 
 /// Legacy X11 plain-text selection atoms we can derive a `text/plain` value
 /// from, in descending order of how trustworthy their declared encoding is.
+///
+/// `COMPOUND_TEXT` is deliberately NOT here, even though
+/// `wayland::is_content_type` counts it as content: that predicate only asks
+/// whether a failed read lost something worth warning about, while this list
+/// asks whether `reencode_atom` can turn the bytes into clean UTF-8. Compound
+/// text is ISO 2022 — multi-byte, with escape sequences switching character
+/// sets mid-string — so decoding it as UTF-8 or latin-1 would paste the escapes
+/// as garbage. Adding it needs a real compound-text decoder, not a list entry.
 const PLAINTEXT_ATOMS: [&str; 3] = ["UTF8_STRING", "STRING", "TEXT"];
 
 /// Whether `mime` is a `text/plain` variant (`text/plain`, `text/plain;charset=…`).
