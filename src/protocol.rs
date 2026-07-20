@@ -92,6 +92,48 @@ pub fn content_hash(offer: &Offer) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// An [`Offer`] together with its [`content_hash`], computed once at construction.
+///
+/// The hash *is* clipboard identity here — echo suppression, mesh dedup, the
+/// bridge's drift reconcile and the LWW comparison all ask "same content?" — so
+/// carrying it with the content means those comparisons never recompute it, and
+/// `content_hash` has exactly one caller.
+///
+/// The offer is immutable behind this type, which is what makes a stale hash
+/// unrepresentable: a transform that *changes* the content must build a new
+/// `Hashed` (rehashing), and one that leaves it alone returns the same value,
+/// carrying the hash forward for free. That turns "did this stage change
+/// anything?" from a flag someone has to thread correctly into something the
+/// types answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hashed {
+    offer: Offer,
+    hash: [u8; 32],
+}
+
+impl Hashed {
+    pub fn new(offer: Offer) -> Hashed {
+        let hash = content_hash(&offer);
+        Hashed { offer, hash }
+    }
+
+    pub fn hash(&self) -> [u8; 32] {
+        self.hash
+    }
+
+    pub fn offer(&self) -> &Offer {
+        &self.offer
+    }
+
+    pub fn into_offer(self) -> Offer {
+        self.offer
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offer.is_empty()
+    }
+}
+
 /// Compact `mime=size, mime=size` rendering of an offer for log lines, sizes
 /// in human units, in the offer's advertise (insertion) order. Build it only
 /// inside an enabled log statement — it allocates per call.
@@ -203,6 +245,18 @@ mod tests {
     use super::test_support::offer;
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn hashed_carries_the_hash_of_its_content() {
+        let o = offer(&[("text/html", b"<b>hi</b>"), ("text/plain", b"hi")]);
+        let h = Hashed::new(o.clone());
+        assert_eq!(h.hash(), content_hash(&o));
+        assert_eq!(h.offer(), &o);
+        assert!(!h.is_empty());
+        assert_eq!(h.into_offer(), o, "the content round-trips unchanged");
+
+        assert!(Hashed::new(Offer::new()).is_empty());
+    }
 
     #[test]
     fn content_hash_is_deterministic_and_order_independent() {

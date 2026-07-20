@@ -3,7 +3,7 @@ use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
-    content_hash, describe_offer, encode_frame, human_bytes, Message, Offer, SelectionKind, Version,
+    describe_offer, encode_frame, human_bytes, Hashed, Message, Offer, SelectionKind, Version,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -107,26 +107,27 @@ fn clean_plaintext(mut v: Vec<u8>) -> Vec<u8> {
 /// still paste content copied from an X11/legacy app. The highest-priority atom
 /// present supplies the value. A no-op if any `text/plain*` already exists or no
 /// source atom is present.
-fn synthesize_text_plain(offer: Offer) -> Offer {
+fn synthesize_text_plain(content: Hashed) -> Hashed {
+    let offer = content.offer();
     if offer.keys().any(|k| is_text_plain(k)) {
-        return offer;
+        return content;
     }
     let Some((src, value)) = PLAINTEXT_ATOMS.iter().find_map(|atom| {
         offer
             .get(*atom)
             .map(|bytes| (*atom, clean_plaintext(reencode_atom(atom, bytes))))
     }) else {
-        return offer; // no legacy atom to derive from
+        return content; // no legacy atom to derive from
     };
     let mut out = Offer::with_capacity(offer.len() + 2);
-    for (k, v) in offer {
+    for (k, v) in content.into_offer() {
         if k == src {
             out.insert("text/plain;charset=utf-8".to_string(), value.clone());
             out.insert("text/plain".to_string(), value.clone());
         }
         out.insert(k, v);
     }
-    out
+    Hashed::new(out)
 }
 
 /// Trim the offer to `max` bytes, dropping individual representations that don't
@@ -141,11 +142,11 @@ fn synthesize_text_plain(offer: Offer) -> Offer {
 /// `wayland::assemble_offer` spends the same number as a *resource guard*, under
 /// streaming ignorance of sizes and before the rules — see its doc comment for
 /// why the two cannot be collapsed into one.
-fn cap_to_payload_size(offer: Offer, max: usize) -> Offer {
-    if offer_size(&offer) <= max {
-        return offer; // common case: the whole offer fits
+fn cap_to_payload_size(content: Hashed, max: usize) -> Hashed {
+    if offer_size(content.offer()) <= max {
+        return content; // common case: the whole offer fits
     }
-    let reps: Vec<(String, Vec<u8>)> = offer.into_iter().collect();
+    let reps: Vec<(String, Vec<u8>)> = content.into_offer().into_iter().collect();
     // Choose survivors smallest-first (maximizes how many fit), recording which
     // by original index so the output can preserve the advertise order.
     let mut by_size: Vec<usize> = (0..reps.len()).collect();
@@ -169,11 +170,13 @@ fn cap_to_payload_size(offer: Offer, max: usize) -> Offer {
         total += sz;
         keep[i] = true;
     }
-    reps.into_iter()
-        .enumerate()
-        .filter(|(i, _)| keep[*i])
-        .map(|(_, kv)| kv)
-        .collect()
+    Hashed::new(
+        reps.into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, kv)| kv)
+            .collect(),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -504,7 +507,7 @@ fn plan_batch(changed: &[SelectionKind], link: LinkSelections, own: bool) -> Bat
 /// to look like a handled case: `plan_batch` only ever sources from `changed`,
 /// and every changed selection was read into `read`. A miss would mean the
 /// planner and the reader disagree — a bug, not a runtime condition.
-fn content_for(read: &IndexMap<SelectionKind, Offer>, action: Action) -> Option<Offer> {
+fn content_for(read: &IndexMap<SelectionKind, Hashed>, action: Action) -> Option<Hashed> {
     let content = read.get(&action.source).cloned();
     debug_assert!(
         content.is_some(),
@@ -732,22 +735,21 @@ impl<C: Clipboard> SyncEngine<C> {
             // spontaneously bridged. or_insert: prime races the run loop, so an
             // inbound apply may already have recorded newer content here — don't
             // clobber it.
-            let raw_hash = content_hash(&raw);
             self.last_written
                 .lock()
                 .unwrap()
                 .entry(kind)
-                .or_insert(raw_hash);
+                .or_insert(raw.hash());
             // Synced kinds also seed `current` (filtered, stamp 0) and record
             // any brand-new types — exactly as before.
             if !synced.contains(&kind) {
                 continue;
             }
-            if let Some(offer) = self.apply_stages(raw, Stages::BROADCAST) {
-                let hash = content_hash(&offer);
+            if let Some(content) = self.apply_stages(raw, Stages::BROADCAST) {
+                let hash = content.hash();
                 debug!(
                     "primed existing {kind:?} clipboard ({})",
-                    describe_offer(&offer)
+                    describe_offer(content.offer())
                 );
                 self.current
                     .lock()
@@ -776,50 +778,50 @@ impl<C: Clipboard> SyncEngine<C> {
     /// pipeline unconditionally, and checking it before synthesis skips needless
     /// work on secret content (synthesis never changes the verdict — it adds no
     /// password-manager hint).
-    fn apply_stages(&self, offer: Offer, stages: Stages) -> Option<Offer> {
-        if offer.is_empty() {
+    fn apply_stages(&self, content: Hashed, stages: Stages) -> Option<Hashed> {
+        if content.is_empty() {
             debug!("nothing to sync: the clipboard is empty");
             return None;
         }
-        if self.excludes_sensitive(&offer) {
+        if self.excludes_sensitive(content.offer()) {
             debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
             return None;
         }
-        let offer = if stages.synthesize && self.cfg.synthesize_text_plain {
-            synthesize_text_plain(offer)
+        let content = if stages.synthesize && self.cfg.synthesize_text_plain {
+            synthesize_text_plain(content)
         } else {
-            offer
+            content
         };
-        let offer = match stages.rules {
-            RulesStage::Skip => offer,
+        let content = match stages.rules {
+            RulesStage::Skip => content,
             rules => {
-                let offer = self.apply_mime_rules(offer, rules == RulesStage::Record);
-                if offer.is_empty() {
+                let content = self.apply_mime_rules(content, rules == RulesStage::Record);
+                if content.is_empty() {
                     debug!("nothing to sync: every MIME type was blocked by the rules");
                     return None;
                 }
-                offer
+                content
             }
         };
         if !stages.cap {
             // Nothing below can empty the offer, so it is still non-empty here.
-            return Some(offer);
+            return Some(content);
         }
-        let offer = cap_to_payload_size(offer, self.cfg.max_payload_size);
-        if offer.is_empty() {
+        let content = cap_to_payload_size(content, self.cfg.max_payload_size);
+        if content.is_empty() {
             debug!("nothing to sync: everything was over the max_payload_size budget");
             return None;
         }
-        Some(offer)
+        Some(content)
     }
 
-    fn apply_mime_rules(&self, offer: Offer, record_unseen: bool) -> Offer {
+    fn apply_mime_rules(&self, content: Hashed, record_unseen: bool) -> Hashed {
         let mut rules = lock_rules(&self.mime_rules);
         if record_unseen {
             let mut appended = false;
-            if rules.compile().has_unseen(offer.keys()) {
+            if rules.compile().has_unseen(content.offer().keys()) {
                 rules.reload_if_changed();
-                appended = rules.ensure(offer.keys());
+                appended = rules.ensure(content.offer().keys());
             }
             // No-op unless something is unsaved (incl. retrying a failed write).
             rules.persist();
@@ -833,19 +835,32 @@ impl<C: Clipboard> SyncEngine<C> {
         // representation. Deliberately after the block above: that may rewrite
         // the table, and the borrow checker enforces the recompile.
         let compiled = rules.compile();
-        offer
-            .into_iter()
-            .filter(|(mime, data)| {
-                let allowed = compiled.allows(mime, data.len());
-                if !allowed {
-                    debug!(
-                        "dropping {mime} ({}): blocked by the MIME rules",
-                        human_bytes(data.len())
-                    );
-                }
-                allowed
-            })
-            .collect()
+        // Decide before rebuilding: when the rules deny nothing — the ordinary
+        // case — the content is unchanged, so return it as-is and its hash stays
+        // valid. Only a genuine drop rebuilds the map (and rehashes).
+        let denied: Vec<&String> = content
+            .offer()
+            .iter()
+            .filter(|(mime, data)| !compiled.allows(mime, data.len()))
+            .map(|(mime, _)| mime)
+            .collect();
+        if denied.is_empty() {
+            return content;
+        }
+        for mime in &denied {
+            debug!(
+                "dropping {mime} ({}): blocked by the MIME rules",
+                human_bytes(content.offer()[*mime].len())
+            );
+        }
+        let denied: std::collections::HashSet<String> = denied.into_iter().cloned().collect();
+        Hashed::new(
+            content
+                .into_offer()
+                .into_iter()
+                .filter(|(mime, _)| !denied.contains(mime))
+                .collect(),
+        )
     }
 
     /// Read the selection with a bounded timeout (no filtering). Split out of
@@ -856,9 +871,9 @@ impl<C: Clipboard> SyncEngine<C> {
     /// slow/unresponsive selection owner must not be able to freeze the engine.
     /// A real read of the size-capped clipboard takes milliseconds; exceeding
     /// this means the source isn't serving its pipe.
-    async fn read_selection(&self, kind: SelectionKind) -> Option<Offer> {
+    async fn read_selection(&self, kind: SelectionKind) -> Option<Hashed> {
         match tokio::time::timeout(READ_TIMEOUT, self.clipboard.read_offer(kind)).await {
-            Ok(Ok(o)) => Some(o),
+            Ok(Ok(o)) => Some(Hashed::new(o)),
             Ok(Err(e)) => {
                 warn!("couldn't read the clipboard: {e:#}");
                 None
@@ -870,16 +885,16 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
-    async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
-        let offer = self.read_selection(kind).await?;
+    async fn capture_offer(&self, kind: SelectionKind) -> Option<Hashed> {
+        let content = self.read_selection(kind).await?;
         // Local content: record brand-new types so the user can curate them.
-        self.apply_stages(offer, Stages::BROADCAST)
+        self.apply_stages(content, Stages::BROADCAST)
     }
 
     /// Broadcast `raw` (the freshly-read content of `kind`) to the mesh after
     /// applying the content filters. The caller reads the selection once and
     /// shares `raw` with the bridge, so a single local change costs one read.
-    async fn broadcast_selection(&self, kind: SelectionKind, raw: Offer) {
+    async fn broadcast_selection(&self, kind: SelectionKind, raw: Hashed) {
         if !self.may_send(kind) {
             if self.cfg.verbose {
                 info!("copied {kind:?}: not sent (this node does not send)");
@@ -889,14 +904,14 @@ impl<C: Clipboard> SyncEngine<C> {
         // Describe what was copied before the filters narrow it, computed once.
         // The bracketed list means "what was copied" in every outcome below
         // (consistent with the received-update summary).
-        let copied = self.cfg.verbose.then(|| describe_offer(&raw));
-        let Some(offer) = self.apply_stages(raw, Stages::BROADCAST) else {
+        let copied = self.cfg.verbose.then(|| describe_offer(raw.offer()));
+        let Some(content) = self.apply_stages(raw, Stages::BROADCAST) else {
             if let Some(copied) = &copied {
                 info!("copied {kind:?} [{copied}]: not sent (nothing passed the content filters)");
             }
             return;
         };
-        let hash = content_hash(&offer);
+        let hash = content.hash();
         // Already the mesh-current content (we just applied it, or the user
         // re-copied identical bytes): nothing to do.
         if self.current.lock().unwrap().get(&kind).map(|s| s.hash) == Some(hash) {
@@ -917,12 +932,12 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         debug!(
             "broadcasting {kind:?} update ({}, stamp {stamp})",
-            describe_offer(&offer)
+            describe_offer(content.offer())
         );
         self.mesh.broadcast(&Message::Clip {
             kind,
             hash,
-            offer,
+            offer: content.into_offer(),
             version,
         });
     }
@@ -936,9 +951,12 @@ impl<C: Clipboard> SyncEngine<C> {
     /// write (the echo can arrive as soon as it lands) and rolls the marker back
     /// on failure, since no echo will follow a write that never happened.
     /// Returns whether the write succeeded.
-    async fn write_selection(&self, kind: SelectionKind, offer: Offer, hash: [u8; 32]) -> bool {
-        self.last_written.lock().unwrap().insert(kind, hash);
-        match self.clipboard.write_offer(kind, offer).await {
+    async fn write_selection(&self, kind: SelectionKind, content: Hashed) -> bool {
+        self.last_written
+            .lock()
+            .unwrap()
+            .insert(kind, content.hash());
+        match self.clipboard.write_offer(kind, content.into_offer()).await {
             Ok(()) => true,
             Err(e) => {
                 warn!("couldn't write the {kind:?} selection: {e:#}");
@@ -961,7 +979,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // even when that partner's own change was an echo of our last write.
         // `changed` names the subset that was a genuine user change, in batch
         // order; it is all the planner needs.
-        let mut read: IndexMap<SelectionKind, Offer> = IndexMap::new();
+        let mut read: IndexMap<SelectionKind, Hashed> = IndexMap::new();
         let mut changed: Vec<SelectionKind> = Vec::new();
         for kind in batch {
             if !self.policies.get(kind).has_local_sink() {
@@ -973,13 +991,10 @@ impl<C: Clipboard> SyncEngine<C> {
             let Some(raw) = self.read_selection(kind).await else {
                 continue;
             };
-            // One-shot consume the echo memo; hash only when a marker exists (the
-            // common genuine-copy path does no hashing here). The marker comes
-            // out into a local first so the lock isn't held across the hash —
-            // `prime` runs concurrently and touches the same map.
+            // One-shot consume the echo memo and compare it to what we read.
+            // The read already carries its hash, so this is a 32-byte compare.
             let marker = self.last_written.lock().unwrap().remove(&kind);
-            let is_echo = marker.is_some_and(|h| h == content_hash(&raw));
-            if !is_echo {
+            if marker != Some(raw.hash()) {
                 changed.push(kind); // else: our own write echoing back — no propagation
             }
             read.insert(kind, raw);
@@ -1015,17 +1030,16 @@ impl<C: Clipboard> SyncEngine<C> {
     async fn execute_write(
         &self,
         kind: SelectionKind,
-        content: Offer,
+        content: Hashed,
         prov: Provenance,
-        read: &IndexMap<SelectionKind, Offer>,
+        read: &IndexMap<SelectionKind, Hashed>,
     ) {
-        let Some(final_offer) = self.apply_stages(content, prov.stages()) else {
+        let Some(final_content) = self.apply_stages(content, prov.stages()) else {
             if prov == Provenance::Own {
                 debug!("not taking ownership of {kind:?}: nothing left after its stages");
             }
             return;
         };
-        let h = content_hash(&final_offer);
         if prov == Provenance::Mirror {
             // Reconcile against the partner's ACTUAL content (handles out-of-band
             // drift; the partner may be unwatched). Reuse a read from this batch if
@@ -1039,14 +1053,15 @@ impl<C: Clipboard> SyncEngine<C> {
                     fresh.as_ref()
                 }
             };
-            if let Some(now) = partner_now {
-                if content_hash(now) == h {
-                    return;
-                }
+            if partner_now.map(Hashed::hash) == Some(final_content.hash()) {
+                return;
             }
         }
-        let copied = self.cfg.verbose.then(|| describe_offer(&final_offer));
-        if self.write_selection(kind, final_offer, h).await {
+        let copied = self
+            .cfg
+            .verbose
+            .then(|| describe_offer(final_content.offer()));
+        if self.write_selection(kind, final_content).await {
             if let (Provenance::Mirror, Some(copied)) = (prov, copied) {
                 info!("mirrored into {kind:?} [{copied}]");
             }
@@ -1134,12 +1149,12 @@ impl<C: Clipboard> SyncEngine<C> {
             let Some(state) = self.current.lock().unwrap().get(&kind).copied() else {
                 continue;
             };
-            let Some(offer) = self.capture_offer(kind).await else {
+            let Some(content) = self.capture_offer(kind).await else {
                 continue;
             };
             // Only resync if the live clipboard still matches our recorded
             // state; otherwise the watcher path will carry the newer content.
-            if content_hash(&offer) != state.hash {
+            if content.hash() != state.hash {
                 continue;
             }
             debug!(
@@ -1150,7 +1165,7 @@ impl<C: Clipboard> SyncEngine<C> {
             let frame = encode_frame(&Message::Clip {
                 kind,
                 hash: state.hash,
-                offer,
+                offer: content.into_offer(),
                 version: state.version,
             });
             for &peer in peers {
@@ -1205,16 +1220,17 @@ impl<C: Clipboard> SyncEngine<C> {
         offer: Offer,
         version: Version,
     ) -> &'static str {
+        let content = Hashed::new(offer);
         debug!(
             "received {kind:?} update from peer {from} ({}, stamp {})",
-            describe_offer(&offer),
+            describe_offer(content.offer()),
             version.stamp
         );
         if !self.may_recv(kind) {
             debug!("ignoring inbound {kind:?} from peer {from}: blocked by direction/sync_selection config");
             return "dropped (blocked by direction/sync_selection config)";
         }
-        if content_hash(&offer) != hash {
+        if content.hash() != hash {
             warn!("dropping update from peer {from}: content hash doesn't match (corrupted or tampered)");
             return "rejected (content hash mismatch)";
         }
@@ -1225,11 +1241,13 @@ impl<C: Clipboard> SyncEngine<C> {
         // between peers, and a node must not write contents it would never
         // have sent (e.g. password-manager secrets, or denied MIME types). Do
         // NOT record unseen types here — a peer must not write to our rules file.
-        let Some(offer) = self.apply_stages(offer, Stages::INBOUND) else {
+        let Some(content) = self.apply_stages(content, Stages::INBOUND) else {
             debug!("dropping inbound {kind:?} from peer {from}: our content filters removed everything");
             return "dropped (content filters removed everything)";
         };
-        let applied_hash = content_hash(&offer);
+        // Free when the filters changed nothing — the common case — because the
+        // hash rode along with the content instead of being recomputed.
+        let applied_hash = content.hash();
         {
             let mut current = self.current.lock().unwrap();
             if let Some(state) = current.get(&kind).copied() {
@@ -1260,7 +1278,7 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         debug!(
             "applying {kind:?} update from peer {from} ({}, stamp {})",
-            describe_offer(&offer),
+            describe_offer(content.offer()),
             version.stamp
         );
         // `write_selection` marks this as engine-written, so the resulting watch
@@ -1268,7 +1286,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // content must not be re-mirrored to the partner selection nor
         // re-broadcast to the mesh under our own origin. `link_selections` is a
         // purely *local* coupling; cross-host propagation is `sync_selection`'s job.
-        if !self.write_selection(kind, offer, applied_hash).await {
+        if !self.write_selection(kind, content).await {
             return "clipboard write failed";
         }
         // Record as current only on a successful write, so a transient
@@ -1368,7 +1386,66 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    use crate::protocol::content_hash;
     use crate::protocol::test_support::{text_offer as offer, wait_for};
+
+    /// Run the pure capture transforms over a bare `Offer`. The engine works in
+    /// `Hashed`; these tests are about the content, so they wrap and unwrap.
+    fn synth(offer: Offer) -> Offer {
+        synthesize_text_plain(Hashed::new(offer)).into_offer()
+    }
+
+    fn cap(offer: Offer, max: usize) -> Offer {
+        cap_to_payload_size(Hashed::new(offer), max).into_offer()
+    }
+
+    #[test]
+    fn a_transform_that_changes_nothing_carries_the_hash_forward() {
+        // Load-bearing: the inbound path reuses the hash it already verified
+        // against the wire, which is only sound because a no-op pipeline really
+        // does hand back the same `Hashed`.
+        let already_plain = Hashed::new(offer("hi"));
+        let before = already_plain.hash();
+        assert_eq!(
+            synthesize_text_plain(already_plain).hash(),
+            before,
+            "synthesis with a text/plain already present must not alter the hash"
+        );
+
+        let fits = Hashed::new(offer("hi"));
+        let before = fits.hash();
+        assert_eq!(
+            cap_to_payload_size(fits, 1 << 20).hash(),
+            before,
+            "an offer under budget must not alter the hash"
+        );
+    }
+
+    #[test]
+    fn a_transform_that_changes_content_rehashes() {
+        // The other half: whenever the content is rebuilt the hash must track it,
+        // or a stale hash would defeat echo suppression and mesh dedup.
+        let capped = cap_to_payload_size(Hashed::new(offer("hello")), 1);
+        assert!(capped.is_empty(), "nothing fits a 1-byte budget");
+        assert_eq!(
+            capped.hash(),
+            content_hash(capped.offer()),
+            "hash must match the content it carries"
+        );
+
+        let synthesized = synthesize_text_plain(Hashed::new(crate::protocol::test_support::offer(
+            &[("UTF8_STRING", b"hi")],
+        )));
+        assert!(
+            synthesized.offer().contains_key("text/plain"),
+            "text/plain should have been back-filled"
+        );
+        assert_eq!(
+            synthesized.hash(),
+            content_hash(synthesized.offer()),
+            "hash must match the content it carries"
+        );
+    }
 
     fn pairs(offer: &Offer) -> Vec<(&str, &[u8])> {
         offer
@@ -1382,7 +1459,7 @@ mod tests {
         let offer: Offer = [("UTF8_STRING".to_string(), b"hi".to_vec())]
             .into_iter()
             .collect();
-        let out = synthesize_text_plain(offer);
+        let out = synth(offer);
         assert_eq!(
             pairs(&out),
             [
@@ -1402,7 +1479,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(pairs(&synthesize_text_plain(a.clone())), pairs(&a));
+        assert_eq!(pairs(&synth(a.clone())), pairs(&a));
         // A parameterized text/plain;charset=... also counts.
         let b: Offer = [
             ("text/plain;charset=utf-8".to_string(), b"x".to_vec()),
@@ -1410,7 +1487,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(pairs(&synthesize_text_plain(b.clone())), pairs(&b));
+        assert_eq!(pairs(&synth(b.clone())), pairs(&b));
     }
 
     #[test]
@@ -1418,14 +1495,14 @@ mod tests {
         let offer: Offer = [("image/png".to_string(), b"\x89PNG".to_vec())]
             .into_iter()
             .collect();
-        assert_eq!(pairs(&synthesize_text_plain(offer.clone())), pairs(&offer));
+        assert_eq!(pairs(&synth(offer.clone())), pairs(&offer));
     }
 
     #[test]
     fn synthesize_reencodes_latin1_string_to_utf8() {
         // STRING is ISO-8859-1: 0xE9 is 'é', which is 0xC3 0xA9 in UTF-8.
         let offer: Offer = [("STRING".to_string(), vec![0xE9])].into_iter().collect();
-        let out = synthesize_text_plain(offer);
+        let out = synth(offer);
         assert_eq!(
             out.get("text/plain").map(Vec::as_slice),
             Some(&[0xC3u8, 0xA9][..]),
@@ -1447,7 +1524,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let out = synthesize_text_plain(offer);
+        let out = synth(offer);
         assert_eq!(
             pairs(&out),
             [
@@ -1468,7 +1545,7 @@ mod tests {
         let offer: Offer = [("UTF8_STRING".to_string(), b"hi\n\0".to_vec())]
             .into_iter()
             .collect();
-        let out = synthesize_text_plain(offer);
+        let out = synth(offer);
         assert_eq!(out.get("text/plain").map(Vec::as_slice), Some(&b"hi"[..]));
         assert_eq!(
             out.get("text/plain;charset=utf-8").map(Vec::as_slice),
@@ -1488,9 +1565,7 @@ mod tests {
             .collect();
         // Only one trailing terminator is removed: "a\n\r\n" -> "a\n".
         assert_eq!(
-            synthesize_text_plain(offer)
-                .get("text/plain")
-                .map(Vec::as_slice),
+            synth(offer).get("text/plain").map(Vec::as_slice),
             Some(&b"a\n"[..])
         );
     }
@@ -1502,17 +1577,13 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(
-            synthesize_text_plain(utf8)
-                .get("text/plain")
-                .map(Vec::as_slice),
+            synth(utf8).get("text/plain").map(Vec::as_slice),
             Some("é".as_bytes())
         );
         // Non-UTF-8 TEXT falls back to latin-1.
         let latin: Offer = [("TEXT".to_string(), vec![0xE9])].into_iter().collect();
         assert_eq!(
-            synthesize_text_plain(latin)
-                .get("text/plain")
-                .map(Vec::as_slice),
+            synth(latin).get("text/plain").map(Vec::as_slice),
             Some(&[0xC3u8, 0xA9][..])
         );
     }
@@ -1530,7 +1601,7 @@ mod tests {
         .into_iter()
         .collect();
         // Budget fits html + plain (54) but not png; png is the only drop.
-        let capped = cap_to_payload_size(offer, 60);
+        let capped = cap(offer, 60);
         assert_eq!(
             capped.keys().map(String::as_str).collect::<Vec<_>>(),
             ["text/html", "text/plain"]
@@ -1550,7 +1621,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let capped = cap_to_payload_size(offer, 45); // fits two (40), not three (60)
+        let capped = cap(offer, 45); // fits two (40), not three (60)
         assert_eq!(
             capped.keys().map(String::as_str).collect::<Vec<_>>(),
             ["a/x", "b/x"]
