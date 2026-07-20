@@ -331,13 +331,20 @@ impl<C: Clipboard> SyncEngine<C> {
         })
     }
 
-    /// Selections this node syncs (Selection only when enabled).
-    fn synced_kinds(&self) -> Vec<SelectionKind> {
-        let mut kinds = vec![SelectionKind::Clipboard];
-        if self.cfg.sync_selection {
-            kinds.push(SelectionKind::Selection);
+    /// CLIPBOARD, plus SELECTION when `with_selection`. The two callers below
+    /// differ only in which config flag answers that.
+    fn kinds(with_selection: bool) -> &'static [SelectionKind] {
+        const BOTH: [SelectionKind; 2] = [SelectionKind::Clipboard, SelectionKind::Selection];
+        if with_selection {
+            &BOTH
+        } else {
+            &BOTH[..1]
         }
-        kinds
+    }
+
+    /// Selections this node syncs (Selection only when enabled).
+    fn synced_kinds(&self) -> &'static [SelectionKind] {
+        Self::kinds(self.cfg.sync_selection)
     }
 
     /// Selections this node cares about observing — CLIPBOARD always, SELECTION
@@ -346,12 +353,8 @@ impl<C: Clipboard> SyncEngine<C> {
     /// decide which selections to seed; the run loop itself receives every
     /// selection the backend delivers, regardless of this set. Broader than
     /// `synced_kinds` (SELECTION may be observed but not synced).
-    fn watched_kinds(&self) -> Vec<SelectionKind> {
-        let mut kinds = vec![SelectionKind::Clipboard];
-        if self.cfg.watch_selection() {
-            kinds.push(SelectionKind::Selection);
-        }
-        kinds
+    fn watched_kinds(&self) -> &'static [SelectionKind] {
+        Self::kinds(self.cfg.watch_selection())
     }
 
     fn may_send(&self, kind: SelectionKind) -> bool {
@@ -511,7 +514,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// normally.
     async fn prime(&self) {
         let synced = self.synced_kinds();
-        for kind in self.watched_kinds() {
+        for &kind in self.watched_kinds() {
             let Some(raw) = self.read_selection(kind).await else {
                 continue;
             };
@@ -744,6 +747,13 @@ impl<C: Clipboard> SyncEngine<C> {
     async fn handle_batch(&self, batch: Vec<SelectionKind>) {
         // Phase 1: read & classify. `read_cache` holds every read (incl. echoes) so
         // a Mirror reconcile can reuse a partner that fired this batch.
+        //
+        // That reconcile is its only consumer, and `plan_batch` emits a Mirror
+        // write only with ownership off and a link direction configured. Under
+        // any other config, caching would clone a whole offer per copy — up to
+        // `max_payload_size` — for something nothing reads, so don't.
+        let cache_reads =
+            !self.cfg.take_ownership && self.cfg.link_selections != LinkSelections::OFF;
         let mut reads: IndexMap<SelectionKind, Offer> = IndexMap::new();
         let mut read_cache: HashMap<SelectionKind, Offer> = HashMap::new();
         for kind in batch {
@@ -762,7 +772,9 @@ impl<C: Clipboard> SyncEngine<C> {
                 Some(h) => h == content_hash(&raw),
                 None => false,
             };
-            read_cache.insert(kind, raw.clone());
+            if cache_reads {
+                read_cache.insert(kind, raw.clone());
+            }
             if is_echo {
                 continue; // our own write echoing back — drop, no propagation
             }
@@ -928,7 +940,7 @@ impl<C: Clipboard> SyncEngine<C> {
         if !self.cfg.resync_on_connect || self.cfg.direction == Direction::ReceiveOnly {
             return;
         }
-        for kind in self.synced_kinds() {
+        for &kind in self.synced_kinds() {
             let Some(state) = self.current.lock().unwrap().get(&kind).copied() else {
                 continue;
             };

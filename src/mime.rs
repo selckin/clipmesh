@@ -730,20 +730,19 @@ fn quoted_key_repr(k: &str) -> String {
 /// Classify a `[rules]` value for the report: its verdict, and the size cap as
 /// written (only when the cap is a usable size).
 fn describe_value(item: &Item) -> (Verdict, Option<String>) {
-    match rule_fields(item) {
-        None => (Verdict::Invalid, None),
-        Some((rule, max)) => {
-            let verdict = match rule {
-                "allow" => Verdict::Allow,
-                "deny" => Verdict::Deny,
-                _ => Verdict::Invalid,
-            };
-            let max = max
-                .filter(|m| matches!(parse_size(m), Ok(n) if n > 0))
-                .map(str::to_string);
-            (verdict, max)
-        }
-    }
+    let Some((rule, max)) = rule_fields(item) else {
+        return (Verdict::Invalid, None);
+    };
+    // Both halves defer to the definitions `parse_rule` itself uses, so the
+    // report can't disagree with the rule actually applied. The verdict is asked
+    // for with no cap, since a bad cap doesn't make the verdict invalid.
+    let verdict = match parse_rule(rule, None) {
+        Some(r) if r.allow => Verdict::Allow,
+        Some(_) => Verdict::Deny,
+        None => Verdict::Invalid,
+    };
+    // Echo the cap as the user wrote it, but only when it's one that survives.
+    (verdict, usable_cap(max).and(max).map(str::to_string))
 }
 
 /// Render one `[rules]` entry as a clean, copy-pasteable `"key" = value` line
@@ -820,16 +819,20 @@ fn parse_rule(rule: &str, max: Option<&str>) -> Option<MimeRule> {
         "deny" => false,
         _ => return None,
     };
-    // A bad or zero-byte cap is dropped (the rule still applies); a 0-byte cap
-    // would make `allow` behave as `deny` since nothing is `<= 0`.
-    let max_size = match max {
-        Some(s) => match parse_size(s) {
-            Ok(0) | Err(_) => None,
-            Ok(v) => Some(v),
-        },
-        None => None,
-    };
-    Some(MimeRule { allow, max_size })
+    Some(MimeRule {
+        allow,
+        max_size: usable_cap(max),
+    })
+}
+
+/// A per-type size cap as a byte count, or `None` when there is none to honour.
+/// A bad or zero-byte cap is dropped (the rule still applies); a 0-byte cap
+/// would make `allow` behave as `deny` since nothing is `<= 0`.
+fn usable_cap(max: Option<&str>) -> Option<usize> {
+    match parse_size(max?) {
+        Ok(0) | Err(_) => None,
+        Ok(v) => Some(v),
+    }
 }
 
 /// Warn (once, at load/reload) about `[rules]` entries that aren't usable, so a
