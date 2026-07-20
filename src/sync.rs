@@ -8,11 +8,11 @@ use crate::protocol::{
     Hashed, Message, Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
 };
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub const SENSITIVE_MIME: &str = "x-kde-passwordManagerHint";
@@ -66,6 +66,21 @@ fn synthesize_text_plain(content: Hashed) -> Hashed {
         out.insert(k, v);
     }
     Hashed::new(out)
+}
+
+/// A rough human duration for a log line — days once there are enough of them,
+/// hours otherwise. Deliberately not a general formatter: it exists so the
+/// clock-skew message can say "about 6 days" instead of a bare millisecond
+/// count, which is the difference between an operator recognising a dead RTC and
+/// not.
+fn approx_duration_ms(ms: u64) -> String {
+    let hours = ms / 3_600_000;
+    match hours {
+        0 => "less than an hour".to_string(),
+        1 => "an hour".to_string(),
+        2..=47 => format!("{hours} hours"),
+        _ => format!("{} days", hours / 24),
+    }
 }
 
 /// Keep only the representations matching a narrowed request, or `None` if that
@@ -174,6 +189,10 @@ pub struct SyncEngine<C> {
     /// Hybrid logical clock: max of wall-clock ms and the highest stamp
     /// seen, so reordered or modestly skewed updates still order sanely.
     clock: Mutex<u64>,
+    /// Peers whose stamps the skew guard is currently refusing. Only used to
+    /// tell "one peer's clock is broken" from "this host's clock is broken" —
+    /// see [`note_skew_rejection`](SyncEngine::note_skew_rejection).
+    skew_rejected: Mutex<HashSet<Uuid>>,
     /// Per-type allow/deny rules, shared with the file watcher (`fswatch`),
     /// which reloads them on external edits. `apply_mime_rules` reloads only
     /// when it's about to record a new type, so the common capture path does no
@@ -519,6 +538,7 @@ impl<C: Clipboard> SyncEngine<C> {
             cfg,
             current: Mutex::new(HashMap::new()),
             clock: Mutex::new(0),
+            skew_rejected: Mutex::new(HashSet::new()),
             mime_rules,
             rules_changed_tx,
         })
@@ -569,13 +589,58 @@ impl<C: Clipboard> SyncEngine<C> {
     fn accept_stamp(&self, v: Version, from: Uuid, what: &str) -> bool {
         if v.stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
             warn!(
-                "rejecting {what} from peer {from}: timestamp {} is implausibly far in the future (peer clock skew?)",
+                "rejecting {what} from peer {from}: timestamp {} is implausibly far in the future (clock skew?)",
                 v.stamp
             );
+            self.note_skew_rejection(from, v.stamp);
             return false;
         }
+        // This peer agrees with our clock, so it is no longer evidence that ours
+        // is the broken one.
+        self.skew_rejected.lock().unwrap().remove(&from);
         self.observe(v.stamp);
         true
+    }
+
+    /// Record that `from`'s stamp was refused, and say so plainly once *every*
+    /// connected peer has been refused.
+    ///
+    /// The guard can only measure "implausibly far in the future" against this
+    /// host's own clock, so it cannot tell a peer whose clock is wrong from a
+    /// clock that is wrong here — and both produce the same warning, which blames
+    /// the peer. The two do differ in scope: a broken peer is one outlier among
+    /// peers, while a clock that is wrong locally makes *every* peer an outlier.
+    ///
+    /// Worth saying out loud, because the failure is quiet and one-directional.
+    /// This node keeps sending normally, so its own copies still propagate; only
+    /// inbound clips and rules pushes are dropped. The mesh looks half-alive, and
+    /// every line about it points at the peers whose clocks are in fact correct.
+    fn note_skew_rejection(&self, from: Uuid, stamp: u64) {
+        if !self.local_clock_is_the_outlier(from) {
+            return;
+        }
+        let peers = self.mesh.peer_count();
+        let now = now_ms();
+        error!(
+            "refused stamps from all {peers} connected peer(s): this host's clock \
+             (epoch-ms {now}) is about {} behind theirs, so it is almost certainly the \
+             one that is wrong, not theirs. Inbound clipboard sync stays disabled \
+             until it is corrected — check NTP and the RTC.",
+            approx_duration_ms(stamp.saturating_sub(now))
+        );
+    }
+
+    /// Whether refusing `from` just made the refusal unanimous across every
+    /// connected peer — the signature of a local clock that is wrong, rather
+    /// than one peer's.
+    ///
+    /// True at most once per newly-complete set, so a stream of refused messages
+    /// reports once rather than on every one; a peer whose stamp is later
+    /// accepted drops out of the set and can make it complete again.
+    fn local_clock_is_the_outlier(&self, from: Uuid) -> bool {
+        let peers = self.mesh.peer_count();
+        let mut rejected = self.skew_rejected.lock().unwrap();
+        rejected.insert(from) && peers > 0 && rejected.len() >= peers
     }
 
     /// Main loop. Debounce lives in the select as a deadline arm so that a
@@ -3660,6 +3725,46 @@ mod tests {
             rules_toml(&[("image/png", "deny")]),
             "implausibly-future rules must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn a_lagging_local_clock_is_named_once_every_peer_is_refused() {
+        // The skew guard measures "implausibly far in the future" against THIS
+        // host's clock, so a local clock lagging the mesh refuses every peer
+        // while still sending normally — a half-alive mesh in which every log
+        // line blames the peers whose clocks are in fact correct. One refused
+        // peer is an outlier among peers; all of them is us.
+        let w = engine(MockClipboard::new(), Config::for_test("s"));
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        w.mesh.register(a, tx_a, PeerRole::Peer);
+        w.mesh.register(b, tx_b, PeerRole::Peer);
+
+        assert!(
+            !w.engine.local_clock_is_the_outlier(a),
+            "one refused peer out of two is that peer's problem"
+        );
+        assert!(
+            w.engine.local_clock_is_the_outlier(b),
+            "every peer refused means this host is the outlier"
+        );
+        assert!(
+            !w.engine.local_clock_is_the_outlier(a) && !w.engine.local_clock_is_the_outlier(b),
+            "reported once, not on every refused message"
+        );
+
+        // A peer we then agree with is no longer evidence against our clock.
+        assert!(w.engine.accept_stamp(Version::new(now_ms(), a), a, "Clip"));
+        assert!(w.engine.local_clock_is_the_outlier(a));
+    }
+
+    #[test]
+    fn approx_duration_reads_as_hours_then_days() {
+        assert_eq!(approx_duration_ms(0), "less than an hour");
+        assert_eq!(approx_duration_ms(3_600_000), "an hour");
+        assert_eq!(approx_duration_ms(5 * 3_600_000), "5 hours");
+        assert_eq!(approx_duration_ms(6 * 24 * 3_600_000), "6 days");
     }
 
     #[tokio::test]
