@@ -599,25 +599,22 @@ impl<C: Clipboard> SyncEngine<C> {
     ) {
         let mut watch = self.clipboard.watch(&self.watched_kinds());
 
-        // Adopt the rules file's persisted version into the clock so the next
-        // local edit outranks it after a restart.
-        {
-            let own_id = self.mesh.own_id();
-            // Read inline, deliberately: `with_rules` exists to keep file I/O out
-            // of the select loop, and the loop has not started yet, so there is
-            // nothing here to stall. It also must not yield — an await between
-            // `watch()` above and `prime`'s spawn below lets a copy made right
-            // after startup land before prime reads, and prime would then record
-            // that copy as engine-written and suppress it.
-            let stamp = lock_rules(&self.mime_rules).version(own_id).stamp;
-            self.observe(stamp);
-        }
-
         // Prime concurrently: reading the existing clipboard can block on a slow
         // selection owner, and must NOT stall inbound/connect handling (a node
         // would otherwise be unreachable on the mesh until the local selection
         // changed). Local changes are buffered (not broadcast) until priming has
         // recorded the restored clipboard, so it isn't re-sent as fresh content.
+        //
+        // Spawned FIRST, immediately after `watch()`, and nothing may be inserted
+        // between the two. `prime` attributes whatever it reads to "what was on
+        // the clipboard at startup", so every moment between the watcher going
+        // live and prime's read is a window in which a real user copy is mistaken
+        // for restored content — suppressed as an echo, and seeded into `current`
+        // at stamp 0 where a peer's older clipboard outranks it. The window
+        // cannot be closed without reading before `watch()` (which would stall
+        // the loop for a slow selection owner) so it is kept as short as
+        // possible instead. `a_copy_made_right_after_startup_is_still_broadcast`
+        // fails if anything yieldable creeps in here.
         let (primed_tx, mut primed_rx) = tokio::sync::oneshot::channel();
         {
             let me = Arc::clone(&self);
@@ -627,6 +624,17 @@ impl<C: Clipboard> SyncEngine<C> {
             });
         }
         let mut primed = false;
+
+        // Adopt the rules file's persisted version into the clock so the next
+        // local edit outranks it after a restart. Inline rather than through
+        // `with_rules`: the select loop has not started, so there is nothing to
+        // stall — and it sits *below* the prime spawn so it cannot lengthen the
+        // window described above.
+        {
+            let own_id = self.mesh.own_id();
+            let stamp = lock_rules(&self.mime_rules).version(own_id).stamp;
+            self.observe(stamp);
+        }
 
         let window = Duration::from_millis(self.cfg.debounce_ms);
         let mut pending: Vec<SelectionKind> = Vec::new();
@@ -2049,6 +2057,28 @@ mod tests {
             h.clip.get(kind).as_ref() == Some(o)
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_made_right_after_startup_is_still_broadcast() {
+        // `prime` attributes whatever it reads to "the clipboard at startup", so
+        // anything that delays its read past a real copy makes that copy look
+        // restored: dropped as an echo, and recorded at stamp 0 where a peer's
+        // older content outranks it. `start` returns as soon as the watcher is
+        // live, so this copies into exactly that window.
+        //
+        // Real time, not paused: the failure mode is a scheduling order, and
+        // auto-advance would hide it. This is the test that goes red if anything
+        // yieldable is added between `watch()` and prime's spawn in `run`.
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("raced"));
+        let (kind, _, o) = recv_clip(&mut h).await;
+        assert_eq!(kind, SelectionKind::Clipboard);
+        assert_eq!(
+            o,
+            offer("raced"),
+            "a copy landing during startup must propagate, not be mistaken for restored content"
+        );
     }
 
     #[tokio::test(start_paused = true)]
