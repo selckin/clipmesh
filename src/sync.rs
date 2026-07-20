@@ -228,6 +228,74 @@ pub struct SyncEngine<C> {
     last_written: Mutex<HashMap<SelectionKind, [u8; 32]>>,
 }
 
+/// What a pipeline does with the per-type MIME rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RulesStage {
+    /// Apply them, and append types not seen before so the user can curate
+    /// them. Local capture only.
+    Record,
+    /// Apply them without appending — a peer must not be able to write to our
+    /// rules file.
+    Apply,
+    /// Don't consult them.
+    Skip,
+}
+
+/// The content transforms one pipeline applies, in order.
+///
+/// There are four pipelines and they differ in ways a single boolean can't
+/// express; declaring them side by side is the point, so a fifth is a new
+/// constant rather than another flag threaded through a shared function.
+/// Sensitivity is not listed: it gates every pipeline unconditionally.
+#[derive(Debug, Clone, Copy)]
+struct Stages {
+    /// Back-fill `text/plain` from a legacy X11 atom. Capture-side only — it is
+    /// a courtesy to local legacy apps, not something to do to a peer's content.
+    synthesize: bool,
+    rules: RulesStage,
+    /// Trim to `max_payload_size`.
+    cap: bool,
+}
+
+impl Stages {
+    /// Locally captured content heading for the mesh: everything applies.
+    const BROADCAST: Stages = Stages {
+        synthesize: true,
+        rules: RulesStage::Record,
+        cap: true,
+    };
+    /// A peer's offer being applied locally. The receiver enforces its own
+    /// content policy (configs differ between peers, and a node must not write
+    /// contents it would never have sent), but records nothing.
+    const INBOUND: Stages = Stages {
+        synthesize: false,
+        rules: RulesStage::Apply,
+        cap: true,
+    };
+    /// The `take_ownership` re-offer. Synthesis is on so the back-filled
+    /// `text/plain` pastes on this host too, and the cap keeps the rewrite
+    /// round-tripping the read-back budget — an over-budget rewrite would be
+    /// re-read smaller, miss its marker, and churn.
+    ///
+    /// Rules are deliberately skipped: a deny rule governs what leaves this
+    /// host, not what the user may paste locally. Filtering here would strip
+    /// types out of the user's own clipboard.
+    const OWN: Stages = Stages {
+        synthesize: true,
+        rules: RulesStage::Skip,
+        cap: true,
+    };
+    /// The local bridge mirror. Deliberately unfiltered, so locally denied or
+    /// oversized representations still reach the partner selection — the bridge
+    /// moves content between two selections on one host and never touches the
+    /// wire.
+    const MIRROR: Stages = Stages {
+        synthesize: false,
+        rules: RulesStage::Skip,
+        cap: false,
+    };
+}
+
 /// Why the engine writes a selection during a batch — selects the reconcile
 /// rule in `execute_write`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +306,16 @@ enum Provenance {
     /// Local-bridge mirror with `take_ownership` off: write only when the
     /// partner does not already hold this content (reconcile against drift).
     Mirror,
+}
+
+impl Provenance {
+    /// The transforms this kind of write applies.
+    fn stages(self) -> Stages {
+        match self {
+            Provenance::Own => Stages::OWN,
+            Provenance::Mirror => Stages::MIRROR,
+        }
+    }
 }
 
 /// The broadcasts and writes a debounce batch produces, computed up front so
@@ -606,7 +684,7 @@ impl<C: Clipboard> SyncEngine<C> {
             if !synced.contains(&kind) {
                 continue;
             }
-            if let Some(offer) = self.filter(raw, true) {
+            if let Some(offer) = self.apply_stages(raw, Stages::BROADCAST) {
                 let hash = content_hash(&offer);
                 debug!(
                     "primed existing {kind:?} clipboard ({})",
@@ -632,55 +710,49 @@ impl<C: Clipboard> SyncEngine<C> {
         self.cfg.exclude_sensitive && is_sensitive(offer)
     }
 
-    /// Apply the content filters (sensitive, MIME, size) to an already-read
-    /// offer. Returns None when there is nothing syncable. `record_unseen`
-    /// records brand-new types in the rules file — true for locally-captured
-    /// content (so the user can curate what they copy), false for inbound peer
-    /// offers (so a peer can't write to our rules file).
-    fn filter(&self, offer: Offer, record_unseen: bool) -> Option<Offer> {
+    /// Run the declared [`Stages`] over an already-read offer. Returns `None`
+    /// when nothing syncable survives.
+    ///
+    /// Sensitivity is checked first and is not a stage: it applies to every
+    /// pipeline unconditionally, and checking it before synthesis skips needless
+    /// work on secret content (synthesis never changes the verdict — it adds no
+    /// password-manager hint).
+    fn apply_stages(&self, offer: Offer, stages: Stages) -> Option<Offer> {
         if offer.is_empty() {
             debug!("nothing to sync: the clipboard is empty");
             return None;
         }
-        // Check sensitivity before synthesizing — synthesis never changes the
-        // verdict (it adds no password-manager hint), so this skips needless work
-        // on secret content and keeps the stage order consistent with
-        // `take_ownership_of`.
         if self.excludes_sensitive(&offer) {
             debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
             return None;
         }
-        // Capture side only (record_unseen): optionally back-fill text/plain from
-        // a legacy UTF8_STRING/STRING/TEXT atom before the rules and cap apply, so
-        // the synthesized reps are curated and budgeted like any other type.
-        let offer = if record_unseen && self.cfg.synthesize_text_plain {
+        let offer = if stages.synthesize && self.cfg.synthesize_text_plain {
             synthesize_text_plain(offer)
         } else {
             offer
         };
-        let offer = self.apply_mime_rules(offer, record_unseen);
-        if offer.is_empty() {
-            debug!("nothing to sync: every MIME type was blocked by the rules");
-            return None;
+        let offer = match stages.rules {
+            RulesStage::Skip => offer,
+            rules => {
+                let offer = self.apply_mime_rules(offer, rules == RulesStage::Record);
+                if offer.is_empty() {
+                    debug!("nothing to sync: every MIME type was blocked by the rules");
+                    return None;
+                }
+                offer
+            }
+        };
+        if stages.cap {
+            let offer = cap_to_payload_size(offer, self.cfg.max_payload_size);
+            if offer.is_empty() {
+                debug!("nothing to sync: everything was over the max_payload_size budget");
+                return None;
+            }
+            return Some(offer);
         }
-        let offer = cap_to_payload_size(offer, self.cfg.max_payload_size);
-        if offer.is_empty() {
-            debug!("nothing to sync: everything was over the max_payload_size budget");
-            return None;
-        }
-        Some(offer)
+        (!offer.is_empty()).then_some(offer)
     }
 
-    /// Drop representations blocked by the per-type rules — denied types, or
-    /// ones over their per-type max size. When `record_unseen`, brand-new types
-    /// are added to the rules with the configured default and persisted so the
-    /// user can tune them. Live external edits are handled by the inotify
-    /// watcher (see fswatch), which shares this ruleset; the hot path only
-    /// touches disk when there's actually a new type to record (and reloads
-    /// first, so the append merges onto the user's latest edits rather than
-    /// clobbering them). Takes the rules lock via `lock_rules`, which recovers a
-    /// poisoned mutex rather than cascading the
-    /// panic to the watcher thread.
     fn apply_mime_rules(&self, offer: Offer, record_unseen: bool) -> Offer {
         let mut rules = lock_rules(&self.mime_rules);
         if record_unseen {
@@ -741,7 +813,7 @@ impl<C: Clipboard> SyncEngine<C> {
     async fn capture_offer(&self, kind: SelectionKind) -> Option<Offer> {
         let offer = self.read_selection(kind).await?;
         // Local content: record brand-new types so the user can curate them.
-        self.filter(offer, true)
+        self.apply_stages(offer, Stages::BROADCAST)
     }
 
     /// Broadcast `raw` (the freshly-read content of `kind`) to the mesh after
@@ -758,7 +830,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // The bracketed list means "what was copied" in every outcome below
         // (consistent with the received-update summary).
         let copied = self.cfg.verbose.then(|| describe_offer(&raw));
-        let Some(offer) = self.filter(raw, true) else {
+        let Some(offer) = self.apply_stages(raw, Stages::BROADCAST) else {
             if let Some(copied) = &copied {
                 info!("copied {kind:?} [{copied}]: not sent (nothing passed the content filters)");
             }
@@ -869,32 +941,12 @@ impl<C: Clipboard> SyncEngine<C> {
         prov: Provenance,
         read_cache: &HashMap<SelectionKind, Offer>,
     ) {
-        // Never re-offer or mirror a password-manager secret.
-        if self.excludes_sensitive(&content) {
+        let Some(final_offer) = self.apply_stages(content, prov.stages()) else {
             if prov == Provenance::Own {
-                debug!("not taking ownership of {kind:?}: flagged sensitive");
+                debug!("not taking ownership of {kind:?}: nothing left after its stages");
             }
             return;
-        }
-        let final_offer = match prov {
-            Provenance::Own => {
-                let owned = if self.cfg.synthesize_text_plain {
-                    synthesize_text_plain(content)
-                } else {
-                    content
-                };
-                // Cap so the owned offer round-trips the read-back budget (see the
-                // original take_ownership_of note): an over-budget rewrite would be
-                // re-read smaller, miss its marker, and churn.
-                cap_to_payload_size(owned, self.cfg.max_payload_size)
-            }
-            // The bridge intentionally bypasses the MIME/size filters so locally
-            // denied or oversized reps still reach the partner.
-            Provenance::Mirror => content,
         };
-        if final_offer.is_empty() {
-            return;
-        }
         let h = content_hash(&final_offer);
         if prov == Provenance::Mirror {
             // Reconcile against the partner's ACTUAL content (handles out-of-band
@@ -1108,7 +1160,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // between peers, and a node must not write contents it would never
         // have sent (e.g. password-manager secrets, or denied MIME types). Do
         // NOT record unseen types here — a peer must not write to our rules file.
-        let Some(offer) = self.filter(offer, false) else {
+        let Some(offer) = self.apply_stages(offer, Stages::INBOUND) else {
             debug!("dropping inbound {kind:?} from peer {from}: our content filters removed everything");
             return "dropped (content filters removed everything)";
         };
