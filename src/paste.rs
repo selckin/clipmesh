@@ -70,24 +70,41 @@ impl PasteArgs {
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
-            let mut value = |flag: &str| {
-                it.next()
-                    .cloned()
+            // Real wl-paste parses with getopt_long, so `--type=text/plain` is
+            // as valid as `--type text/plain`. Splitting here means each flag is
+            // still written once, in one form — impersonation that rejected a
+            // spelling the real tool accepts would break existing scripts with
+            // an error naming a flag they know works.
+            let (flag, mut inline) = match arg.split_once('=') {
+                Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+                _ => (arg.as_str(), None),
+            };
+            let mut value = || {
+                inline
+                    .take()
+                    .map(Ok)
+                    .unwrap_or_else(|| it.next().cloned().context("needs a value"))
                     .with_context(|| format!("{flag} needs a value"))
             };
-            match arg.as_str() {
-                "-t" | "--type" => out.type_ = Some(value(arg)?),
+            match flag {
+                "-t" | "--type" => out.type_ = Some(value()?),
                 "-l" | "--list-types" => out.list = true,
                 "-n" | "--no-newline" => out.no_newline = true,
                 "-p" | "--primary" => out.kind = SelectionKind::Selection,
-                "--node" => out.node = Some(value(arg)?),
-                "--config" => out.config = Some(PathBuf::from(value(arg)?)),
+                "--node" => out.node = Some(value()?),
+                "--config" => out.config = Some(PathBuf::from(value()?)),
                 "-w" | "--watch" => {
                     bail!(
-                        "{arg} is not supported by clipmesh's wl-paste mode (one-shot paste only)"
+                        "{flag} is not supported by clipmesh's wl-paste mode (one-shot paste only)"
                     )
                 }
                 other => bail!("unknown paste flag: {other}"),
+            }
+            // An inline value no arm consumed: the flag doesn't take one, and
+            // silently dropping it would paste something other than what was
+            // asked for.
+            if inline.is_some() {
+                bail!("{flag} does not take a value");
             }
         }
         Ok(out)
@@ -549,6 +566,31 @@ mod tests {
         assert!(a.list);
         assert!(a.no_newline);
         assert_eq!(a.type_.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn parse_accepts_the_gnu_inline_value_form() {
+        // Real wl-paste parses with getopt_long, so a script written against it
+        // may use either spelling; rejecting one breaks the impersonation with
+        // an error naming a flag that demonstrably works elsewhere.
+        let a = PasteArgs::parse(&args(&[
+            "--type=text/plain",
+            "--node=desktop",
+            "--config=/tmp/c.toml",
+        ]))
+        .unwrap();
+        assert_eq!(a.type_.as_deref(), Some("text/plain"));
+        assert_eq!(a.node.as_deref(), Some("desktop"));
+        assert_eq!(a.config, Some(PathBuf::from("/tmp/c.toml")));
+
+        // A value carried by a flag that takes none is a mistake, not something
+        // to drop silently.
+        assert!(PasteArgs::parse(&args(&["--list-types=yes"])).is_err());
+        // An empty inline value is still a value, not a missing one.
+        assert_eq!(
+            PasteArgs::parse(&args(&["--type="])).unwrap().type_,
+            Some(String::new())
+        );
     }
 
     #[test]
