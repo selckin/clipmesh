@@ -1176,7 +1176,11 @@ impl<C: Clipboard> SyncEngine<C> {
     }
 
     /// Dispatch an inbound message from a peer to the right handler.
-    async fn on_inbound(&self, from: Uuid, msg: Message) {
+    ///
+    /// Everything here is awaited inline on the engine's single select-loop
+    /// task, so a handler that blocks blocks the whole engine — except `Get`,
+    /// which is deliberately spawned; see there.
+    async fn on_inbound(self: &Arc<Self>, from: Uuid, msg: Message) {
         match msg {
             Message::Clip {
                 kind,
@@ -1185,7 +1189,18 @@ impl<C: Clipboard> SyncEngine<C> {
                 version,
             } => self.on_inbound_clip(from, kind, hash, offer, version).await,
             Message::Rules { version, body } => self.on_inbound_rules(from, version, body).await,
-            Message::Get { kind, want } => self.on_get(from, kind, want).await,
+            // Answering reads the clipboard live, bounded only by
+            // `ClipboardIo::READ_TIMEOUT`. Awaited here, an unresponsive
+            // selection owner — the case that timeout exists for — would stall
+            // local captures, inbound clips and reconnect resyncs for its full
+            // duration, once per request, and a client can pipeline as many
+            // requests as the inbound channel holds. Nothing about answering a
+            // query needs ordering against the loop, so it gets its own task:
+            // the same reasoning that put rules-file I/O on the blocking pool.
+            Message::Get { kind, want } => {
+                let engine = Arc::clone(self);
+                tokio::spawn(async move { engine.on_get(from, kind, want).await });
+            }
             Message::Hello { .. } => {
                 warn!("ignoring an unexpected Hello from peer {from} after handshake")
             }
@@ -3645,6 +3660,35 @@ mod tests {
             rules_toml(&[("image/png", "deny")]),
             "implausibly-future rules must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_paste_request_does_not_stall_the_engine_loop() {
+        // `serve_get` reads the clipboard live, bounded only by READ_TIMEOUT
+        // (5s). Awaited on the select loop, one request against an unresponsive
+        // selection owner froze local captures, inbound clips and reconnect
+        // resyncs for that whole window — and requests can be pipelined.
+        let kind = SelectionKind::Clipboard;
+        let clip = MockClipboard::new();
+        clip.seed(kind, offer("hello"));
+        let e = engine(clip.clone(), Config::for_test("s")).engine;
+
+        clip.block_reads();
+        // Well under READ_TIMEOUT: the point is that dispatch does not wait for
+        // the read at all, not that it waits a bit less.
+        timeout(
+            Duration::from_millis(200),
+            e.on_inbound(
+                Uuid::new_v4(),
+                Message::Get {
+                    kind,
+                    want: GetWant::All,
+                },
+            ),
+        )
+        .await
+        .expect("a paste request blocked the engine loop on a clipboard read");
+        clip.allow_reads();
     }
 
     #[tokio::test]

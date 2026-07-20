@@ -393,6 +393,7 @@ fn run(
             .context("reading inotify events")?;
         let mut changed = PerTarget::default();
         let mut reresolve = PerTarget::default();
+        let mut dead = PerTarget::default();
 
         for event in events {
             if event.mask.contains(EventMask::Q_OVERFLOW) {
@@ -402,6 +403,22 @@ fn run(
                 warn!("inotify event queue overflowed; re-checking config and MIME rules");
                 changed = PerTarget::ALL;
                 reresolve = PerTarget::ALL;
+                continue;
+            }
+            // The kernel removed this watch: the directory was deleted, moved or
+            // unmounted (re-stowing a dotfiles tree does exactly that). IGNORED
+            // is the authoritative signal — it follows DELETE_SELF and every
+            // other removal — and it carries no `event.name`, so the guard below
+            // dropped it and nothing else noticed: `entries` kept a descriptor no
+            // event can ever match again, and once the last watch was gone
+            // `read_events_blocking` blocked forever instead of erroring, so
+            // `supervise` never restarted us either. The process stayed up and
+            // permanently deaf to both config restarts and rules reloads, with
+            // nothing logged.
+            if event.mask.contains(EventMask::IGNORED) {
+                for entry in entries.iter().filter(|e| e.wd == event.wd) {
+                    dead.set(entry.target);
+                }
                 continue;
             }
             let Some(name) = event.name else { continue };
@@ -431,6 +448,30 @@ fn run(
                     reresolve.set(entry.target);
                 }
             }
+        }
+
+        // Re-establish anything the kernel dropped, from scratch: every entry for
+        // that file names a descriptor that is gone. Failing here — the usual
+        // case, since the directory is typically recreated a moment later —
+        // returns the error rather than looping, so `supervise` restarts the
+        // watcher on its backoff schedule and keeps retrying until the directory
+        // is back. Blocking forever on an empty watch list is the one outcome
+        // there is no recovery from.
+        for target in Target::ALL {
+            let (true, Some(path)) = (dead.get(target), path_of(target)) else {
+                continue;
+            };
+            warn!(
+                "the kernel dropped the watch on {} {} (its directory went away); \
+                 re-establishing it",
+                target.label(),
+                path.display()
+            );
+            entries.retain(|e| e.target != target);
+            add_file_watches(&mut inotify, &mut masks, &mut entries, target, path)?;
+            // Anything that happened while we were unwatched was missed, so
+            // re-check the file rather than assuming it is unchanged.
+            changed.set(target);
         }
 
         for target in Target::ALL {
@@ -586,6 +627,57 @@ mod tests {
             || std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
             || rx.try_recv().is_ok(),
             "editing the symlink target did not ping the engine",
+        );
+    }
+
+    #[test]
+    fn a_watched_directory_that_is_replaced_is_watched_again() {
+        // Re-stowing a dotfiles tree removes the config directory and recreates
+        // it. The kernel drops the watch and reports IGNORED, which carries no
+        // file name — so it was silently discarded, `entries` kept a dead
+        // descriptor, and with no watches left `read_events_blocking` blocked
+        // forever rather than erroring. Nothing restarted, nothing was logged,
+        // and the process stayed permanently deaf to config and rules changes.
+        let base = tempfile::tempdir().unwrap();
+        let cfg_dir = base.path().join("clipmesh");
+        std::fs::create_dir(&cfg_dir).unwrap();
+        let config_path = cfg_dir.join("config.toml");
+        let rules_path = cfg_dir.join("mimetypes");
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+        let rules = Arc::new(Mutex::new(MimeRules::load(
+            Some(rules_path.clone()),
+            MimePolicy::Deny,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        // Supervised, as in production: re-establishing may need a restart when
+        // the directory is briefly absent.
+        {
+            let (config_path, rules_path) = (config_path.clone(), rules_path.clone());
+            let (rules, tx) = (rules.clone(), tx.clone());
+            let (config_tx, config_rx) = tokio::sync::mpsc::channel(8);
+            thread::spawn(move || {
+                let _config_rx = config_rx;
+                watch_forever(&config_path, Some(&rules_path), &rules, &tx, &config_tx);
+            });
+        }
+
+        poll_until(
+            || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "watcher never went live",
+        );
+        while rx.try_recv().is_ok() {}
+
+        // The whole directory goes away and comes back, as `stow -R` does.
+        std::fs::remove_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir(&cfg_dir).unwrap();
+        std::fs::write(&config_path, "listen = \"x\"\npsk = \"s\"\n").unwrap();
+
+        poll_until(
+            || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "the watcher never recovered from its directory being replaced",
         );
     }
 
