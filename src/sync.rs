@@ -3,7 +3,7 @@ use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
-    content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind, Version,
+    content_hash, describe_offer, encode_frame, human_bytes, Message, Offer, SelectionKind, Version,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -665,7 +665,21 @@ impl<C: Clipboard> SyncEngine<C> {
                     }
                 },
                 peer = connects.recv() => match peer {
-                    Some(peer) => self.on_peer_connected(peer).await,
+                    Some(peer) => {
+                        // Peers reconnect in bursts — a switch or AP blip, a
+                        // laptop waking, this node restarting — and each
+                        // connect would otherwise re-read the clipboard and
+                        // re-serialize the same payload per peer. Drain the
+                        // rest of the burst first so the resync costs one read
+                        // and one encode for the whole group.
+                        let mut peers = vec![peer];
+                        while let Ok(more) = connects.try_recv() {
+                            if !peers.contains(&more) {
+                                peers.push(more);
+                            }
+                        }
+                        self.on_peers_connected(&peers).await
+                    }
                     None => {
                         warn!("connect-event channel closed; shutting down the sync engine");
                         break;
@@ -1079,7 +1093,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// gate clipboard content); gated only by `share_mime_rules` and having a
     /// file. Materialises the version header on first send so the version is
     /// pinned to disk and survives restarts.
-    fn resync_rules_to(&self, peer: Uuid) {
+    fn resync_rules_to(&self, peers: &[Uuid]) {
         if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
             return;
         }
@@ -1089,18 +1103,20 @@ impl<C: Clipboard> SyncEngine<C> {
         match snapshot {
             Ok(s) => {
                 debug!(
-                    "pushing shared MIME-rules to peer {peer} (stamp {})",
+                    "pushing shared MIME-rules to {} reconnected peer(s) (stamp {})",
+                    peers.len(),
                     s.version.stamp
                 );
-                self.mesh.send_to(
-                    peer,
-                    &Message::Rules {
-                        version: s.version,
-                        body: s.body,
-                    },
-                );
+                // Encode once for the whole burst; each peer gets a refcount.
+                let frame = encode_frame(&Message::Rules {
+                    version: s.version,
+                    body: s.body,
+                });
+                for &peer in peers {
+                    self.mesh.send_frame_to(peer, &frame);
+                }
             }
-            Err(e) => self.warn_snapshot_failed(e, &format!(" for peer {peer}")),
+            Err(e) => self.warn_snapshot_failed(e, &format!(" for {} peer(s)", peers.len())),
         }
     }
 
@@ -1108,9 +1124,9 @@ impl<C: Clipboard> SyncEngine<C> {
     /// without waiting for the next copy. The receiver orders it by
     /// `(stamp, origin)` like any other update, so two nodes resyncing at
     /// each other settle on the same content instead of swapping.
-    async fn on_peer_connected(&self, peer: Uuid) {
+    async fn on_peers_connected(&self, peers: &[Uuid]) {
         // Rules sharing is independent of clipboard direction/resync settings.
-        self.resync_rules_to(peer);
+        self.resync_rules_to(peers);
         if !self.cfg.resync_on_connect || self.cfg.direction == Direction::ReceiveOnly {
             return;
         }
@@ -1126,16 +1142,20 @@ impl<C: Clipboard> SyncEngine<C> {
             if content_hash(&offer) != state.hash {
                 continue;
             }
-            debug!("resyncing current {kind:?} to reconnected peer {peer}");
-            self.mesh.send_to(
-                peer,
-                &Message::Clip {
-                    kind,
-                    hash: state.hash,
-                    offer,
-                    version: state.version,
-                },
+            debug!(
+                "resyncing current {kind:?} to {} reconnected peer(s)",
+                peers.len()
             );
+            // One read and one encode for the whole burst, not per peer.
+            let frame = encode_frame(&Message::Clip {
+                kind,
+                hash: state.hash,
+                offer,
+                version: state.version,
+            });
+            for &peer in peers {
+                self.mesh.send_frame_to(peer, &frame);
+            }
         }
     }
 
@@ -2502,6 +2522,37 @@ mod tests {
             other => panic!("expected resync Clip, got {other:?}"),
         }
         // the pre-existing peer must not receive a duplicate
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resync_reaches_every_peer_of_a_reconnect_burst() {
+        // Several peers reconnecting at once (a switch blip, a laptop waking)
+        // are drained into one burst so the clipboard is read and encoded once.
+        // Every peer in the burst must still get its own resync — the sharing is
+        // of the encoded frame, not of the delivery.
+        let mut h = start(Config::for_test("s")).await;
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("current"));
+        recv_clip(&mut h).await; // consume the live broadcast
+
+        let mut rxs: Vec<_> = (0..3)
+            .map(|_| {
+                let (tx, rx) = mpsc::channel(8);
+                h.mesh.register(Uuid::new_v4(), tx);
+                rx
+            })
+            .collect();
+
+        for (i, rx) in rxs.iter_mut().enumerate() {
+            match recv_from(rx).await {
+                Message::Clip { offer: o, .. } => {
+                    assert_eq!(o, offer("current"), "peer {i} got the wrong resync")
+                }
+                other => panic!("peer {i}: expected resync Clip, got {other:?}"),
+            }
+        }
+        // and no duplicate to the peer that was already connected
         assert_no_broadcast(&mut h).await;
     }
 

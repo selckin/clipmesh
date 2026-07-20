@@ -25,6 +25,10 @@ pub struct SendHalf<W> {
     /// Ciphertext scratch, sized once to the largest a Noise record can be.
     /// Reused across sends rather than reallocated (and re-zeroed) per message.
     out: Vec<u8>,
+    /// Plaintext scratch for the first chunk (length prefix + its payload).
+    /// Reused for the same reason as `out`, and bounded by the same one-record
+    /// ceiling, so it adds no growth the connection wasn't already carrying.
+    head: Vec<u8>,
 }
 
 pub struct RecvHalf<R> {
@@ -84,6 +88,7 @@ where
             st: st.clone(),
             nonce: 0,
             out: vec![0u8; NOISE_MAX],
+            head: Vec::new(),
         },
         RecvHalf {
             io: rd,
@@ -140,12 +145,18 @@ impl<W: AsyncWrite + Unpin> SendHalf<W> {
         let len = u32::try_from(plaintext.len()).context("message too large for framing")?;
         let head_payload = plaintext.len().min(CHUNK - HEADER);
 
-        // Only the first chunk needs assembling; sized to what it actually
-        // holds, so a small message allocates a small buffer.
-        let mut head = Vec::with_capacity(HEADER + head_payload);
+        // Only the first chunk needs assembling. Moved out of `self` for the
+        // write (which needs `&mut self`) and put back after, so the capacity
+        // survives to the next send instead of being reallocated and refilled
+        // per message — a message at or over one chunk would otherwise allocate
+        // ~64 KiB every time, on every connection.
+        let mut head = std::mem::take(&mut self.head);
+        head.clear();
         head.extend_from_slice(&len.to_be_bytes());
         head.extend_from_slice(&plaintext[..head_payload]);
-        self.write_chunk(&head).await?;
+        let wrote = self.write_chunk(&head).await;
+        self.head = head;
+        wrote?;
 
         for chunk in plaintext[head_payload..].chunks(CHUNK) {
             self.write_chunk(chunk).await?;

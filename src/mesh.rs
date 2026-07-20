@@ -108,6 +108,16 @@ impl Mesh {
     /// Send a message to one peer's designated connection (used for
     /// targeted resyncs). Same try_send semantics as broadcast.
     pub fn send_to(&self, peer: Uuid, msg: &Message) {
+        self.send_frame_to(peer, &encode_frame(msg));
+    }
+
+    /// Send an already-encoded frame to one peer.
+    ///
+    /// Split from `send_to` so a caller with the same message for several peers
+    /// encodes it once and hands each a refcount, exactly as `broadcast` does —
+    /// otherwise a resync burst re-serializes a whole clipboard payload (up to
+    /// `max_payload_size`) per recipient.
+    pub fn send_frame_to(&self, peer: Uuid, frame: &Frame) {
         let target = self
             .peers
             .lock()
@@ -116,7 +126,7 @@ impl Mesh {
             .and_then(|conns| conns.first().map(|c| c.tx.clone()));
         match target {
             Some(tx) => {
-                if tx.try_send(encode_frame(msg)).is_err() {
+                if tx.try_send(frame.clone()).is_err() {
                     warn!(
                         "dropped targeted message to peer {peer}: its send queue is full or closed"
                     );
