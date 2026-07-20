@@ -324,11 +324,38 @@ impl Provenance {
     }
 }
 
+/// One planned act of propagation: which selection it acts on, and which of the
+/// batch's reads supplies the content.
+///
+/// The plan names its content rather than carrying it. Every payload a batch
+/// propagates is the content of some genuinely-changed selection — its own, or
+/// (for a mirrored partner) its bridge source — so `source` always indexes the
+/// batch's reads. That keeps planning a decision about *selections*, with no
+/// clipboard payload copied to reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Action {
+    /// The selection being broadcast or written.
+    target: SelectionKind,
+    /// The changed selection whose content fills it. Equal to `target` for a
+    /// genuine change; the bridge source for a mirrored partner.
+    source: SelectionKind,
+}
+
+impl Action {
+    /// A selection propagating its own content.
+    fn direct(kind: SelectionKind) -> Action {
+        Action {
+            target: kind,
+            source: kind,
+        }
+    }
+}
+
 /// The broadcasts and writes a debounce batch produces, computed up front so
 /// propagation never rides watch echoes. Each selection is written at most once.
 struct BatchPlan {
-    broadcasts: Vec<(SelectionKind, Offer)>,
-    writes: Vec<(SelectionKind, Offer, Provenance)>,
+    broadcasts: Vec<Action>,
+    writes: Vec<(Action, Provenance)>,
 }
 
 /// What this node does with one selection, decided once from the config.
@@ -426,36 +453,31 @@ fn link_partner(kind: SelectionKind, link: LinkSelections) -> Option<SelectionKi
 }
 
 /// Decide a batch's broadcasts and writes from its genuine local changes. Pure:
-/// no I/O and no content transforms (the `Own` synth+cap and the `Mirror`
-/// reconcile happen in `execute_write`). `reads` is every genuine user change
-/// this batch (echoes already removed), in batch order.
-fn plan_batch(
-    reads: &IndexMap<SelectionKind, Offer>,
-    link: LinkSelections,
-    own: bool,
-) -> BatchPlan {
+/// no I/O, no content transforms (the `Own` synth+cap and the `Mirror` reconcile
+/// happen in `execute_write`), and no clipboard payload at all — the decision
+/// depends only on *which* selections changed, so `changed` is the list of
+/// genuine user changes (echoes already removed) in batch order.
+fn plan_batch(changed: &[SelectionKind], link: LinkSelections, own: bool) -> BatchPlan {
+    // Every genuine change propagates its own content.
+    let direct: Vec<Action> = changed.iter().copied().map(Action::direct).collect();
+
     // Mirror targets: a selection some genuine change mirrors INTO that is not
     // itself a genuine change (direct-change-wins — never clobber a concurrent
     // user change). The two selections never share a partner (the mapping is a
     // bijection), so each target has a single source.
-    let mut mirror_targets: IndexMap<SelectionKind, Offer> = IndexMap::new();
-    for (&kind, raw) in reads {
-        if let Some(partner) = link_partner(kind, link) {
-            if !reads.contains_key(&partner) {
-                mirror_targets.insert(partner, raw.clone());
-            }
-        }
-    }
+    let mirrors: Vec<Action> = changed
+        .iter()
+        .filter_map(|&source| {
+            let target = link_partner(source, link)?;
+            (!changed.contains(&target)).then_some(Action { target, source })
+        })
+        .collect();
 
     // Broadcasts: every genuine change, then every mirror target (so a mirrored
     // partner still reaches the mesh, as today). The caller applies may_send +
     // content filters + mesh-current dedup, so a non-synced or unchanged
     // selection yields no actual send.
-    let broadcasts = reads
-        .iter()
-        .chain(&mirror_targets)
-        .map(|(&kind, raw)| (kind, raw.clone()))
-        .collect();
+    let broadcasts = direct.iter().chain(&mirrors).copied().collect();
 
     // Writes, each selection at most once:
     //  - own on  -> Own (unconditional) for every genuine change AND every mirror
@@ -464,19 +486,31 @@ fn plan_batch(
     //  - own off -> Mirror (reconciled) for mirror targets only; genuine changes
     //    are broadcast but not written locally.
     let writes = if own {
-        reads
+        direct
             .iter()
-            .chain(&mirror_targets)
-            .map(|(&kind, raw)| (kind, raw.clone(), Provenance::Own))
+            .chain(&mirrors)
+            .map(|&a| (a, Provenance::Own))
             .collect()
     } else {
-        mirror_targets
-            .iter()
-            .map(|(&kind, raw)| (kind, raw.clone(), Provenance::Mirror))
-            .collect()
+        mirrors.iter().map(|&a| (a, Provenance::Mirror)).collect()
     };
 
     BatchPlan { broadcasts, writes }
+}
+
+/// The content an action propagates: this batch's read of its source selection.
+///
+/// Always present, and the assert says so rather than leaving a silent `continue`
+/// to look like a handled case: `plan_batch` only ever sources from `changed`,
+/// and every changed selection was read into `read`. A miss would mean the
+/// planner and the reader disagree — a bug, not a runtime condition.
+fn content_for(read: &IndexMap<SelectionKind, Offer>, action: Action) -> Option<Offer> {
+    let content = read.get(&action.source).cloned();
+    debug_assert!(
+        content.is_some(),
+        "planned {action:?} sources content from a selection this batch never read"
+    );
+    content
 }
 
 impl<C: Clipboard> SyncEngine<C> {
@@ -907,17 +941,14 @@ impl<C: Clipboard> SyncEngine<C> {
     /// once and recording it in `last_written` so its watch echo is dropped next
     /// batch rather than re-driving propagation.
     async fn handle_batch(&self, batch: Vec<SelectionKind>) {
-        // Phase 1: read & classify. `read_cache` holds every read (incl. echoes) so
-        // a Mirror reconcile can reuse a partner that fired this batch.
-        //
-        // That reconcile is its only consumer, and `plan_batch` emits a Mirror
-        // write only with ownership off and a link direction configured. Under
-        // any other config, caching would clone a whole offer per copy — up to
-        // `max_payload_size` — for something nothing reads, so don't.
-        let cache_reads =
-            !self.cfg.take_ownership && self.cfg.link_selections != LinkSelections::OFF;
-        let mut reads: IndexMap<SelectionKind, Offer> = IndexMap::new();
-        let mut read_cache: HashMap<SelectionKind, Offer> = HashMap::new();
+        // Phase 1: read & classify. `read` is this batch's view of the clipboard
+        // and holds every selection read, echoes included — a Mirror reconcile
+        // compares against the partner's ACTUAL content, which is worth having
+        // even when that partner's own change was an echo of our last write.
+        // `changed` names the subset that was a genuine user change, in batch
+        // order; it is all the planner needs.
+        let mut read: IndexMap<SelectionKind, Offer> = IndexMap::new();
+        let mut changed: Vec<SelectionKind> = Vec::new();
         for kind in batch {
             if !self.policies.get(kind).has_local_sink() {
                 if self.cfg.verbose {
@@ -934,27 +965,33 @@ impl<C: Clipboard> SyncEngine<C> {
             // `prime` runs concurrently and touches the same map.
             let marker = self.last_written.lock().unwrap().remove(&kind);
             let is_echo = marker.is_some_and(|h| h == content_hash(&raw));
-            if cache_reads {
-                read_cache.insert(kind, raw.clone());
+            if !is_echo {
+                changed.push(kind); // else: our own write echoing back — no propagation
             }
-            if is_echo {
-                continue; // our own write echoing back — drop, no propagation
-            }
-            reads.insert(kind, raw);
+            read.insert(kind, raw);
         }
-        if reads.is_empty() {
+        if changed.is_empty() {
             return;
         }
 
-        // Phase 2: plan (pure).
-        let plan = plan_batch(&reads, self.cfg.link_selections, self.cfg.take_ownership);
+        // Phase 2: plan (pure, payload-free).
+        let plan = plan_batch(&changed, self.cfg.link_selections, self.cfg.take_ownership);
 
-        // Phase 3: execute.
-        for (kind, raw) in plan.broadcasts {
-            self.broadcast_selection(kind, raw).await;
+        // Phase 3: execute. Each action gets its own copy because `apply_stages`
+        // consumes and rewrites the offer per pipeline; the plan's actions are
+        // exactly the number of copies the batch needs.
+        for action in plan.broadcasts {
+            let Some(content) = content_for(&read, action) else {
+                continue;
+            };
+            self.broadcast_selection(action.target, content).await;
         }
-        for (kind, content, prov) in plan.writes {
-            self.execute_write(kind, content, prov, &read_cache).await;
+        for (action, prov) in plan.writes {
+            let Some(content) = content_for(&read, action) else {
+                continue;
+            };
+            self.execute_write(action.target, content, prov, &read)
+                .await;
         }
     }
 
@@ -966,7 +1003,7 @@ impl<C: Clipboard> SyncEngine<C> {
         kind: SelectionKind,
         content: Offer,
         prov: Provenance,
-        read_cache: &HashMap<SelectionKind, Offer>,
+        read: &IndexMap<SelectionKind, Offer>,
     ) {
         let Some(final_offer) = self.apply_stages(content, prov.stages()) else {
             if prov == Provenance::Own {
@@ -980,12 +1017,12 @@ impl<C: Clipboard> SyncEngine<C> {
             // drift; the partner may be unwatched). Reuse a read from this batch if
             // the partner fired, else read once. A failed read falls through to a
             // best-effort, self-terminating mirror.
-            let read;
-            let partner_now = match read_cache.get(&kind) {
+            let fresh;
+            let partner_now = match read.get(&kind) {
                 Some(o) => Some(o),
                 None => {
-                    read = self.read_selection(kind).await;
-                    read.as_ref()
+                    fresh = self.read_selection(kind).await;
+                    fresh.as_ref()
                 }
             };
             if let Some(now) = partner_now {
@@ -3549,96 +3586,115 @@ mod tests {
     }
 
     // ---- plan_batch (pure) ----
-    // `IndexMap` resolves via `use super::*`; do NOT add a `use indexmap::IndexMap;`
-    // here (it would be a redundant import and fail clippy -D warnings).
+    // The plan is payload-free, so these assert on selections alone: `direct(k)`
+    // is k propagating its own content, `mirror(t, s)` is t filled from s.
 
-    fn reads_of(pairs: &[(SelectionKind, &str)]) -> IndexMap<SelectionKind, Offer> {
-        pairs.iter().map(|(k, t)| (*k, offer(t))).collect()
+    const CB: SelectionKind = SelectionKind::Clipboard;
+    const SEL: SelectionKind = SelectionKind::Selection;
+
+    fn direct(kind: SelectionKind) -> Action {
+        Action::direct(kind)
+    }
+
+    fn mirror(target: SelectionKind, source: SelectionKind) -> Action {
+        Action { target, source }
     }
 
     #[test]
     fn plan_copy_on_select_owns_both_with_no_mirror() {
-        // Both selections genuinely changed to the same content: no mirror (direct
-        // change wins on the partner), two unconditional ownership writes.
-        let reads = reads_of(&[
-            (SelectionKind::Clipboard, "Y"),
-            (SelectionKind::Selection, "Y"),
-        ]);
-        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, true);
+        // Both selections genuinely changed: no mirror (direct change wins on the
+        // partner), two unconditional ownership writes, each from its own read.
+        let plan = plan_batch(&[CB, SEL], LinkSelections::CLIPBOARD_TO_SELECTION, true);
         assert_eq!(
             plan.writes,
             vec![
-                (SelectionKind::Clipboard, offer("Y"), Provenance::Own),
-                (SelectionKind::Selection, offer("Y"), Provenance::Own),
+                (direct(CB), Provenance::Own),
+                (direct(SEL), Provenance::Own),
             ]
         );
-        assert_eq!(plan.broadcasts.len(), 2);
+        assert_eq!(plan.broadcasts, vec![direct(CB), direct(SEL)]);
     }
 
     #[test]
     fn plan_ctrl_c_stale_merges_mirror_into_one_owned_write() {
         // Only CLIPBOARD changed; SELECTION is a mirror target. With ownership on it
         // becomes a single Own write of SELECTION — not a mirror write plus a later
-        // ownership write. SELECTION is still broadcast (mirror target).
-        let reads = reads_of(&[(SelectionKind::Clipboard, "Y")]);
-        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, true);
+        // ownership write — filled from CLIPBOARD's read. SELECTION is still
+        // broadcast (mirror target).
+        let plan = plan_batch(&[CB], LinkSelections::CLIPBOARD_TO_SELECTION, true);
         assert_eq!(
             plan.writes,
             vec![
-                (SelectionKind::Clipboard, offer("Y"), Provenance::Own),
-                (SelectionKind::Selection, offer("Y"), Provenance::Own),
+                (direct(CB), Provenance::Own),
+                (mirror(SEL, CB), Provenance::Own),
             ]
         );
-        let kinds: Vec<_> = plan.broadcasts.iter().map(|(k, _)| *k).collect();
-        assert_eq!(
-            kinds,
-            vec![SelectionKind::Clipboard, SelectionKind::Selection]
-        );
+        assert_eq!(plan.broadcasts, vec![direct(CB), mirror(SEL, CB)]);
     }
 
     #[test]
     fn plan_clobber_skips_mirror_when_partner_is_a_concurrent_change() {
-        // CLIPBOARD=X and SELECTION=Y both genuine in one batch: CLIPBOARD->SELECTION
-        // mirror is skipped so SELECTION keeps Y. Ownership off => no writes at all.
-        let reads = reads_of(&[
-            (SelectionKind::Clipboard, "X"),
-            (SelectionKind::Selection, "Y"),
-        ]);
-        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, false);
+        // CLIPBOARD and SELECTION both genuine in one batch: the CLIPBOARD->SELECTION
+        // mirror is skipped so SELECTION keeps its own content. Ownership off => no
+        // writes at all.
+        let plan = plan_batch(&[CB, SEL], LinkSelections::CLIPBOARD_TO_SELECTION, false);
         assert!(plan.writes.is_empty());
-        assert_eq!(plan.broadcasts.len(), 2);
+        assert_eq!(plan.broadcasts, vec![direct(CB), direct(SEL)]);
     }
 
     #[test]
     fn plan_mirror_only_when_ownership_off() {
         // CLIPBOARD changed, ownership off: SELECTION mirror target gets a reconciled
         // Mirror write; CLIPBOARD itself is broadcast only (the user put it there).
-        let reads = reads_of(&[(SelectionKind::Clipboard, "Y")]);
-        let plan = plan_batch(&reads, LinkSelections::CLIPBOARD_TO_SELECTION, false);
-        assert_eq!(
-            plan.writes,
-            vec![(SelectionKind::Selection, offer("Y"), Provenance::Mirror)]
-        );
+        let plan = plan_batch(&[CB], LinkSelections::CLIPBOARD_TO_SELECTION, false);
+        assert_eq!(plan.writes, vec![(mirror(SEL, CB), Provenance::Mirror)]);
     }
 
     #[test]
     fn plan_no_link_broadcasts_without_writing() {
-        let reads = reads_of(&[(SelectionKind::Clipboard, "Y")]);
-        let plan = plan_batch(&reads, LinkSelections::OFF, false);
+        let plan = plan_batch(&[CB], LinkSelections::OFF, false);
         assert!(plan.writes.is_empty());
-        assert_eq!(
-            plan.broadcasts,
-            vec![(SelectionKind::Clipboard, offer("Y"))]
-        );
+        assert_eq!(plan.broadcasts, vec![direct(CB)]);
     }
 
     #[test]
     fn plan_selection_to_clipboard_mirrors_the_other_way() {
-        let reads = reads_of(&[(SelectionKind::Selection, "Y")]);
-        let plan = plan_batch(&reads, LinkSelections::SELECTION_TO_CLIPBOARD, false);
-        assert_eq!(
-            plan.writes,
-            vec![(SelectionKind::Clipboard, offer("Y"), Provenance::Mirror)]
-        );
+        let plan = plan_batch(&[SEL], LinkSelections::SELECTION_TO_CLIPBOARD, false);
+        assert_eq!(plan.writes, vec![(mirror(CB, SEL), Provenance::Mirror)]);
+        assert_eq!(plan.broadcasts, vec![direct(SEL), mirror(CB, SEL)]);
+    }
+
+    #[test]
+    fn plan_never_writes_a_selection_twice() {
+        // The "each selection at most once" invariant, over every config: a target
+        // appearing twice would mean two writes racing for the same selection.
+        for link in [
+            LinkSelections::OFF,
+            LinkSelections::CLIPBOARD_TO_SELECTION,
+            LinkSelections::SELECTION_TO_CLIPBOARD,
+            LinkSelections::BOTH,
+        ] {
+            for own in [false, true] {
+                for changed in [vec![CB], vec![SEL], vec![CB, SEL], vec![SEL, CB]] {
+                    let plan = plan_batch(&changed, link, own);
+                    let mut targets: Vec<_> = plan.writes.iter().map(|(a, _)| a.target).collect();
+                    let before = targets.len();
+                    targets.sort_by_key(|k| format!("{k:?}"));
+                    targets.dedup();
+                    assert_eq!(
+                        targets.len(),
+                        before,
+                        "duplicate write target for {link:?}, own={own}, changed={changed:?}"
+                    );
+                    // A plan may only ever draw content from a genuine change.
+                    for (a, _) in &plan.writes {
+                        assert!(changed.contains(&a.source), "write source not a change");
+                    }
+                    for a in &plan.broadcasts {
+                        assert!(changed.contains(&a.source), "broadcast source not a change");
+                    }
+                }
+            }
+        }
     }
 }

@@ -122,19 +122,24 @@ Recorders, all writing `last_written`:
 and keeps only genuine user changes:
 
 ```text
-reads:      IndexMap<SelectionKind, Offer>   // genuine local changes, in batch order
-read_cache: HashMap<SelectionKind, Offer>    // every read this batch (incl. echoes), reused by reconcile
+read:    IndexMap<SelectionKind, Offer>   // every read this batch (incl. echoes)
+changed: Vec<SelectionKind>               // the genuine user changes, in batch order
 for kind in batch:
     if !has_local_sink(kind):              // nothing would act on it — preserve
         verbose "copied {kind}: not sent (this node does not send)"; continue
     raw = read_selection(kind)             // the one read; None on error/timeout → skip
-    read_cache.insert(kind, raw)
     // one-shot consume the echo memo, then classify
     match last_written.lock().remove(kind):
-        Some(h) if h == content_hash(raw): continue   // our own echo → drop, no re-entry
-        _:                                            // genuine change
-            reads.insert(kind, raw)
+        Some(h) if h == content_hash(raw): pass        // our own echo → no propagation
+        _:                                             // genuine change
+            changed.push(kind)
+    read.insert(kind, raw)
 ```
+
+`read` is the batch's view of the clipboard and is the **only** store of content:
+it holds echoes too, because a `Mirror` reconcile compares against the partner's
+*actual* content even when that partner's own change was an echo of our last
+write. `changed` carries no payload — it is all the planner needs.
 
 This is the read cache and the echo gate. Because an echo is dropped here, it
 never triggers a broadcast, mirror, or ownership write — there is no cascade.
@@ -145,11 +150,20 @@ A free function (no `self`, no I/O) computes the whole batch's intent so it can 
 unit-tested directly:
 
 ```rust
+/// One planned act of propagation. The plan *names* its content rather than
+/// carrying it: every payload a batch propagates is the content of some
+/// genuinely-changed selection — its own, or (for a mirrored partner) its bridge
+/// source — so `source` always indexes phase 1's `read`.
+struct Action {
+    target: SelectionKind,   // the selection being broadcast or written
+    source: SelectionKind,   // the change whose content fills it (== target if direct)
+}
+
 struct BatchPlan {
-    /// (kind, raw content) to broadcast to the mesh, in deterministic order.
-    broadcasts: Vec<(SelectionKind, Offer)>,
-    /// (kind, content, Provenance) to write locally, each kind at most once.
-    writes: Vec<(SelectionKind, Offer, Provenance)>,
+    /// Selections to broadcast to the mesh, in deterministic order.
+    broadcasts: Vec<Action>,
+    /// Selections to write locally, each target at most once.
+    writes: Vec<(Action, Provenance)>,
 }
 
 /// Why a write happens — selects the reconcile rule in execute.
@@ -162,32 +176,29 @@ enum Provenance {
     Mirror,
 }
 
-/// `reads` = genuine local changes this batch. `link`, `own` come from Config.
-/// Pure: decides *which* selections to broadcast and write (with provenance);
-/// it does not transform content. The caller does the I/O, the
-/// may_send/filter/dedup on broadcasts, the synth+cap transform on `Own`
-/// writes, and the drift reconcile for `Mirror`.
-fn plan_batch(
-    reads: &IndexMap<SelectionKind, Offer>,
-    link: LinkSelections,
-    own: bool,
-) -> BatchPlan
+/// `changed` = the genuine local changes this batch. `link`, `own` come from
+/// Config. Pure, and payload-free: the decision depends only on *which*
+/// selections changed, so no clipboard content is copied to reach it. The caller
+/// does the I/O, the may_send/filter/dedup on broadcasts, the synth+cap
+/// transform on `Own` writes, and the drift reconcile for `Mirror`.
+fn plan_batch(changed: &[SelectionKind], link: LinkSelections, own: bool) -> BatchPlan
 ```
 
 Rules:
 
 1. **Mirror targets.** For each genuine `K` with `bridge_partner(K) = Some(P)`
-   (derived from `link`): if `P` is **also** in `reads` (a concurrent direct user
+   (derived from `link`): if `P` is **also** in `changed` (a concurrent direct user
    change), **skip the mirror** — direct-change-wins, the clobber fix expressed
-   structurally. Otherwise `P` receives `K`'s content. A selection is a *mirror
+   structurally. Otherwise `P` receives `K`'s content (`Action { target: P, source: K }`). A selection is a *mirror
    target* if it is some genuine change's partner and is not itself a genuine
    change.
 
-2. **Source content per selection.** Each selection that is a genuine change or a
-   mirror target carries a source `Offer`: its own raw (genuine change) or the
-   source change's raw (mirror target). The plan carries this raw content
-   verbatim; the `Own` synth+cap transform is applied later, in execute, not
-   here — so `plan_batch` stays a pure decision over which selections act.
+2. **Source per selection.** Each selection that is a genuine change or a mirror
+   target names where its content comes from: itself (genuine change) or the
+   source change (mirror target). The plan records only that *name*; execute
+   looks the content up in `read`. The `Own` synth+cap transform is applied later,
+   in execute, so `plan_batch` stays a pure decision over which selections act —
+   and, because it never touches an `Offer`, planning copies nothing.
 
 3. **Broadcasts.** Emit a broadcast for every genuine change and every mirror
    target. (A mirrored partner still reaches the mesh, matching today; the caller
@@ -226,9 +237,9 @@ for (kind, content, prov) in plan.writes:
     if prov == Mirror:
         // Own writes are unconditional (ownership transfer) and skip this.
         // Mirror reconciles against the partner's ACTUAL content (handles
-        // out-of-band drift; the partner may be unwatched): reuse read_cache
-        // if the partner fired this batch, else read it once here.
-        partner_now = read_cache.get(kind) or read_selection(kind)
+        // out-of-band drift; the partner may be unwatched): reuse the batch's
+        // read if the partner fired this batch, else read it once here.
+        partner_now = read.get(kind) or read_selection(kind)
         if content_hash(partner_now) == content_hash(final): continue
     // record BEFORE the write so the watch echo it produces is dropped next batch
     last_written.lock().insert(kind, content_hash(final))
@@ -280,7 +291,9 @@ and assert the `BatchPlan`:
 - clobber → mirror skipped when partner is a concurrent genuine change;
 - one-direction vs both-direction `link_selections`;
 - `own` off → mirror-only `Mirror` write; `own` on → `Own` supersedes;
-- empty/no-sink selections produce no write.
+- empty/no-sink selections produce no write;
+- across every `link`/`own`/`changed` combination: no target is written twice,
+  and no action sources content from a selection that did not change.
 
 **Engine tests** (existing, must stay green — they guard the observable
 behavior): `take_ownership_with_link_selections_terminates`, the
