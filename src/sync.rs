@@ -134,7 +134,13 @@ fn synthesize_text_plain(offer: Offer) -> Offer {
 /// would blow the budget) instead of dropping the whole offer. The smallest-first
 /// pass only decides *which* reps survive; the kept reps are emitted in the
 /// offer's original (advertise) order, so over-budget truncation preserves the
-/// source's preference order. Mirrors the read-path budget and per-type caps.
+/// source's preference order.
+///
+/// This is the *policy* application of `max_payload_size`, run after the MIME
+/// rules and with every representation's size known. The read path in
+/// `wayland::assemble_offer` spends the same number as a *resource guard*, under
+/// streaming ignorance of sizes and before the rules — see its doc comment for
+/// why the two cannot be collapsed into one.
 fn cap_to_payload_size(offer: Offer, max: usize) -> Offer {
     if offer_size(&offer) <= max {
         return offer; // common case: the whole offer fits

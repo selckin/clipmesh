@@ -53,10 +53,11 @@ fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     };
     debug!("reading the {kind:?} clipboard; offered types: {types:?}");
     // Bound each read by the remaining budget (+1 to detect overflow) so a
-    // huge or unbounded representation can't OOM the daemon. Note the
-    // max_payload_size budget is spent here, before sync.rs applies the
-    // per-type MIME allow/deny rules, so a large rep the rules would later deny
-    // can still consume budget.
+    // huge or unbounded representation can't OOM the daemon.
+    //
+    // This budget and `sync::cap_to_payload_size` are both `max_payload_size`
+    // but are NOT the same decision, and the difference is inherent rather than
+    // an oversight (see `assemble_offer`).
     let (offer, total) = assemble_offer(types, max, |mime, budget| {
         let (pipe, _actual_mime) = paste::get_contents(
             ct,
@@ -99,6 +100,28 @@ fn is_content_type(mime: &str) -> bool {
 /// everything, the earlier-advertised (more-preferred) representations survive;
 /// the order is deterministic because `get_mime_types_ordered` hands it to us as
 /// an ordered list rather than an unordered set.
+///
+/// # Why this budget is not `cap_to_payload_size`
+///
+/// Both spend `max_payload_size`, but they answer different questions with
+/// different information, and the duplication cannot be removed:
+///
+/// - Here, sizes are unknowable until a representation has been read, so the
+///   only possible strategy is streaming and greedy: take them in advertise
+///   order until the budget runs out. `cap_to_payload_size` runs afterwards with
+///   every size in hand and can therefore choose smallest-first, which fits more
+///   representations. Neither strategy can be used at the other's layer.
+/// - This layer also cannot pre-filter by the MIME rules to avoid spending
+///   budget on a representation that will later be denied. The rules govern what
+///   leaves the host, not what the user may paste locally: `Stages::OWN` and
+///   `Stages::MIRROR` deliberately re-offer denied representations to the local
+///   selections. Filtering here would strip them before those pipelines ever
+///   saw them. (Tried; `both_directions_no_redundant_write_with_denied_rep`
+///   catches it.)
+///
+/// The residual wart is real but small: a large representation advertised early
+/// can consume budget that a later one then can't have, even if the rules would
+/// have dropped the first. Raising `max_payload_size` is the user-facing fix.
 fn assemble_offer(
     types: impl IntoIterator<Item = String>,
     max: usize,
