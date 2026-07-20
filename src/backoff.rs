@@ -6,7 +6,10 @@
 //! they share the state machine and supply their own policy.
 
 use rand::Rng;
-use std::time::Duration;
+use std::ops::ControlFlow;
+use std::thread;
+use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Exponential backoff with a ceiling and optional jitter.
 ///
@@ -88,6 +91,30 @@ pub const RESTART_STABLE_AFTER: Duration = Duration::from_secs(5);
 /// A [`Backoff`] tuned for a watcher-thread restart loop.
 pub fn watcher_restart() -> Backoff {
     Backoff::new(RESTART_MIN, RESTART_MAX)
+}
+
+/// Run `attempt` forever on the shared watcher restart schedule, sleeping a
+/// backed-off delay between runs and resetting once a run has stayed up long
+/// enough to look healthy.
+///
+/// Both long-lived watcher threads (file and clipboard) are supervised by this,
+/// so the timing, the "was that run healthy?" question and the restart log can't
+/// drift apart between them — previously each spelled the same five steps out
+/// itself. `attempt` reports its own errors and returns [`ControlFlow::Break`]
+/// to retire the watcher for good (the clipboard watcher does this when the
+/// engine has gone away); returning [`ControlFlow::Continue`] restarts it.
+pub fn supervise(label: &str, mut attempt: impl FnMut() -> ControlFlow<()>) {
+    let mut backoff = watcher_restart();
+    loop {
+        let started = Instant::now();
+        if attempt().is_break() {
+            return;
+        }
+        backoff.reset_if_stable(started.elapsed(), RESTART_STABLE_AFTER);
+        let delay = backoff.next_delay();
+        warn!("restarting the {label} in {delay:?}");
+        thread::sleep(delay);
+    }
 }
 
 #[cfg(test)]

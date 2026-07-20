@@ -1,3 +1,5 @@
+pub mod atoms;
+pub mod io;
 pub mod mock;
 pub mod watch;
 pub mod wayland;

@@ -100,12 +100,15 @@ being invoked under that name):
 
     ln -s "$(command -v clipmesh)" ~/.local/bin/wl-paste
 
-Two caveats, both inherent to pulling a clipboard the node already pushes:
+The paste asks the node for exactly what it needs — `-t` transfers only that one
+representation, `-l` only the type names — and the node reads its clipboard live
+to answer. `resync_on_connect` is irrelevant here: it governs what a node pushes
+to a rejoining peer, not whether it answers a question.
 
-- The target must run with `resync_on_connect` on (the default) and not be
-  `direction = "receive_only"`, or there is nothing to push and the paste times
-  out.
-- `-p`/`--primary` only works against a node that has `sync_selection = true`.
+One caveat remains: a node only serves a selection it is configured to send, so
+`direction = "receive_only"` refuses, and `-p`/`--primary` needs
+`sync_selection = true`. In both cases the node says so explicitly rather than
+leaving the paste to time out.
 
 This is a one-shot read: there is no `wl-paste --watch` and no `wl-copy`.
 

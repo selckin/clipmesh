@@ -1,4 +1,4 @@
-use crate::protocol::{encode_frame, Frame, Message};
+use crate::protocol::{encode_frame, Frame, Message, PeerRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,7 @@ use uuid::Uuid;
 struct ConnHandle {
     id: u64,
     tx: mpsc::Sender<Frame>,
+    role: PeerRole,
 }
 
 /// Live peer table. Connections are grouped by remote node ID; index 0 in
@@ -44,14 +45,23 @@ impl Mesh {
     }
 
     /// Add a connection for a peer; returns its connection ID.
-    pub fn register(&self, remote: Uuid, tx: mpsc::Sender<Frame>) -> u64 {
+    ///
+    /// A [`PeerRole::Paster`] is registered so its request can be answered, but
+    /// is deliberately inert as a mesh member: it fires no connect event (so the
+    /// engine spends no resync on a client that will never sync) and is skipped
+    /// by `broadcast`. Only a real peer joining is mesh news.
+    pub fn register(&self, remote: Uuid, tx: mpsc::Sender<Frame>, role: PeerRole) -> u64 {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let first_connection = {
             let mut peers = self.peers.lock().unwrap();
             let conns = peers.entry(remote).or_default();
-            conns.push(ConnHandle { id, tx });
+            conns.push(ConnHandle { id, tx, role });
             conns.len() == 1
         };
+        if role == PeerRole::Paster {
+            debug!("paste client {remote} connected (connection {id})");
+            return id;
+        }
         if first_connection {
             info!("peer {remote} connected (connection {id})");
             if self.connect_tx.try_send(remote).is_err() {
@@ -90,7 +100,13 @@ impl Mesh {
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(id, conns)| conns.first().map(|c| (*id, c.tx.clone())))
+            // Skip pasters: a one-shot client is not a sync destination.
+            .filter_map(|(id, conns)| {
+                conns
+                    .first()
+                    .filter(|c| c.role == PeerRole::Peer)
+                    .map(|c| (*id, c.tx.clone()))
+            })
             .collect();
         debug!("broadcasting clipboard update to {} peer(s)", targets.len());
         if targets.is_empty() {
@@ -105,18 +121,13 @@ impl Mesh {
         }
     }
 
-    /// Send a message to one peer's designated connection (used for
-    /// targeted resyncs). Same try_send semantics as broadcast.
-    pub fn send_to(&self, peer: Uuid, msg: &Message) {
-        self.send_frame_to(peer, &encode_frame(msg));
-    }
-
-    /// Send an already-encoded frame to one peer.
+    /// Send an already-encoded frame to one peer's designated connection (used
+    /// for targeted resyncs). Same try_send semantics as broadcast.
     ///
-    /// Split from `send_to` so a caller with the same message for several peers
-    /// encodes it once and hands each a refcount, exactly as `broadcast` does —
-    /// otherwise a resync burst re-serializes a whole clipboard payload (up to
-    /// `max_payload_size`) per recipient.
+    /// Takes an encoded frame rather than a `&Message` so a caller with the same
+    /// message for several peers encodes it once and hands each a refcount,
+    /// exactly as `broadcast` does — otherwise a resync burst re-serializes a
+    /// whole clipboard payload (up to `max_payload_size`) per recipient.
     pub fn send_frame_to(&self, peer: Uuid, frame: &Frame) {
         let target = self
             .peers
@@ -200,11 +211,38 @@ mod tests {
         let peer = Uuid::new_v4();
         let (tx1, _rx1) = mpsc::channel(8);
         let (tx2, _rx2) = mpsc::channel(8);
-        mesh.register(peer, tx1);
+        mesh.register(peer, tx1, PeerRole::Peer);
         assert_eq!(connects.try_recv().unwrap(), peer);
         // a duplicate (standby) connection must not re-trigger resync
-        mesh.register(peer, tx2);
+        mesh.register(peer, tx2, PeerRole::Peer);
         assert!(connects.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_paster_costs_no_resync_and_receives_no_broadcast() {
+        // A `--paste` client asks one question and leaves. Treating it as a peer
+        // made every `wl-paste` cost the serving node a full connect resync — a
+        // rules snapshot plus a live capture of every synced selection, which on
+        // Wayland is one connection per advertised MIME type.
+        let (mesh, _rx, mut connects) = new_mesh();
+        let paster = Uuid::new_v4();
+        let (tx, mut paste_rx) = mpsc::channel(8);
+        mesh.register(paster, tx, PeerRole::Paster);
+        assert!(
+            connects.try_recv().is_err(),
+            "a paster must not trigger a resync"
+        );
+
+        // It is still reachable for its reply...
+        mesh.send_frame_to(paster, &encode_frame(&clip("the answer")));
+        assert_eq!(recv(&mut paste_rx), clip("the answer"));
+
+        // ...but is not a sync destination.
+        mesh.broadcast(&clip("a later copy"));
+        assert!(
+            paste_rx.try_recv().is_err(),
+            "a paster must not receive broadcasts"
+        );
     }
 
     #[tokio::test]
@@ -214,9 +252,9 @@ mod tests {
         let peer_b = Uuid::new_v4();
         let (tx_a, mut rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
-        mesh.register(peer_a, tx_a);
-        mesh.register(peer_b, tx_b);
-        mesh.send_to(peer_a, &clip("targeted"));
+        mesh.register(peer_a, tx_a, PeerRole::Peer);
+        mesh.register(peer_b, tx_b, PeerRole::Peer);
+        mesh.send_frame_to(peer_a, &encode_frame(&clip("targeted")));
         assert_eq!(recv(&mut rx_a), clip("targeted"));
         assert!(rx_b.try_recv().is_err());
     }
@@ -227,8 +265,8 @@ mod tests {
         let peer = Uuid::new_v4();
         let (tx1, mut rx1) = mpsc::channel(8);
         let (tx2, mut rx2) = mpsc::channel(8);
-        let c1 = mesh.register(peer, tx1);
-        let _c2 = mesh.register(peer, tx2);
+        let c1 = mesh.register(peer, tx1, PeerRole::Peer);
+        let _c2 = mesh.register(peer, tx2, PeerRole::Peer);
 
         mesh.broadcast(&clip("a"));
         assert_eq!(recv(&mut rx1), clip("a"));
@@ -248,8 +286,8 @@ mod tests {
         let (mesh, _rx, _c) = new_mesh();
         let (tx_a, mut rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
-        mesh.register(Uuid::new_v4(), tx_a);
-        mesh.register(Uuid::new_v4(), tx_b);
+        mesh.register(Uuid::new_v4(), tx_a, PeerRole::Peer);
+        mesh.register(Uuid::new_v4(), tx_b, PeerRole::Peer);
 
         mesh.broadcast(&clip("x"));
         assert_eq!(recv(&mut rx_a), clip("x"));
@@ -263,7 +301,7 @@ mod tests {
         let (mesh, _rx, _c) = new_mesh();
         let peer = Uuid::new_v4();
         let (tx, _krx) = mpsc::channel(8);
-        let c = mesh.register(peer, tx);
+        let c = mesh.register(peer, tx, PeerRole::Peer);
         assert_eq!(mesh.peer_count(), 1);
         mesh.unregister(peer, c);
         assert_eq!(mesh.peer_count(), 0);

@@ -13,7 +13,7 @@
 use crate::config::{self, Config};
 use crate::mesh::Mesh;
 use crate::peer;
-use crate::protocol::{Message, Offer, SelectionKind};
+use crate::protocol::{GetResult, GetWant, Message, Offer, PeerRole, SelectionKind};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
@@ -157,14 +157,24 @@ fn resolve_targets(pa: &PasteArgs, cfg: &Config) -> Result<Vec<String>> {
     Ok(cfg.peers.clone())
 }
 
-/// Connect to `addr`, take the clipboard the node pushes on connect
-/// (resync-on-connect), and return the `Offer` for `want`. Reuses the full peer
-/// connection stack (`peer::run_connection`); no wire-format change.
+/// Connect to `addr` as a one-shot paste client, ask it for `want`, and return
+/// what it answers.
+///
+/// This is a *request*, not a scrape. The connection is announced as
+/// [`PeerRole::Paster`], so the node registers it only to reply: it fires no
+/// connect event, spends no resync (a rules snapshot plus a live capture of
+/// every synced selection) on a client that will never sync, and never
+/// broadcasts to it. `narrow` also lets the node send back only the
+/// representation actually wanted.
+///
+/// Reuses the full peer connection stack (`peer::run_connection`), so the Noise
+/// handshake, version check and framing are identical to a mesh link.
 pub async fn fetch_offer(
     addr: &str,
     psk: [u8; 32],
     max_payload: usize,
     want: SelectionKind,
+    narrow: GetWant,
     timeout: Duration,
 ) -> Result<Offer> {
     let stream = TcpStream::connect(addr)
@@ -173,60 +183,81 @@ pub async fn fetch_offer(
     let _ = stream.set_nodelay(true);
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
-    // Keep the connect receiver alive: `Mesh::register` fires one `try_send` on
-    // it when we register, and dropping it would make that send warn needlessly.
-    let (connect_tx, _connect_rx) = mpsc::channel(64);
+    // The node registers as a peer from our side, so this fires once the hello
+    // exchange completes — which is when it is safe to send the request.
+    let (connect_tx, mut connect_rx) = mpsc::channel(64);
     let mesh = Mesh::new(Uuid::new_v4(), inbound_tx, connect_tx);
 
     // Drive the connection inline (not spawned) so returning from this function
     // drops it, and `run_connection`'s AbortGuards tear down its reader/writer.
     // `run_connection` adds its own framing slack on top of `max_payload`.
-    let conn = peer::run_connection(stream, true, psk, max_payload, mesh);
+    let conn = peer::run_connection(
+        stream,
+        true,
+        psk,
+        max_payload,
+        mesh.clone(),
+        PeerRole::Paster,
+    );
     tokio::pin!(conn);
 
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
 
-    // Exit the select loop with the error to surface; the wanted Clip returns
-    // early from inside it. Whichever way we leave, we first drain anything the
-    // reader already delivered (below), so a Clip buffered in the same tick the
-    // connection closes or the deadline fires isn't lost to `select!`'s
-    // pseudo-random branch choice.
+    // Exit the select loop with the error to surface; a reply returns early from
+    // inside it.
     let err: anyhow::Error = loop {
         tokio::select! {
             _ = &mut deadline => break anyhow!(
-                "no {want:?} clipboard received from {addr} within {timeout:?} — the node \
-                 may have an empty clipboard, resync_on_connect disabled, (for --primary) \
-                 sync_selection disabled, or a large clipboard is still transferring over a \
-                 slow link"
+                "no reply from {addr} within {timeout:?} — it may still be transferring a \
+                 large clipboard over a slow link"
             ),
-            // The connection ended before sending what we wanted: surface its
-            // real error (PSK/version mismatch, reset) rather than timing out.
+            // The connection ended before answering: surface its real error
+            // (PSK/version mismatch, reset) rather than timing out.
             res = &mut conn => break match res {
-                Ok(()) => anyhow!("connection to {addr} closed before sending a {want:?} clipboard"),
+                Ok(()) => anyhow!("connection to {addr} closed before answering"),
                 Err(e) => e.context(format!("connecting to clipmesh node {addr}")),
             },
+            // Registered, so the writer is live: ask.
+            Some(_) = connect_rx.recv() => {
+                mesh.broadcast(&Message::Get { kind: want, want: narrow.clone() });
+            }
             msg = inbound_rx.recv() => match msg {
-                Some((_from, Message::Clip { kind, offer, .. })) if kind == want => {
-                    return Ok(offer);
+                Some((_from, Message::GetReply { kind, result })) if kind == want => {
+                    return interpret(result, addr, want);
                 }
-                // Rules, or a Clip of the other selection: keep waiting.
+                // A reply about the other selection, or anything else: keep waiting.
                 Some(_) => continue,
                 None => break anyhow!("connection to {addr} closed unexpectedly"),
             },
         }
     };
-
-    // The reader may have delivered our Clip just before the connection closed
-    // (or the deadline fired); take it from the buffer rather than report `err`.
-    while let Ok((_from, msg)) = inbound_rx.try_recv() {
-        if let Message::Clip { kind, offer, .. } = msg {
-            if kind == want {
-                return Ok(offer);
-            }
-        }
-    }
     Err(err)
+}
+
+/// Turn a node's answer into an offer or a specific error.
+///
+/// Each failure names its own cause, which is the point of asking rather than
+/// waiting for a push: the old design could only ever time out, and had to list
+/// four unrelated possible reasons in one message.
+fn interpret(result: GetResult, addr: &str, want: SelectionKind) -> Result<Offer> {
+    match result {
+        GetResult::Offer(o) => Ok(o),
+        GetResult::Types(types) => Ok(types.into_iter().map(|t| (t, Vec::new())).collect()),
+        GetResult::Empty => bail!("the {want:?} clipboard on {addr} is empty"),
+        GetResult::NotOffered { available } => bail!(
+            "that type is not offered by {addr} (available: {})",
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            }
+        ),
+        GetResult::NotSynced => bail!(
+            "{addr} does not serve its {want:?} selection — it is configured \
+             receive-only, or (for --primary) without sync_selection"
+        ),
+    }
 }
 
 /// Race `fetch_offer` across every target concurrently and return the offer from
@@ -238,15 +269,17 @@ pub async fn fetch_from_any(
     psk: [u8; 32],
     max_payload: usize,
     want: SelectionKind,
+    narrow: GetWant,
     timeout: Duration,
 ) -> Result<Offer> {
     if let [addr] = targets.as_slice() {
-        return fetch_offer(addr, psk, max_payload, want, timeout).await;
+        return fetch_offer(addr, psk, max_payload, want, narrow, timeout).await;
     }
     let mut set = tokio::task::JoinSet::new();
     for addr in targets.clone() {
-        // psk/max_payload/want/timeout are Copy; addr is moved per task.
-        set.spawn(async move { fetch_offer(&addr, psk, max_payload, want, timeout).await });
+        // psk/max_payload/want/timeout are Copy; addr and narrow are cloned per task.
+        let narrow = narrow.clone();
+        set.spawn(async move { fetch_offer(&addr, psk, max_payload, want, narrow, timeout).await });
     }
     let mut last_err: Option<anyhow::Error> = None;
     // First success wins; dropping `set` on return aborts the remaining fetches.
@@ -294,6 +327,20 @@ fn write_stdout(bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// How much of the offer this invocation actually needs, so the node can send
+/// only that. `-l` needs names but no bytes; `-t` needs exactly one
+/// representation; the default picks by preference order and so must see them
+/// all.
+fn narrowing(pa: &PasteArgs) -> GetWant {
+    if pa.list {
+        return GetWant::TypesOnly;
+    }
+    match &pa.type_ {
+        Some(t) => GetWant::One(t.clone()),
+        None => GetWant::All,
+    }
+}
+
 /// Entry point for paste mode: parse args, load config, pull from a node, and
 /// write the selected representation to stdout.
 pub async fn run(args: Vec<String>) -> Result<()> {
@@ -309,6 +356,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         cfg.psk,
         cfg.max_payload_size,
         pa.kind,
+        narrowing(&pa),
         PASTE_TIMEOUT,
     )
     .await?;

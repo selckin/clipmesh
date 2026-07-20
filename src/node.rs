@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::mesh::Mesh;
 use crate::mime::MimeRules;
 use crate::peer;
+use crate::protocol::PeerRole;
 use crate::sync::SyncEngine;
 use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
@@ -67,6 +68,7 @@ pub async fn spawn_node<C: Clipboard>(cfg: Arc<Config>, clipboard: Arc<C>) -> Re
                                 cfg.psk,
                                 cfg.max_payload_size,
                                 mesh,
+                                PeerRole::Peer,
                             )
                             .await
                             {
@@ -168,6 +170,7 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
                     cfg.psk,
                     cfg.max_payload_size,
                     mesh.clone(),
+                    PeerRole::Peer,
                 )
                 .await
                 {

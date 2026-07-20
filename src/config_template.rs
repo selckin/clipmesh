@@ -631,46 +631,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
-    /// Every option the config parser accepts, read out of serde's own
-    /// `deny_unknown_fields` error. That message enumerates `RawConfig`'s
-    /// fields, which makes it the schema itself rather than a second list to
-    /// keep in step by hand.
-    fn config_schema_keys() -> Vec<String> {
-        // `{:#}` — the whole anyhow chain; the serde detail is a source, not the
-        // top-level "parsing config" context.
-        let err =
-            match crate::config::Config::from_toml("listen = \"x\"\npsk = \"s\"\nzz_probe = 1\n") {
-                Err(e) => format!("{e:#}"),
-                Ok(_) => panic!("an unknown config key must be rejected"),
-            };
-        let (_, list) = err
-            .split_once("expected one of ")
-            .expect("serde's unknown-field error should enumerate the accepted fields");
-        let keys: Vec<String> = list
-            .split(',')
-            .filter_map(|s| s.trim().trim_matches('`').split('`').next())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        // Guard the scrape itself: if serde ever changes this wording, fail
-        // here rather than silently checking an empty list.
-        assert!(
-            keys.len() > 10 && keys.contains(&"listen".to_string()),
-            "couldn't scrape the field list from: {err}"
-        );
-        keys
-    }
-
+    /// The template must be able to render every option the parser accepts, or
+    /// `--sync-config` drops that line from a config file that sets it.
+    /// `RAW_CONFIG_KEYS` is the schema: the compiler stops a new `RawConfig`
+    /// field from reaching users without passing through it (see `from_toml`'s
+    /// destructure), and this test carries that obligation on to `TEMPLATE`.
     #[test]
     fn every_config_option_has_a_template_block() {
         let renderable = template_keys();
-        for key in config_schema_keys() {
+        for key in crate::config::RAW_CONFIG_KEYS {
             // The only table; rendered by its own block, not as a scalar.
             if key == "link_selections" {
                 continue;
             }
             assert!(
-                renderable.contains(&key.as_str()),
+                renderable.contains(&key),
                 "config option `{key}` has no TEMPLATE block: --sync-config would \
                  delete it from a config that sets it"
             );
@@ -766,17 +741,10 @@ mod tests {
 
     #[test]
     fn example_config_matches_template() {
-        let expected = render_example();
-        let path = "examples/config.toml"; // cargo runs tests with CWD = crate root
-        if std::env::var("CLIPMESH_REGEN_EXAMPLE").is_ok() {
-            std::fs::write(path, &expected).unwrap();
-            return;
-        }
-        let actual = std::fs::read_to_string(path).unwrap();
-        assert_eq!(
-            actual, expected,
-            "examples/config.toml is stale; regenerate with \
-             CLIPMESH_REGEN_EXAMPLE=1 cargo test --lib example_config_matches_template"
+        crate::fsutil::assert_matches_generated_example(
+            "examples/config.toml",
+            &render_example(),
+            "example_config_matches_template",
         );
     }
 

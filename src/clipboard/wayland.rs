@@ -1,3 +1,4 @@
+use crate::clipboard::atoms;
 use crate::clipboard::watch::spawn_watcher;
 use crate::clipboard::{Clipboard, ClipboardEvent};
 use crate::protocol::{describe_offer, human_bytes, Offer, SelectionKind};
@@ -76,38 +77,6 @@ pub(crate) fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Off
     Ok(offer)
 }
 
-/// Whether a failed read of this advertised type likely lost real content
-/// (worth a warn) rather than an X11/XWayland pseudo-target that always errors
-/// on read. Real MIME types carry a '/'; X11 also exposes plain text under a
-/// few uppercase atoms that ARE content, so classify those as content too.
-/// Everything else slashless (TARGETS, TIMESTAMP, MULTIPLE, an app's TK_* atoms,
-/// ...) is selection metadata.
-fn is_content_type(mime: &str) -> bool {
-    mime.contains('/') || matches!(mime, "STRING" | "UTF8_STRING" | "TEXT" | "COMPOUND_TEXT")
-}
-
-/// ICCCM selection targets that are protocol machinery rather than content, and
-/// that no source ever serves as data — reading one always fails.
-///
-/// Worth naming explicitly because a read is not cheap here: every
-/// representation costs its own Wayland connection (see `read_offer_blocking`),
-/// so attempting these spends a full connect-and-roundtrip per selection just to
-/// be told no. Skipping them is exactly equivalent — a failed read is dropped
-/// from the offer anyway — but does not pay for the answer.
-///
-/// Deliberately an exact list rather than "anything `!is_content_type`": an
-/// unrecognised slashless atom might genuinely carry data, and is still attempted
-/// (its failure is logged at debug, as before).
-const SELECTION_MACHINERY: [&str; 7] = [
-    "TARGETS",
-    "TIMESTAMP",
-    "MULTIPLE",
-    "SAVE_TARGETS",
-    "DELETE",
-    "INSERT_SELECTION",
-    "INSERT_PROPERTY",
-];
-
 /// Build an `Offer` from the advertised `types`, reading each with `read`
 /// (given the mime and remaining byte budget; it may read up to budget+1 so we
 /// can detect overflow). Returns the offer and its total byte size. A
@@ -159,7 +128,7 @@ fn assemble_offer(
         if offer.contains_key(&mime) {
             continue;
         }
-        if SELECTION_MACHINERY.contains(&mime.as_str()) {
+        if atoms::is_machinery(&mime) {
             debug!("skipping clipboard type {mime}: a selection target, never content");
             continue;
         }
@@ -171,7 +140,7 @@ fn assemble_offer(
             Err(e) => {
                 // A content type that won't read is real data loss worth a warn;
                 // a pseudo-target erroring on read is expected, so keep it quiet.
-                if is_content_type(&mime) {
+                if atoms::is_content(&mime) {
                     warn!("skipping clipboard type {mime}: can't read it ({e:#})");
                 } else {
                     debug!("skipping clipboard type {mime}: not readable content ({e:#})");
@@ -299,31 +268,8 @@ mod tests {
         assert_eq!(total, 0);
     }
 
-    #[test]
-    fn content_type_classification_covers_x11_text_atoms() {
-        // Real MIME types and the X11 text atoms are content (a failed read is
-        // worth a warn); selection-metadata atoms are not.
-        for m in [
-            "image/png",
-            "text/plain",
-            "STRING",
-            "UTF8_STRING",
-            "TEXT",
-            "COMPOUND_TEXT",
-        ] {
-            assert!(is_content_type(m), "{m} should be content");
-        }
-        for m in [
-            "TARGETS",
-            "TIMESTAMP",
-            "MULTIPLE",
-            "SAVE_TARGETS",
-            "TK_SELECTION",
-        ] {
-            assert!(!is_content_type(m), "{m} should not be content");
-        }
-    }
-
+    // The atom classification itself is tested in `clipboard::atoms`, which now
+    // owns it; what matters here is that `assemble_offer` acts on it.
     #[test]
     fn assemble_offer_never_spends_a_read_on_selection_machinery() {
         // Each read costs a whole Wayland connection, and these targets always

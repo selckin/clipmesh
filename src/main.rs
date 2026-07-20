@@ -207,7 +207,7 @@ fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()>
         bail!("couldn't write the MIME rules file {}", path.display());
     }
 
-    let verb = if allow { "allow" } else { "deny" };
+    let verb = clipmesh::mime::rule_word(allow);
     println!("Set \"{pattern}\" = \"{verb}\" in {}", path.display());
     if !removed.is_empty() {
         println!(

@@ -18,6 +18,16 @@ const HEADER: usize = 4;
 /// copy could pin 64 MiB per peer indefinitely, long after the copy is gone.
 const PLAIN_BUF_KEEP: usize = NOISE_MAX;
 
+/// An empty reassembly buffer, pre-sized to `PLAIN_BUF_KEEP`.
+///
+/// A completed message *is* the buffer it was reassembled in (see `recv`), so a
+/// fresh one is installed per message rather than reused; sizing it here is what
+/// keeps that from turning into a growth-realloc treadmill, and what bounds the
+/// capacity a connection carries between messages.
+fn fresh_plain_buf() -> Vec<u8> {
+    Vec::with_capacity(PLAIN_BUF_KEEP)
+}
+
 pub struct SendHalf<W> {
     io: W,
     st: Arc<StatelessTransportState>,
@@ -35,7 +45,14 @@ pub struct RecvHalf<R> {
     io: R,
     st: Arc<StatelessTransportState>,
     nonce: u64,
+    /// Reassembly buffer for the message being received. Holds *only* payload
+    /// bytes — the length prefix is consumed into `expected_len` the moment it
+    /// arrives — so a finished message is this buffer, handed over as-is.
     plain_buf: Vec<u8>,
+    /// Payload length of the message being reassembled, taken from its length
+    /// prefix. `None` means the next record starts a new message and so leads
+    /// with that prefix.
+    expected_len: Option<usize>,
     /// Plaintext scratch for one decrypted record; see `SendHalf::out`.
     out: Vec<u8>,
     /// Ciphertext scratch for the record currently being read.
@@ -94,7 +111,8 @@ where
             io: rd,
             st,
             nonce: 0,
-            plain_buf: Vec::new(),
+            plain_buf: fresh_plain_buf(),
+            expected_len: None,
             out: vec![0u8; NOISE_MAX],
             record: Vec::new(),
             max_message,
@@ -175,26 +193,23 @@ impl<W: AsyncWrite + Unpin> SendHalf<W> {
 
 impl<R: AsyncRead + Unpin> RecvHalf<R> {
     /// Receive one logical message. Errors are terminal for the connection.
+    ///
+    /// Completion is copy-free: because `absorb` strips the length prefix on
+    /// arrival, `plain_buf` ends up holding exactly the message, so it can be
+    /// handed to the caller instead of copied out of. Copying it would mean a
+    /// second full pass over a payload that can reach `max_message` (32 MiB),
+    /// on top of the one copy reassembly inherently costs.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         loop {
-            if self.plain_buf.len() >= HEADER {
-                let len = u32::from_be_bytes(self.plain_buf[..HEADER].try_into().unwrap()) as usize;
-                if len > self.max_message {
-                    bail!("message too large: {len} > {}", self.max_message);
-                }
-                if self.plain_buf.len() >= HEADER + len {
-                    let msg = self.plain_buf[HEADER..HEADER + len].to_vec();
-                    self.plain_buf.drain(..HEADER + len);
-                    // Release the reassembly space an outsized message grew,
-                    // instead of holding its high-water mark for the life of
-                    // the connection. `shrink_to` is a no-op when capacity is
-                    // already below the limit; the length check is what matters,
-                    // so a partially-filled buffer mid-stream isn't reallocated.
-                    if self.plain_buf.len() <= PLAIN_BUF_KEEP {
-                        self.plain_buf.shrink_to(PLAIN_BUF_KEEP);
-                    }
-                    return Ok(msg);
-                }
+            if self.expected_len == Some(self.plain_buf.len()) {
+                self.expected_len = None;
+                // Installing a fresh buffer is also what releases the space an
+                // outsized message grew, instead of holding its high-water mark
+                // for the life of the connection — the reason `PLAIN_BUF_KEEP`
+                // exists. There is never a leftover to carry over: a record
+                // belongs to one message (see `absorb`), so the buffer we give
+                // away ends exactly where the message does.
+                return Ok(std::mem::replace(&mut self.plain_buf, fresh_plain_buf()));
             }
             read_record_into(&mut self.io, &mut self.record).await?;
             let n = self
@@ -202,8 +217,45 @@ impl<R: AsyncRead + Unpin> RecvHalf<R> {
                 .read_message(self.nonce, &self.record, &mut self.out)
                 .context("decrypt failed (tampering or desync)")?;
             self.nonce += 1;
-            self.plain_buf.extend_from_slice(&self.out[..n]);
+            self.absorb(n)?;
         }
+    }
+
+    /// Fold one decrypted record's `n` plaintext bytes into the message being
+    /// reassembled, splitting off the length prefix when the record starts one.
+    ///
+    /// `send` frames a message so it begins at a record boundary, carries its
+    /// whole 4-byte prefix in that first record, and ends its last record
+    /// exactly at the message end — a record never spans two messages. Handing
+    /// `plain_buf` out whole rests on that, so a record that breaks the framing
+    /// is treated as a desync and kills the connection, rather than being
+    /// reassembled into a message silently starting or ending in the wrong
+    /// place. Both bails are unreachable against a conforming sender; a peer
+    /// speaking different framing is refused by the version check long before.
+    fn absorb(&mut self, n: usize) -> Result<()> {
+        let record = &self.out[..n];
+        let (len, payload) = match self.expected_len {
+            Some(len) => (len, record),
+            None => {
+                if record.len() < HEADER {
+                    bail!("framing desync: {n}-byte record cannot carry a length prefix");
+                }
+                let (prefix, rest) = record.split_at(HEADER);
+                let len = u32::from_be_bytes(prefix.try_into().unwrap()) as usize;
+                // Checked before a single payload byte is buffered, so an
+                // oversized claim costs nothing to reject.
+                if len > self.max_message {
+                    bail!("message too large: {len} > {}", self.max_message);
+                }
+                (len, rest)
+            }
+        };
+        if self.plain_buf.len() + payload.len() > len {
+            bail!("framing desync: record overruns the {len}-byte message");
+        }
+        self.plain_buf.extend_from_slice(payload);
+        self.expected_len = Some(len);
+        Ok(())
     }
 }
 
@@ -289,6 +341,13 @@ mod tests {
             let got = brx.recv().await.unwrap();
             assert_eq!(got.len(), size, "wrong length for a {size}-byte message");
             assert_eq!(got, msg, "corrupted round trip for a {size}-byte message");
+            // Handing the reassembly buffer to the caller is only sound while a
+            // message ends exactly where its last record does. These sizes are
+            // where that would break, so pin the reassembler as idle here.
+            assert!(
+                brx.plain_buf.is_empty() && brx.expected_len.is_none(),
+                "leftover reassembly state after a {size}-byte message"
+            );
         }
     }
 

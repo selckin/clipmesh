@@ -17,10 +17,10 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Which watched file an event pertains to.
@@ -31,11 +31,45 @@ enum Target {
 }
 
 impl Target {
+    /// Every watched file. Used to iterate the re-resolve pass, which is
+    /// order-independent (the targets are distinct files with distinct watches).
+    const ALL: [Target; 2] = [Target::Config, Target::Rules];
+
+    /// This target's slot in a [`PerTarget`] flag set. Exhaustive, so adding a
+    /// third watched file is a compile error here rather than a flag silently
+    /// left unhandled at one of the sites that set or read it.
+    fn index(self) -> usize {
+        match self {
+            Target::Config => 0,
+            Target::Rules => 1,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Target::Config => "config file",
             Target::Rules => "MIME-rules file",
         }
+    }
+}
+
+/// One flag per watched file. Replaces a hand-maintained set of parallel
+/// booleans: each `Target` was previously spelled out separately at every site
+/// that set or tested one, so a third watched file meant finding them all with
+/// no help from the compiler.
+#[derive(Default, Clone, Copy)]
+struct PerTarget([bool; 2]);
+
+impl PerTarget {
+    /// Every target flagged — what a dropped-event queue overflow implies.
+    const ALL: PerTarget = PerTarget([true; 2]);
+
+    fn set(&mut self, target: Target) {
+        self.0[target.index()] = true;
+    }
+
+    fn get(self, target: Target) -> bool {
+        self.0[target.index()]
     }
 }
 
@@ -137,9 +171,7 @@ fn watch_forever(
     rules: &Arc<Mutex<MimeRules>>,
     rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) {
-    let mut backoff = crate::backoff::watcher_restart();
-    loop {
-        let started = Instant::now();
+    crate::backoff::supervise("file watcher", || {
         let mut on_config_change = || restart_on_config_change(config_path, original_config);
         // run() only returns on error; falling through reconnects.
         if let Err(e) = run(
@@ -151,11 +183,8 @@ fn watch_forever(
         ) {
             warn!("file watcher error ({e:#}); reconnecting");
         }
-        backoff.reset_if_stable(started.elapsed(), crate::backoff::RESTART_STABLE_AFTER);
-        let delay = backoff.next_delay();
-        warn!("restarting the file watcher in {delay:?}");
-        thread::sleep(delay);
-    }
+        ControlFlow::Continue(())
+    });
 }
 
 /// Add (or widen) the watch on `dir` to include `mask`, registering the UNION
@@ -346,6 +375,15 @@ fn run(
     }
     info!("watching config and MIME-rule files for changes");
 
+    // The one place a target maps back to its path. `None` for the rules file
+    // when none is configured.
+    let path_of = |target: Target| -> Option<&Path> {
+        match target {
+            Target::Config => Some(config_path),
+            Target::Rules => rules_path,
+        }
+    };
+
     // Sized to hold a burst of events in one read (each is a small struct plus
     // the file name) so an editor's flurry of temp-file writes is read at once.
     let mut buf = [0u8; 8192];
@@ -353,10 +391,8 @@ fn run(
         let events = inotify
             .read_events_blocking(&mut buf)
             .context("reading inotify events")?;
-        let mut config_changed = false;
-        let mut rules_changed = false;
-        let mut reresolve_config = false;
-        let mut reresolve_rules = false;
+        let mut changed = PerTarget::default();
+        let mut reresolve = PerTarget::default();
 
         for event in events {
             if event.mask.contains(EventMask::Q_OVERFLOW) {
@@ -364,10 +400,8 @@ fn run(
                 // both files. The rules reload is idempotent and the config check
                 // only restarts on a real, parseable content change.
                 warn!("inotify event queue overflowed; re-checking config and MIME rules");
-                config_changed = true;
-                rules_changed = true;
-                reresolve_config = true;
-                reresolve_rules = true;
+                changed = PerTarget::ALL;
+                reresolve = PerTarget::ALL;
                 continue;
             }
             let Some(name) = event.name else { continue };
@@ -390,39 +424,24 @@ fn run(
                 if !act {
                     continue;
                 }
-                match entry.target {
-                    Target::Config => config_changed = true,
-                    Target::Rules => rules_changed = true,
-                }
+                changed.set(entry.target);
                 // A change at the link site may mean the symlink itself was
                 // (re)created/repointed; re-resolve its target watch below.
                 if entry.site == Site::Link {
-                    match entry.target {
-                        Target::Config => reresolve_config = true,
-                        Target::Rules => reresolve_rules = true,
-                    }
+                    reresolve.set(entry.target);
                 }
             }
         }
 
-        if reresolve_config {
-            reconcile_target(
-                &mut inotify,
-                &mut masks,
-                &mut entries,
-                Target::Config,
-                config_path,
-            );
-        }
-        if reresolve_rules {
-            if let Some(rp) = rules_path {
-                reconcile_target(&mut inotify, &mut masks, &mut entries, Target::Rules, rp);
+        for target in Target::ALL {
+            if let (true, Some(path)) = (reresolve.get(target), path_of(target)) {
+                reconcile_target(&mut inotify, &mut masks, &mut entries, target, path);
             }
         }
 
         // Reload rules before (possibly) restarting on a config change, so a
         // simultaneous edit to both still takes effect.
-        if rules_changed {
+        if changed.get(Target::Rules) {
             let changed = lock_rules(rules).reload_if_changed();
             // Only ping on a *real* external change. Our own writes (adopt /
             // version bump / materialise) return false here, so they don't
@@ -431,7 +450,7 @@ fn run(
                 let _ = rules_changed_tx.try_send(());
             }
         }
-        if config_changed {
+        if changed.get(Target::Config) {
             on_config_change();
         }
     }

@@ -56,6 +56,28 @@ pub fn resolve_link_target(path: &Path) -> PathBuf {
     current
 }
 
+/// Assert that a checked-in generated example matches what its template renders
+/// now, or rewrite it when `CLIPMESH_REGEN_EXAMPLE` is set.
+///
+/// Both generated examples — `examples/config.toml` from `config_template` and
+/// `examples/mimetypes` from `mime::TEMPLATE` — are pinned this way. Sharing the
+/// check keeps the regen protocol and the staleness message identical for both,
+/// so changing how regeneration works is one edit rather than two that can drift.
+#[cfg(test)]
+pub fn assert_matches_generated_example(path: &str, expected: &str, test_name: &str) {
+    // cargo runs tests with CWD = crate root, so `path` is crate-relative.
+    if std::env::var("CLIPMESH_REGEN_EXAMPLE").is_ok() {
+        fs::write(path, expected).unwrap();
+        return;
+    }
+    let actual = fs::read_to_string(path).unwrap();
+    assert_eq!(
+        actual, expected,
+        "{path} is stale; regenerate with \
+         CLIPMESH_REGEN_EXAMPLE=1 cargo test --lib {test_name}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

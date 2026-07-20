@@ -1,5 +1,6 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Wire protocol version. Bumped whenever the on-wire message format changes.
@@ -7,7 +8,9 @@ use uuid::Uuid;
 /// all nodes must run a compatible build. Logged at startup for diagnosis.
 ///
 /// v5: `Clip`/`Rules` carry a single `Version` instead of loose `stamp`/`origin`.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: `Hello` carries a `PeerRole`, and `--paste` asks with `Get`/`GetReply`
+/// instead of scraping the connect-time resync push.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// All MIME representations of one clipboard state, in the source compositor's
 /// advertise order (preference order — richest first), which `IndexMap`
@@ -19,6 +22,23 @@ pub type Offer = IndexMap<String, Vec<u8>>;
 pub enum SelectionKind {
     Clipboard,
     Selection,
+}
+
+impl SelectionKind {
+    /// Every selection, in the canonical order (CLIPBOARD first) that
+    /// per-selection arrays are laid out in and that iteration reports.
+    pub const ALL: [SelectionKind; 2] = [SelectionKind::Clipboard, SelectionKind::Selection];
+
+    /// This selection's slot in a per-selection array laid out as [`ALL`].
+    ///
+    /// The `match` is exhaustive, so adding a variant is a compile error here
+    /// rather than a runtime panic at the first lookup for the new kind.
+    pub fn index(self) -> usize {
+        match self {
+            SelectionKind::Clipboard => 0,
+            SelectionKind::Selection => 1,
+        }
+    }
 }
 
 /// The hybrid-logical-clock value that orders one piece of shared state.
@@ -47,16 +67,84 @@ impl Version {
     }
 }
 
+/// What the far end of a connection is, announced in [`Message::Hello`].
+///
+/// A `Paster` is a one-shot `--paste` client, not a mesh member: it asks one
+/// question and leaves. Distinguishing it is what stops every `wl-paste` from
+/// costing the serving node a full connect-time resync (a rules snapshot plus a
+/// live capture of every synced selection) for a peer that will never sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerRole {
+    /// A clipmesh node. Participates in the mesh: resynced on connect, and a
+    /// target for broadcasts.
+    Peer,
+    /// A `--paste` client. Registered only so its request can be answered.
+    Paster,
+}
+
+/// What a [`Message::Get`] asks for.
+///
+/// Naming the three client modes on the wire is what lets the *node* narrow the
+/// reply. Pulling a whole offer to print one representation was the other half
+/// of the cost here: `-t text/plain` against a clipboard holding a 30 MB PNG
+/// used to transfer the PNG too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetWant {
+    /// Every representation — the default, where the client picks by preference
+    /// order and so must see them all.
+    All,
+    /// Only this type, matched case-insensitively (`--type`).
+    One(String),
+    /// No content at all, just the available type names (`--list-types`).
+    TypesOnly,
+}
+
+/// The answer to a [`Message::Get`].
+///
+/// The variants exist so a failure names its own cause. The pushed-resync design
+/// this replaced could only ever time out, and its message had to list four
+/// unrelated possibilities — empty clipboard, `resync_on_connect` off,
+/// `sync_selection` off, or a slow transfer still in flight — because the client
+/// had never actually asked a question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GetResult {
+    /// The requested representation(s), in the source's advertise order.
+    Offer(Offer),
+    /// The available type names, for [`GetWant::TypesOnly`].
+    Types(Vec<String>),
+    /// The node has nothing on that selection.
+    Empty,
+    /// The node has content, but not the requested type.
+    NotOffered { available: Vec<String> },
+    /// The node does not serve that selection at all — `sync_selection` is off
+    /// for SELECTION, or `direction` makes this node receive-only.
+    NotSynced,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
-    /// First message on every connection: announces the sender's node ID and
-    /// the wire protocol version it speaks. A peer whose version differs is
-    /// refused during the handshake — bincode is not self-describing, so
-    /// mismatched builds would otherwise just fail to decode each other's
-    /// messages and drop the connection with a corruption-like error.
+    /// First message on every connection: announces the sender's node ID, the
+    /// wire protocol version it speaks, and whether it is a mesh peer or a
+    /// one-shot paster. A peer whose version differs is refused during the
+    /// handshake — bincode is not self-describing, so mismatched builds would
+    /// otherwise just fail to decode each other's messages and drop the
+    /// connection with a corruption-like error.
     Hello {
         node_id: Uuid,
         protocol_version: u32,
+        role: PeerRole,
+    },
+    /// Ask for one selection's current content. Answered with [`Message::GetReply`].
+    ///
+    /// This is a *request*, which is the point: the previous `--paste` took
+    /// whatever the node happened to push on connect, so it could not narrow the
+    /// reply, could not be told why it got nothing, and forced the node into a
+    /// full resync to produce an answer at all.
+    Get { kind: SelectionKind, want: GetWant },
+    /// The answer to a [`Message::Get`], echoing the `kind` asked about.
+    GetReply {
+        kind: SelectionKind,
+        result: GetResult,
     },
     /// A clipboard update.
     Clip {
@@ -105,16 +193,26 @@ pub fn content_hash(offer: &Offer) -> [u8; 32] {
 /// carrying the hash forward for free. That turns "did this stage change
 /// anything?" from a flag someone has to thread correctly into something the
 /// types answer.
+///
+/// The offer sits behind an [`Arc`] because that immutability makes sharing
+/// safe, and the engine clones a `Hashed` several times per copy event (one per
+/// planned broadcast and write). Copying the payload each time would cost a full
+/// duplicate of the clipboard — up to `max_payload_size` — per clone, so clones
+/// bump a refcount instead and `into_offer` only copies when it isn't the last
+/// holder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hashed {
-    offer: Offer,
+    offer: Arc<Offer>,
     hash: [u8; 32],
 }
 
 impl Hashed {
     pub fn new(offer: Offer) -> Hashed {
         let hash = content_hash(&offer);
-        Hashed { offer, hash }
+        Hashed {
+            offer: Arc::new(offer),
+            hash,
+        }
     }
 
     pub fn hash(&self) -> [u8; 32] {
@@ -125,8 +223,10 @@ impl Hashed {
         &self.offer
     }
 
+    /// Free when this is the last holder; copies the offer only when it is
+    /// still shared.
     pub fn into_offer(self) -> Offer {
-        self.offer
+        Arc::try_unwrap(self.offer).unwrap_or_else(|shared| (*shared).clone())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -287,8 +387,23 @@ mod tests {
         let hello = Message::Hello {
             node_id: Uuid::new_v4(),
             protocol_version: PROTOCOL_VERSION,
+            role: PeerRole::Peer,
         };
         assert_eq!(decode(&encode(&hello)).unwrap(), hello);
+
+        let get = Message::Get {
+            kind: SelectionKind::Selection,
+            want: GetWant::One("text/plain".to_string()),
+        };
+        assert_eq!(decode(&encode(&get)).unwrap(), get);
+
+        let reply = Message::GetReply {
+            kind: SelectionKind::Clipboard,
+            result: GetResult::NotOffered {
+                available: vec!["image/png".to_string()],
+            },
+        };
+        assert_eq!(decode(&encode(&reply)).unwrap(), reply);
 
         let o = offer(&[("text/plain", b"payload")]);
         let clip = Message::Clip {

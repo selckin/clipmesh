@@ -9,8 +9,8 @@ use crate::clipboard::wayland::read_offer_blocking;
 use crate::clipboard::ClipboardEvent;
 use crate::protocol::SelectionKind;
 use anyhow::{bail, Context, Result};
+use std::ops::ControlFlow;
 use std::thread;
-use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
@@ -48,24 +48,20 @@ pub fn spawn_watcher(
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
 fn run(tx: mpsc::UnboundedSender<ClipboardEvent>, watched: Vec<SelectionKind>, max_payload: usize) {
-    let mut backoff = crate::backoff::watcher_restart();
-    loop {
-        let started = Instant::now();
+    crate::backoff::supervise("clipboard watcher", || {
         match watch_once(&tx, &watched, max_payload) {
-            Ok(StopReason::ReceiverGone) => return, // engine gone; stop watching
+            // engine gone; stop watching
+            Ok(StopReason::ReceiverGone) => return ControlFlow::Break(()),
             Ok(StopReason::Finished) => {
                 warn!("compositor closed the clipboard watcher; reconnecting")
             }
             Err(e) => error!("clipboard watcher failed: {e:#}"),
         }
         if tx.is_closed() {
-            return;
+            return ControlFlow::Break(());
         }
-        backoff.reset_if_stable(started.elapsed(), crate::backoff::RESTART_STABLE_AFTER);
-        let delay = backoff.next_delay();
-        warn!("restarting the clipboard watcher in {delay:?}");
-        thread::sleep(delay);
-    }
+        ControlFlow::Continue(())
+    });
 }
 
 enum StopReason {

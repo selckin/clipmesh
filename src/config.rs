@@ -109,6 +109,38 @@ struct RawConfig {
     mime_rules_file: Option<String>,
 }
 
+/// Every TOML key the config parser accepts — the schema `config_template`
+/// checks its `TEMPLATE` against, so an option with no block is caught here
+/// instead of being silently deleted from a user's file by `--sync-config`.
+///
+/// Written out by hand but not taken on trust, from both directions: adding a
+/// field to `RawConfig` breaks the no-rest-pattern destructure in `from_toml`
+/// (which points back here), and `raw_config_keys_matches_the_struct` pins this
+/// list to the field names serde itself reports, so a typo, a stale entry, or a
+/// `#[serde(rename)]` that moves a key can't pass unnoticed.
+pub const RAW_CONFIG_KEYS: [&str; 20] = [
+    "listen",
+    "port",
+    "peers",
+    "psk",
+    "psk_file",
+    "psk_env",
+    "max_payload_size",
+    "debounce_ms",
+    "sync_selection",
+    "link_selections",
+    "direction",
+    "exclude_sensitive",
+    "resync_on_connect",
+    "share_mime_rules",
+    "verbose",
+    "log_level",
+    "unknown_mime",
+    "synthesize_text_plain",
+    "take_ownership",
+    "mime_rules_file",
+];
+
 fn default_port() -> u16 {
     48100
 }
@@ -266,17 +298,44 @@ impl Config {
 
     pub fn from_toml(text: &str) -> Result<Config> {
         let raw: RawConfig = toml::from_str(text).context("parsing config")?;
-        let secret = match (&raw.psk, &raw.psk_file, &raw.psk_env) {
-            (Some(s), None, None) => s.clone(),
+        // Destructured with no `..` rest pattern on purpose. A field added to
+        // `RawConfig` then fails to compile right here until it is handled —
+        // which is the moment to also add it to `RAW_CONFIG_KEYS` above, and so
+        // to the `--sync-config` template. Without that stop, a new option would
+        // parse fine and quietly vanish from any config file that set it.
+        let RawConfig {
+            listen,
+            port,
+            peers,
+            psk,
+            psk_file,
+            psk_env,
+            max_payload_size,
+            debounce_ms,
+            sync_selection,
+            link_selections,
+            direction,
+            exclude_sensitive,
+            resync_on_connect,
+            share_mime_rules,
+            verbose,
+            log_level,
+            unknown_mime,
+            synthesize_text_plain,
+            take_ownership,
+            mime_rules_file,
+        } = raw;
+        let secret = match (psk, psk_file, psk_env) {
+            (Some(s), None, None) => s,
             (None, Some(f), None) => {
-                let path = shellexpand::tilde(f).into_owned();
+                let path = shellexpand::tilde(&f).into_owned();
                 fs::read_to_string(&path)
                     .with_context(|| format!("reading psk_file {path}"))?
                     .trim()
                     .to_string()
             }
             (None, None, Some(var)) => {
-                std::env::var(var).with_context(|| format!("reading psk_env {var}"))?
+                std::env::var(&var).with_context(|| format!("reading psk_env {var}"))?
             }
             _ => bail!("exactly one of psk, psk_file, psk_env must be set"),
         };
@@ -287,44 +346,39 @@ impl Config {
         // left inside `listen` would silently shadow `port` (and the port peers
         // inherit), turning a half-migrated config into a mesh that never forms,
         // so reject it with a pointer to the right field.
-        if let Some(p) = port_of(&raw.listen) {
+        if let Some(p) = port_of(&listen) {
             bail!(
-                "listen must not include a port (found {p:?} in {:?}); \
-                 set the port with the separate `port` field instead",
-                raw.listen
+                "listen must not include a port (found {p:?} in {listen:?}); \
+                 set the port with the separate `port` field instead"
             );
         }
         // Combine them, and let any peer without its own port reuse the port.
-        let port = raw.port.to_string();
-        let listen = with_default_port(&raw.listen, &port);
-        let peers = raw
-            .peers
-            .iter()
-            .map(|p| with_default_port(p, &port))
-            .collect();
+        let port_text = port.to_string();
         Ok(Config {
-            listen,
-            port: raw.port,
-            peers,
+            listen: with_default_port(&listen, &port_text),
+            port,
+            peers: peers
+                .iter()
+                .map(|p| with_default_port(p, &port_text))
+                .collect(),
             psk: *blake3::hash(secret.as_bytes()).as_bytes(),
-            max_payload_size: match parse_size(&raw.max_payload_size)? {
+            max_payload_size: match parse_size(&max_payload_size)? {
                 0 => bail!("max_payload_size must be greater than 0"),
                 n => n,
             },
-            debounce_ms: raw.debounce_ms,
-            sync_selection: raw.sync_selection,
-            link_selections: raw.link_selections,
-            direction: raw.direction,
-            exclude_sensitive: raw.exclude_sensitive,
-            resync_on_connect: raw.resync_on_connect,
-            share_mime_rules: raw.share_mime_rules,
-            verbose: raw.verbose,
-            log_level: raw.log_level,
-            unknown_mime: raw.unknown_mime,
-            synthesize_text_plain: raw.synthesize_text_plain,
-            take_ownership: raw.take_ownership,
-            mime_rules_path: raw
-                .mime_rules_file
+            debounce_ms,
+            sync_selection,
+            link_selections,
+            direction,
+            exclude_sensitive,
+            resync_on_connect,
+            share_mime_rules,
+            verbose,
+            log_level,
+            unknown_mime,
+            synthesize_text_plain,
+            take_ownership,
+            mime_rules_path: mime_rules_file
                 .map(|f| PathBuf::from(shellexpand::tilde(&f).into_owned())),
         })
     }
@@ -629,6 +683,74 @@ selection_to_clipboard = true
             assert_eq!(link.clipboard_to_selection, clip_to_sel, "{link:?}");
             assert_eq!(link.selection_to_clipboard, sel_to_clip, "{link:?}");
         }
+    }
+
+    /// A `Deserializer` that answers nothing and only records the field list
+    /// serde hands it for a struct. Derived `Deserialize` impls pass that list
+    /// to `deserialize_struct` — it is the same list `deny_unknown_fields`
+    /// builds its error message from, but taken from the API instead of scraped
+    /// out of the prose, and already carrying any `#[serde(rename)]`.
+    struct FieldSpy<'a>(&'a mut Vec<&'static str>);
+
+    /// The spy always stops immediately; nothing inspects why.
+    #[derive(Debug)]
+    struct Stop;
+
+    impl std::fmt::Display for Stop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("field capture stops here")
+        }
+    }
+    impl std::error::Error for Stop {}
+    impl serde::de::Error for Stop {
+        fn custom<T: std::fmt::Display>(_: T) -> Self {
+            Stop
+        }
+    }
+
+    impl<'de> serde::Deserializer<'de> for FieldSpy<'_> {
+        type Error = Stop;
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Stop> {
+            self.0.extend_from_slice(fields);
+            Err(Stop)
+        }
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _visitor: V,
+        ) -> Result<V::Value, Stop> {
+            Err(Stop)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    /// `RAW_CONFIG_KEYS` must name exactly the keys `RawConfig` accepts. The
+    /// compiler catches a *new* field (`from_toml`'s destructure won't build
+    /// until it's handled), but nothing stops that fix from touching only the
+    /// destructure — so pin the list to serde's own view of the struct, which
+    /// also catches a removed field left behind here and a renamed key.
+    #[test]
+    fn raw_config_keys_matches_the_struct() {
+        let mut fields = Vec::new();
+        let _ = RawConfig::deserialize(FieldSpy(&mut fields));
+        fields.sort_unstable();
+        let mut declared = RAW_CONFIG_KEYS;
+        declared.sort_unstable();
+        assert_eq!(
+            fields, declared,
+            "RAW_CONFIG_KEYS has drifted from RawConfig's fields"
+        );
     }
 
     #[test]

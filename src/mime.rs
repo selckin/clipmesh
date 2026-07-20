@@ -314,10 +314,21 @@ impl MimeRules {
     }
 
     fn write_file(&mut self) {
+        if self.path.is_none() {
+            return;
+        }
+        let text = self.body();
+        self.write_text(text);
+    }
+
+    /// `write_file` for a body the caller has already rendered. Rendering clones
+    /// the document, sorts `[rules]` and serialises it, so a snapshot — which
+    /// needs the body anyway to measure and to send — passes its copy here
+    /// rather than making `write_file` render an identical second one.
+    fn write_text(&mut self, text: String) {
         let Some(path) = self.path.clone() else {
             return;
         };
-        let text = self.body();
         match fs::write(&path, &text) {
             Ok(()) => {
                 // Remember our own write so reload_if_changed treats it as
@@ -397,11 +408,7 @@ impl MimeRules {
         if unseen.is_empty() {
             return false;
         }
-        let action = if self.unknown == MimePolicy::Allow {
-            "allow"
-        } else {
-            "deny"
-        };
+        let action = rule_word(self.unknown == MimePolicy::Allow);
         // A type repeated in `mimes` yields the same key twice; the second write
         // is identical to the first, so this stays idempotent.
         for m in &unseen {
@@ -448,7 +455,7 @@ impl MimeRules {
     /// Add or replace a single `allow`/`deny` rule for `key` (which may be a
     /// glob). Used by the `--allow`/`--deny` CLI.
     pub fn set_rule(&mut self, key: &str, allow: bool) {
-        table_mut(&mut self.doc, "rules")[key] = value(if allow { "allow" } else { "deny" });
+        table_mut(&mut self.doc, "rules")[key] = value(rule_word(allow));
         self.dirty = true;
     }
 
@@ -530,15 +537,35 @@ impl MimeRules {
         !self.dirty
     }
 
+    /// `persist` for a body the caller has already rendered. See [`write_text`].
+    ///
+    /// [`write_text`]: MimeRules::write_text
+    fn persist_text(&mut self, text: String) -> bool {
+        if self.dirty {
+            self.write_text(text);
+        }
+        !self.dirty
+    }
+
     /// Discard in-memory changes and restore the ruleset to the last content we
     /// read or wrote (`loaded`). Used to roll back a stamp bump or an adoption
     /// after a failed `persist`, so the in-memory rules never silently diverge
     /// from what's on disk (which would otherwise be lost on restart).
     fn revert_to_loaded(&mut self) {
-        self.doc = match self.loaded.as_deref() {
-            Some(text) => text.parse().unwrap_or_default(),
-            None => DocumentMut::new(),
-        };
+        match self.loaded.as_deref().map(str::parse::<DocumentMut>) {
+            Some(Ok(doc)) => self.doc = doc,
+            // Unreachable: `loaded` is only ever set from text that already
+            // parsed (a file we read) or that we rendered ourselves. Keeping the
+            // current document is the safe answer if it somehow happens anyway —
+            // this is the *rollback* path, so the obvious `unwrap_or_default()`
+            // would install an EMPTY ruleset, and under the default
+            // `unknown_mime = deny` that silently stops syncing every type until
+            // restart.
+            Some(Err(e)) => {
+                warn!("couldn't restore the last-good MIME rules ({e}); keeping the current ones")
+            }
+            None => self.doc = DocumentMut::new(),
+        }
         self.dirty = false;
     }
 
@@ -613,7 +640,7 @@ impl MimeRules {
             self.revert_to_loaded();
             return Err(SnapshotError::TooLarge { len: body.len() });
         }
-        if !self.persist() {
+        if !self.persist_text(body.clone()) {
             self.revert_to_loaded();
             return Err(SnapshotError::WriteFailed);
         }
@@ -928,6 +955,16 @@ fn normalize(doc: &mut DocumentMut) {
     }
 }
 
+/// The rules-file word for an allow/deny decision. One definition, so the
+/// literals that go into the file and the ones reported to the user can't drift.
+pub fn rule_word(allow: bool) -> &'static str {
+    if allow {
+        "allow"
+    } else {
+        "deny"
+    }
+}
+
 /// Extract the `(rule, max)` strings from a `[rules]` value: a `"allow"`/`"deny"`
 /// string, or a `{ rule = "...", max = "..." }` (inline or regular) table.
 /// Returns None if the value isn't a recognizable rule shape.
@@ -935,12 +972,10 @@ fn rule_fields(item: &Item) -> Option<(&str, Option<&str>)> {
     if let Some(s) = item.as_str() {
         return Some((s, None));
     }
-    if let Some(t) = item.as_inline_table() {
-        let rule = t.get("rule").and_then(Value::as_str)?;
-        return Some((rule, t.get("max").and_then(Value::as_str)));
-    }
-    let t = item.as_table()?;
-    let rule = t.get("rule").and_then(Item::as_str)?;
+    // `TableLike` covers both table flavours, so the two shapes share one
+    // extraction and a new rule key is a single edit.
+    let t = item.as_table_like()?;
+    let rule = t.get("rule")?.as_str()?;
     Some((rule, t.get("max").and_then(Item::as_str)))
 }
 
@@ -1257,17 +1292,10 @@ mod tests {
 
     #[test]
     fn example_mimetypes_matches_template() {
-        let expected = render_example();
-        let path = "examples/mimetypes"; // cargo runs tests with CWD = crate root
-        if std::env::var("CLIPMESH_REGEN_EXAMPLE").is_ok() {
-            std::fs::write(path, &expected).unwrap();
-            return;
-        }
-        let actual = std::fs::read_to_string(path).unwrap();
-        assert_eq!(
-            actual, expected,
-            "examples/mimetypes is stale; regenerate with \
-             CLIPMESH_REGEN_EXAMPLE=1 cargo test --lib example_mimetypes_matches_template"
+        crate::fsutil::assert_matches_generated_example(
+            "examples/mimetypes",
+            &render_example(),
+            "example_mimetypes_matches_template",
         );
     }
 

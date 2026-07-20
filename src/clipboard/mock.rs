@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 /// In-memory clipboard for tests. Mirrors real-clipboard behavior:
 /// programmatic writes re-fire the watcher (exercising echo suppression).
@@ -15,6 +15,9 @@ pub struct MockClipboard {
     writes: AtomicUsize,
     fail_writes: std::sync::atomic::AtomicBool,
     fail_reads: std::sync::atomic::AtomicBool,
+    /// `Some` while reads are gated by `block_reads`; `None` (the default) lets
+    /// them through immediately.
+    read_gate: Mutex<Option<Arc<Semaphore>>>,
 }
 
 impl MockClipboard {
@@ -26,6 +29,7 @@ impl MockClipboard {
             writes: AtomicUsize::new(0),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
             fail_reads: std::sync::atomic::AtomicBool::new(false),
+            read_gate: Mutex::new(None),
         })
     }
 
@@ -38,6 +42,29 @@ impl MockClipboard {
     /// Make subsequent read_offer calls fail (simulates a transient read error).
     pub fn set_fail_reads(&self, fail: bool) {
         self.fail_reads.store(fail, Ordering::SeqCst);
+    }
+
+    /// Stall every subsequent `read_offer` until [`allow_reads`], modelling a
+    /// slow or unresponsive selection owner. Left blocked, it models one that
+    /// never answers at all.
+    ///
+    /// This is what lets the `Initial`-contract tests be exact rather than
+    /// hopeful: with reads gated, any content the engine has must have come from
+    /// the backend's `Initial` event, so "read it back later" implementations
+    /// fail the test deterministically instead of occasionally.
+    ///
+    /// [`allow_reads`]: MockClipboard::allow_reads
+    pub fn block_reads(&self) {
+        *self.read_gate.lock().unwrap() = Some(Arc::new(Semaphore::new(0)));
+    }
+
+    /// Release reads stalled by [`block_reads`], and stop gating later ones.
+    ///
+    /// [`block_reads`]: MockClipboard::block_reads
+    pub fn allow_reads(&self) {
+        if let Some(gate) = self.read_gate.lock().unwrap().take() {
+            gate.add_permits(Semaphore::MAX_PERMITS);
+        }
     }
 
     /// Seed existing clipboard content without notifying watchers, modelling
@@ -113,6 +140,12 @@ impl Clipboard for MockClipboard {
     async fn read_offer(&self, kind: SelectionKind) -> Result<Offer> {
         if self.fail_reads.load(Ordering::SeqCst) {
             anyhow::bail!("simulated clipboard read failure");
+        }
+        // Clone the gate out before awaiting: the std mutex must not be held
+        // across an await point.
+        let gate = self.read_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let _permit = gate.acquire().await;
         }
         Ok(self.get(kind).unwrap_or_default())
     }
