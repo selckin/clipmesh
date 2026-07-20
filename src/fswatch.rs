@@ -11,7 +11,7 @@
 
 use crate::config::Config;
 use crate::fsutil::{is_symlink, resolve_link_target};
-use crate::mime::MimeRules;
+use crate::mime::{lock_rules, MimeRules};
 use anyhow::{Context, Result};
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Which watched file an event pertains to.
@@ -137,12 +137,7 @@ fn watch_forever(
     rules: &Arc<Mutex<MimeRules>>,
     rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) {
-    const RESTART_MIN: Duration = Duration::from_secs(1);
-    const RESTART_MAX: Duration = Duration::from_secs(30);
-    /// A run shorter than this counts as a failure and escalates backoff.
-    const STABLE_AFTER: Duration = Duration::from_secs(5);
-
-    let mut delay = RESTART_MIN;
+    let mut delay = crate::backoff::RESTART_MIN;
     loop {
         let started = Instant::now();
         let mut on_config_change = || restart_on_config_change(config_path, original_config);
@@ -156,13 +151,7 @@ fn watch_forever(
         ) {
             warn!("file watcher error ({e:#}); reconnecting");
         }
-        delay = crate::backoff::next_delay(
-            delay,
-            started.elapsed(),
-            RESTART_MIN,
-            RESTART_MAX,
-            STABLE_AFTER,
-        );
+        delay = crate::backoff::restart_delay(delay, started.elapsed());
         warn!("restarting the file watcher in {delay:?}");
         thread::sleep(delay);
     }
@@ -427,10 +416,7 @@ fn run(
         // Reload rules before (possibly) restarting on a config change, so a
         // simultaneous edit to both still takes effect.
         if rules_changed {
-            let changed = rules
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .reload_if_changed();
+            let changed = lock_rules(rules).reload_if_changed();
             // Only ping on a *real* external change. Our own writes (adopt /
             // version bump / materialise) return false here, so they don't
             // trigger a spurious bump-and-rebroadcast loop.

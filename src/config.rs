@@ -54,15 +54,6 @@ impl LinkSelections {
         clipboard_to_selection: true,
         selection_to_clipboard: true,
     };
-
-    /// True when CLIPBOARD changes should be mirrored into the SELECTION.
-    pub fn clip_to_selection(self) -> bool {
-        self.clipboard_to_selection
-    }
-    /// True when SELECTION changes should be mirrored into the CLIPBOARD.
-    pub fn selection_to_clip(self) -> bool {
-        self.selection_to_clipboard
-    }
 }
 
 /// Raw on-disk shape; resolved into `Config`.
@@ -253,7 +244,7 @@ impl Config {
     /// (`selection_to_clipboard`/`both`). Single source of truth for both the
     /// backend wiring (`main`) and the engine's `watched_kinds`.
     pub fn watch_selection(&self) -> bool {
-        self.sync_selection || self.link_selections.selection_to_clip()
+        self.sync_selection || self.link_selections.selection_to_clipboard
     }
 
     pub fn load(path: &Path) -> Result<Config> {
@@ -635,16 +626,19 @@ selection_to_clipboard = true
         assert!(Config::from_toml("listen = \"x\"\npsk = \"s\"\nsync_primary = true\n").is_err());
     }
 
+    /// Pins the four named direction constants to their intended field pairs —
+    /// easy to typo, and `link_partner` dispatches on exactly these.
     #[test]
-    fn link_selections_direction_helpers() {
-        assert!(!LinkSelections::OFF.clip_to_selection());
-        assert!(!LinkSelections::OFF.selection_to_clip());
-        assert!(LinkSelections::CLIPBOARD_TO_SELECTION.clip_to_selection());
-        assert!(!LinkSelections::CLIPBOARD_TO_SELECTION.selection_to_clip());
-        assert!(!LinkSelections::SELECTION_TO_CLIPBOARD.clip_to_selection());
-        assert!(LinkSelections::SELECTION_TO_CLIPBOARD.selection_to_clip());
-        assert!(LinkSelections::BOTH.clip_to_selection());
-        assert!(LinkSelections::BOTH.selection_to_clip());
+    fn link_selections_named_directions_have_the_right_fields() {
+        for (link, clip_to_sel, sel_to_clip) in [
+            (LinkSelections::OFF, false, false),
+            (LinkSelections::CLIPBOARD_TO_SELECTION, true, false),
+            (LinkSelections::SELECTION_TO_CLIPBOARD, false, true),
+            (LinkSelections::BOTH, true, true),
+        ] {
+            assert_eq!(link.clipboard_to_selection, clip_to_sel, "{link:?}");
+            assert_eq!(link.selection_to_clipboard, sel_to_clip, "{link:?}");
+        }
     }
 
     #[test]

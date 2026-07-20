@@ -17,7 +17,20 @@ use crate::config::{parse_size, MimePolicy};
 use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use toml_edit::{value, Decor, DocumentMut, Item, Key, Table, Value};
+
+/// Lock the shared rules, tolerating a poisoned mutex.
+///
+/// `MimeRules` has no cross-field invariant that a panic mid-update could leave
+/// half-applied — the worst case is an unsaved edit — so recovering the guard is
+/// strictly better than propagating the panic into the engine or the fswatch
+/// thread and taking clipboard sync down with it.
+pub fn lock_rules(rules: &Mutex<MimeRules>) -> MutexGuard<'_, MimeRules> {
+    rules
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -409,6 +422,7 @@ impl MimeRules {
     }
 
     /// Whether there are in-memory rule changes not yet written to disk.
+    #[cfg(test)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

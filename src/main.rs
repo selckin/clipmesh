@@ -158,34 +158,52 @@ fn sync_config_action(config_path: &Path) -> Result<()> {
 /// Apply a single `--allow`/`--deny` glob to the MIME-rules file and exit. Any
 /// existing entries the new glob now covers are removed and echoed back so the
 /// user can re-add the ones they want to keep as exceptions.
+/// State of the MIME rules file as found on disk by [`open_rules_file`].
+enum RulesFile {
+    /// Exists and parses as TOML.
+    Present,
+    /// Exists but holds only whitespace.
+    Empty,
+    /// Not there at all.
+    Missing,
+}
+
+/// Resolve the MIME rules path from the config and validate the file up front,
+/// for the one-shot CLI commands.
+///
+/// Validating here is the point: `MimeRules::load` silently heals an unparseable
+/// file into a fresh skeleton — a write, which also drops the `[clipmesh]` sync
+/// version — so a CLI command must refuse before it ever gets that far. Callers
+/// decide for themselves what `Empty`/`Missing` mean: a writer creates the file,
+/// a reader reports and stops.
+fn open_rules_file(config_path: &Path) -> Result<(Config, PathBuf, RulesFile)> {
+    let cfg = Config::load(config_path)?;
+    let path = cfg
+        .mime_rules_path
+        .clone()
+        .context("no MIME rules file is configured")?;
+    let state = match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => RulesFile::Empty,
+        Ok(text) => {
+            text.parse::<toml_edit::DocumentMut>().with_context(|| {
+                format!("{} isn't valid TOML — fix or delete it", path.display())
+            })?;
+            RulesFile::Present
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RulesFile::Missing,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok((cfg, path, state))
+}
+
 fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()> {
     if pattern.trim().is_empty() {
         bail!("the --allow/--deny pattern must not be empty");
     }
     init_cli_logging();
 
-    let cfg = Config::load(config_path)?;
-    let path = cfg
-        .mime_rules_path
-        .clone()
-        .context("no MIME rules file is configured")?;
-    // A one-shot edit must not silently discard the user's file: if it exists but
-    // isn't valid TOML, refuse rather than let MimeRules::load reset it to a
-    // fresh skeleton (which would also drop the [clipmesh] sync version).
-    match std::fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => {
-            text.parse::<toml_edit::DocumentMut>().with_context(|| {
-                format!(
-                    "{} isn't valid TOML — fix or delete it before editing rules",
-                    path.display()
-                )
-            })?;
-        }
-        Ok(_) => {} // absent-equivalent (empty): a fresh file is fine
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    }
-
+    // Empty or missing is fine here — MimeRules::load creates a fresh file.
+    let (cfg, path, _) = open_rules_file(config_path)?;
     let mut rules = MimeRules::load(Some(path.clone()), cfg.unknown_mime);
     let removed = rules.apply_glob(allow, pattern);
     if !rules.persist() {
@@ -212,27 +230,17 @@ fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()>
 /// creates or rewrites the file.
 fn print_rules(config_path: &Path) -> Result<()> {
     init_cli_logging();
-    let cfg = Config::load(config_path)?;
-    let path = cfg
-        .mime_rules_path
-        .clone()
-        .context("no MIME rules file is configured")?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) if text.trim().is_empty() => {
+    let (cfg, path, state) = open_rules_file(config_path)?;
+    match state {
+        RulesFile::Empty => {
             println!("The MIME rules file {} is empty.", path.display());
             return Ok(());
         }
-        // Validate up front so a corrupt file reports a clear error instead of
-        // MimeRules::load silently healing it into a fresh skeleton (a write).
-        Ok(text) => {
-            text.parse::<toml_edit::DocumentMut>()
-                .with_context(|| format!("{} isn't valid TOML", path.display()))?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        RulesFile::Missing => {
             println!("No MIME rules file yet at {}", path.display());
             return Ok(());
         }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        RulesFile::Present => {}
     }
     // The file exists and is valid TOML, so this reads it without writing.
     let rules = MimeRules::load(Some(path.clone()), cfg.unknown_mime);

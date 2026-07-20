@@ -1,7 +1,7 @@
 use crate::clipboard::Clipboard;
 use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
-use crate::mime::MimeRules;
+use crate::mime::{lock_rules, MimeRules};
 use crate::protocol::{content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -237,12 +237,12 @@ struct BatchPlan {
 }
 
 /// The selection a configured link direction mirrors `kind` INTO, or `None`.
-/// Free-function twin of `SyncEngine::bridge_partner`, so the pure planner needs
-/// no `&self`.
+/// Single place that maps the `link_selections` directions to a source→partner
+/// pair. A free function so the pure planner needs no `&self`.
 fn link_partner(kind: SelectionKind, link: LinkSelections) -> Option<SelectionKind> {
     match kind {
-        SelectionKind::Clipboard if link.clip_to_selection() => Some(SelectionKind::Selection),
-        SelectionKind::Selection if link.selection_to_clip() => Some(SelectionKind::Clipboard),
+        SelectionKind::Clipboard if link.clipboard_to_selection => Some(SelectionKind::Selection),
+        SelectionKind::Selection if link.selection_to_clipboard => Some(SelectionKind::Clipboard),
         _ => None,
     }
 }
@@ -346,13 +346,6 @@ impl<C: Clipboard> SyncEngine<C> {
         kinds
     }
 
-    /// The selection the local bridge mirrors changes in `kind` *into*, or
-    /// `None` when no bridge direction is configured for `kind`. Single place
-    /// that maps the `link_selections` directions to a source→partner pair.
-    fn bridge_partner(&self, kind: SelectionKind) -> Option<SelectionKind> {
-        link_partner(kind, self.cfg.link_selections)
-    }
-
     fn may_send(&self, kind: SelectionKind) -> bool {
         self.cfg.direction != Direction::ReceiveOnly
             && (kind != SelectionKind::Selection || self.cfg.sync_selection)
@@ -378,6 +371,19 @@ impl<C: Clipboard> SyncEngine<C> {
         *c = (*c).max(stamp);
     }
 
+    /// Gate an inbound stamp into the hybrid clock: drop implausibly-future
+    /// stamps before they reach it, so one peer with a broken clock can't poison
+    /// ordering for this node, then fold an accepted stamp in. `what` names the
+    /// message kind for the warning. Returns whether the stamp was accepted.
+    fn accept_stamp(&self, stamp: u64, from: Uuid, what: &str) -> bool {
+        if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
+            warn!("rejecting {what} from peer {from}: timestamp {stamp} is implausibly far in the future (peer clock skew?)");
+            return false;
+        }
+        self.observe(stamp);
+        true
+    }
+
     /// Main loop. Debounce lives in the select as a deadline arm so that a
     /// storm of local change events can never starve inbound/connect
     /// processing. Runs until any of its input channels close.
@@ -393,11 +399,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // local edit outranks it after a restart.
         {
             let own_id = self.mesh.own_id();
-            let (stamp, _) = self
-                .mime_rules
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .version(own_id);
+            let (stamp, _) = lock_rules(&self.mime_rules).version(own_id);
             self.observe(stamp);
         }
 
@@ -600,10 +602,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// clobbering them). Recovers a poisoned lock rather than cascading the
     /// panic to the watcher thread.
     fn apply_mime_rules(&self, offer: Offer, record_unseen: bool) -> Offer {
-        let mut rules = self
-            .mime_rules
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rules = lock_rules(&self.mime_rules);
         if record_unseen {
             let mut appended = false;
             if rules.has_unseen(offer.keys()) {
@@ -721,7 +720,9 @@ impl<C: Clipboard> SyncEngine<C> {
     /// node sends it), the selection bridge, or the ownership rewrite. When none
     /// would, `handle_batch` skips the read entirely.
     fn has_local_sink(&self, kind: SelectionKind) -> bool {
-        self.may_send(kind) || self.bridge_partner(kind).is_some() || self.cfg.take_ownership
+        self.may_send(kind)
+            || link_partner(kind, self.cfg.link_selections).is_some()
+            || self.cfg.take_ownership
     }
 
     /// Drain one debounce batch: read each fired selection once, plan every
@@ -807,22 +808,26 @@ impl<C: Clipboard> SyncEngine<C> {
         if final_offer.is_empty() {
             return;
         }
+        let h = content_hash(&final_offer);
         if prov == Provenance::Mirror {
             // Reconcile against the partner's ACTUAL content (handles out-of-band
             // drift; the partner may be unwatched). Reuse a read from this batch if
             // the partner fired, else read once. A failed read falls through to a
             // best-effort, self-terminating mirror (matching the old bridge_from).
+            let read;
             let partner_now = match read_cache.get(&kind) {
-                Some(o) => Some(o.clone()),
-                None => self.read_selection(kind).await,
+                Some(o) => Some(o),
+                None => {
+                    read = self.read_selection(kind).await;
+                    read.as_ref()
+                }
             };
             if let Some(now) = partner_now {
-                if content_hash(&now) == content_hash(&final_offer) {
+                if content_hash(now) == h {
                     return;
                 }
             }
         }
-        let h = content_hash(&final_offer);
         let copied = self.cfg.verbose.then(|| describe_offer(&final_offer));
         // Record BEFORE the write so the watch echo it produces is recognised.
         self.last_written.lock().unwrap().insert(kind, h);
@@ -871,10 +876,7 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         let own_id = self.mesh.own_id();
         let (stamp, origin, body) = {
-            let mut rules = self
-                .mime_rules
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut rules = lock_rules(&self.mime_rules);
             // Read the version once; set_version below stores exactly this, so
             // it is also what we send.
             let (stamp, origin) = rules.version(own_id);
@@ -1007,13 +1009,9 @@ impl<C: Clipboard> SyncEngine<C> {
             warn!("dropping update from peer {from}: content hash doesn't match (corrupted or tampered)");
             return "rejected (content hash mismatch)";
         }
-        // Drop implausibly-future stamps before they reach the clock, so one
-        // peer with a broken clock can't poison ordering for this node.
-        if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
-            warn!("rejecting update from peer {from}: timestamp {stamp} is implausibly far in the future (peer clock skew?)");
+        if !self.accept_stamp(stamp, from, "update") {
             return "rejected (timestamp too far in the future)";
         }
-        self.observe(stamp);
         // Apply the receiver's own content policy: configs can differ
         // between peers, and a node must not write contents it would never
         // have sent (e.g. password-manager secrets, or denied MIME types). Do
@@ -1104,10 +1102,7 @@ impl<C: Clipboard> SyncEngine<C> {
         let stamp = self.tick();
         let origin = self.mesh.own_id();
         let body = {
-            let mut rules = self
-                .mime_rules
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut rules = lock_rules(&self.mime_rules);
             rules.set_version(stamp, origin);
             // Measure the real (post-stamp) body, then persist. If it's over the
             // wire limit or the write fails, roll the stamp back: we must not
@@ -1144,16 +1139,11 @@ impl<C: Clipboard> SyncEngine<C> {
         if !self.rules_body_ok(body.len(), &format!(" from peer {from}")) {
             return;
         }
-        if stamp > now_ms().saturating_add(MAX_FUTURE_SKEW_MS) {
-            warn!("rejecting MIME-rules from peer {from}: timestamp {stamp} is implausibly far in the future (peer clock skew?)");
+        if !self.accept_stamp(stamp, from, "MIME-rules") {
             return;
         }
-        self.observe(stamp);
         let own_id = self.mesh.own_id();
-        let mut rules = self
-            .mime_rules
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rules = lock_rules(&self.mime_rules);
         let current = rules.version(own_id);
         if (stamp, origin) > current {
             debug!(
@@ -3420,9 +3410,8 @@ mod tests {
     }
 
     // ---- plan_batch (pure) ----
-    // `IndexMap` resolves via `use super::*` once Step 3 adds the module-level
-    // import; do NOT add a `use indexmap::IndexMap;` here (it would become a
-    // redundant import and fail clippy -D warnings).
+    // `IndexMap` resolves via `use super::*`; do NOT add a `use indexmap::IndexMap;`
+    // here (it would be a redundant import and fail clippy -D warnings).
 
     fn reads_of(pairs: &[(SelectionKind, &str)]) -> IndexMap<SelectionKind, Offer> {
         pairs.iter().map(|(k, t)| (*k, offer(t))).collect()

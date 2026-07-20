@@ -139,6 +139,8 @@ where
 
     let reader_mesh = mesh.clone();
     let mut reader = tokio::spawn(async move {
+        // The loop diverges, so the task's Result type is pinned by this binding
+        // rather than by a trailing Ok(()) (which would be unreachable).
         let result: Result<()> = async {
             loop {
                 let raw = recv.recv().await?;

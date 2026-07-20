@@ -125,6 +125,7 @@ impl Mesh {
         self.peers.lock().unwrap().len()
     }
 
+    #[cfg(test)]
     pub fn peer_ids(&self) -> Vec<Uuid> {
         self.peers.lock().unwrap().keys().copied().collect()
     }
