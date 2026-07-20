@@ -1,5 +1,6 @@
 //! Small filesystem helpers shared across modules.
 
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -56,6 +57,53 @@ pub fn resolve_link_target(path: &Path) -> PathBuf {
     current
 }
 
+/// Write `contents` to `path` atomically: a temp file in the target's own
+/// directory, then a rename. A crash, a full disk, or a kill mid-write can then
+/// only leave the old file or the new one, never a truncated one.
+///
+/// Both files clipmesh owns are written through here — the config (`--sync-config`)
+/// and the MIME rules, which are rewritten on every unseen type and shared
+/// mesh-wide, so a half-written one would propagate rather than sit still.
+///
+/// If `path` is a symlink (stow-managed dotfiles are), follow it and rewrite the
+/// real target in place rather than clobbering the link with a regular file;
+/// `resolve_link_target` is a no-op for a plain file. The temp lives in the
+/// target's own directory so the rename stays on one filesystem (and is
+/// therefore atomic), and so `fswatch`, which watches that directory for
+/// `CLOSE_WRITE | MOVED_TO`, still sees the replacement.
+pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let target = resolve_link_target(path);
+    // resolve_link_target stops after a bounded number of hops; if the result
+    // is still a symlink the chain was too deep (or a cycle) and we never
+    // reached the real file. Refuse rather than rename over — and clobber —
+    // that intermediate link. (Config::load already rejects broken/cyclic links
+    // upstream; this guards the over-deep case its single open() can still pass.)
+    if is_symlink(&target) {
+        bail!(
+            "{} resolves through too many symlink hops to write safely",
+            path.display()
+        );
+    }
+    let dir = parent_dir(&target);
+    let name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clipmesh");
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let written = fs::write(&tmp, contents)
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| {
+            fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))
+        });
+    if written.is_err() {
+        // Don't leave a partial temp behind — it would sit in the resolved
+        // target's directory (e.g. a stow dotfiles repo). Best-effort; a
+        // successful rename already consumed the temp.
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// Assert that a checked-in generated example matches what its template renders
 /// now, or rewrite it when `CLIPMESH_REGEN_EXAMPLE` is set.
 ///
@@ -109,5 +157,56 @@ mod tests {
         let plain = dir.path().join("plain.toml");
         std::fs::write(&plain, "x").unwrap();
         assert_eq!(resolve_link_target(&plain), plain);
+    }
+
+    #[test]
+    fn write_atomic_refuses_an_over_deep_symlink_chain() {
+        // A chain longer than resolve_link_target's hop cap resolves to an
+        // INTERMEDIATE symlink, not the real file. write_atomic must refuse
+        // rather than rename over (and clobber) that intermediate link.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "old").unwrap();
+        // real <- l0 <- l1 <- ... <- l9 (10 hops from l9 to real, > the cap)
+        let mut prev = real.clone();
+        let mut links = Vec::new();
+        for i in 0..10 {
+            let link = dir.path().join(format!("l{i}.toml"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link.clone();
+            links.push(link);
+        }
+        let head = prev; // l9
+
+        assert!(
+            write_atomic(&head, "new").is_err(),
+            "should refuse a chain deeper than the hop cap"
+        );
+        // the real target is untouched and every intermediate link survives
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "old");
+        for link in &links {
+            assert!(
+                is_symlink(link),
+                "intermediate link was clobbered: {}",
+                link.display()
+            );
+        }
+    }
+
+    #[test]
+    fn write_atomic_does_not_leak_its_temp_on_a_failed_rename() {
+        // Force the rename to fail by pointing at a path that is a directory
+        // (you can't rename a file over a directory); the temp file must be
+        // cleaned up rather than left behind (here, in a stow target dir).
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("config.toml");
+        std::fs::create_dir(&as_dir).unwrap();
+
+        assert!(write_atomic(&as_dir, "x").is_err());
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "temp file leaked after a failed write");
     }
 }

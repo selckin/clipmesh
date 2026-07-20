@@ -102,7 +102,7 @@ const TEMPLATE: &str = "\
 
 /// The built-in skeleton in its canonical on-disk form — byte-for-byte what
 /// clipmesh writes when it creates a fresh rules file (`materialize_fresh` →
-/// `write_file` → `body`, which sorts and strips interleaved comments).
+/// `persist_body` → `body`, which sorts and strips interleaved comments).
 ///
 /// `examples/mimetypes` is generated from this and pinned by a golden test, so
 /// the shipped example and the file clipmesh creates itself cannot drift — the
@@ -269,7 +269,7 @@ impl MimeRules {
         self.doc = TEMPLATE.parse().expect("built-in TOML template must parse");
         self.loaded = None;
         self.dirty = true;
-        self.write_file();
+        self.persist_body(None);
     }
 
     /// Adopt a freshly-parsed document as the live ruleset and remember its text
@@ -287,7 +287,7 @@ impl MimeRules {
     }
 
     /// Render the current ruleset to its on-disk TOML text, so it can be sent to
-    /// peers verbatim. Identical to what `write_file` writes: the `[rules]` table
+    /// peers verbatim. Identical to what `persist_body` writes: the `[rules]` table
     /// is sorted and any comments interleaved among its entries are dropped, so
     /// the saved/shared form is deterministic. Comments above `[rules]` (the
     /// header and the `[clipmesh]` table) are kept.
@@ -310,35 +310,6 @@ impl MimeRules {
                 self.dirty = true;
             }
             Err(e) => warn!("ignoring a peer's MIME-rules update that isn't valid TOML: {e}"),
-        }
-    }
-
-    fn write_file(&mut self) {
-        if self.path.is_none() {
-            return;
-        }
-        let text = self.body();
-        self.write_text(text);
-    }
-
-    /// `write_file` for a body the caller has already rendered. Rendering clones
-    /// the document, sorts `[rules]` and serialises it, so a snapshot — which
-    /// needs the body anyway to measure and to send — passes its copy here
-    /// rather than making `write_file` render an identical second one.
-    fn write_text(&mut self, text: String) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        match fs::write(&path, &text) {
-            Ok(()) => {
-                // Remember our own write so reload_if_changed treats it as
-                // unchanged (no reload storm when the watcher sees this write).
-                self.loaded = Some(text);
-                self.dirty = false;
-            }
-            // Leave `dirty` set so the next persist() retries rather than letting
-            // in-memory rules silently diverge from disk.
-            Err(e) => warn!("couldn't write MIME rules to {}: {e}", path.display()),
         }
     }
 
@@ -531,20 +502,46 @@ impl MimeRules {
     /// is now in sync — `true` if it wrote successfully or there was nothing to
     /// write, `false` if the write failed and changes are still pending.
     pub fn persist(&mut self) -> bool {
-        if self.dirty {
-            self.write_file();
-        }
-        !self.dirty
+        self.persist_body(None)
     }
 
-    /// `persist` for a body the caller has already rendered. See [`write_text`].
+    /// The single write path: every route from memory to the rules file goes
+    /// through here, so `loaded`/`dirty` — the record of what is actually on
+    /// disk — cannot be reconciled in one place and forgotten in another.
     ///
-    /// [`write_text`]: MimeRules::write_text
-    fn persist_text(&mut self, text: String) -> bool {
-        if self.dirty {
-            self.write_text(text);
+    /// `body` is the rendered on-disk text when the caller already has one.
+    /// Rendering clones the document, sorts `[rules]` and serialises it, so a
+    /// snapshot — which needs the body anyway to measure and to send — hands its
+    /// copy over rather than making this render an identical second one; `None`
+    /// renders it here.
+    fn persist_body(&mut self, body: Option<String>) -> bool {
+        if !self.dirty {
+            return true;
         }
-        !self.dirty
+        let Some(path) = self.path.clone() else {
+            // Rules with no file (in-memory only): there is nothing to write, and
+            // the change stays pending so no caller reads this as "it's on disk".
+            return false;
+        };
+        let text = body.unwrap_or_else(|| self.body());
+        // Atomic replace, not a truncate-and-write: this file is rewritten on
+        // every unseen MIME type and shared mesh-wide, so a write interrupted by
+        // a crash or a full disk would leave a half-file that peers then adopt.
+        match crate::fsutil::write_atomic(&path, &text) {
+            Ok(()) => {
+                // Remember our own write so reload_if_changed treats it as
+                // unchanged (no reload storm when the watcher sees this write).
+                self.loaded = Some(text);
+                self.dirty = false;
+                true
+            }
+            // Leave `dirty` set so the next persist() retries rather than letting
+            // in-memory rules silently diverge from disk.
+            Err(e) => {
+                warn!("couldn't write MIME rules to {}: {e:#}", path.display());
+                false
+            }
+        }
     }
 
     /// Discard in-memory changes and restore the ruleset to the last content we
@@ -640,7 +637,12 @@ impl MimeRules {
             self.revert_to_loaded();
             return Err(SnapshotError::TooLarge { len: body.len() });
         }
-        if !self.persist_text(body.clone()) {
+        // The bytes need two owners: `loaded` (our record of what is on disk, so
+        // the watcher doesn't read this write back as an external edit) and the
+        // returned snapshot (moved onto the wire). One copy is therefore
+        // irreducible while `Snapshot::body` is an owned `String` — but it is a
+        // copy of an already-rendered body, not a second render of the document.
+        if !self.persist_body(Some(body.clone())) {
             self.revert_to_loaded();
             return Err(SnapshotError::WriteFailed);
         }
@@ -799,29 +801,34 @@ fn table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
 /// match. `*` and `?` are always wildcards — there is no escape, so a key whose
 /// literal text contains `*`/`?` can't be matched verbatim (MIME types never do).
 /// Case folding is ASCII-only (MIME types are ASCII), so non-ASCII bytes compare
-/// case-sensitively.
+/// case-sensitively — which is also why matching runs over bytes rather than
+/// chars: nothing above ASCII is folded, so decoding UTF-8 would buy nothing and
+/// cost an allocation per call. (`?` therefore consumes one byte, which is one
+/// character for the ASCII this file deals in.)
 fn glob_match(pattern: &str, text: &str) -> bool {
     // Fast path: a wildcard-free pattern (every exact key) is just a
-    // case-insensitive compare — no Vec<char> allocation. This is the hot path,
-    // since `find_rule`/`any_match` run it against every rule key per type.
+    // case-insensitive compare. This is the hot path, since `find_rule`/
+    // `any_match` run it against every rule key per type.
     if !pattern.bytes().any(|b| b == b'*' || b == b'?') {
         return pattern.eq_ignore_ascii_case(text);
     }
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
+    // Byte slices, not `Vec<char>`: the wildcard path used to collect both sides
+    // onto the heap on every call, re-collecting the same MIME text once per
+    // wildcard rule in the table.
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
     let (mut pi, mut ti) = (0usize, 0usize);
     // Last '*' we passed and the text position to retry from, for backtracking.
     let (mut star, mut star_ti): (Option<usize>, usize) = (None, 0);
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
             pi += 1;
             ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        } else if pi < p.len() && p[pi] == b'*' {
             star = Some(pi);
             star_ti = ti;
             pi += 1;
         } else if let Some(s) = star {
-            // Mismatch after a '*': let the '*' swallow one more char and retry.
+            // Mismatch after a '*': let the '*' swallow one more byte and retry.
             pi = s + 1;
             star_ti += 1;
             ti = star_ti;
@@ -830,7 +837,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     // Trailing '*'s match the empty remainder.
-    while pi < p.len() && p[pi] == '*' {
+    while pi < p.len() && p[pi] == b'*' {
         pi += 1;
     }
     pi == p.len()
@@ -1015,16 +1022,22 @@ fn warn_invalid_rules(doc: &DocumentMut, path: &Path) {
         return;
     };
     for (mime, item) in rules.iter() {
+        // Both guards ask the definitions that decide the rule actually applied,
+        // rather than restating them — a warning that disagrees with enforcement
+        // is worse than none, since it sends the user to fix a working entry (or
+        // stays silent on a broken one).
         match rule_fields(item) {
             None => warn!(
                 "MIME rules: ignoring {mime:?} in {} — value must be \"allow\"/\"deny\" or {{ rule = ..., max = ... }}",
                 path.display()
             ),
-            Some((rule, _)) if rule != "allow" && rule != "deny" => warn!(
+            // Asked with no cap: a bad cap doesn't make the rule word invalid,
+            // and is reported on its own below.
+            Some((rule, _)) if parse_rule(rule, None).is_none() => warn!(
                 "MIME rules: ignoring {mime:?} in {} — rule must be \"allow\" or \"deny\", got {rule:?}",
                 path.display()
             ),
-            Some((_, Some(max))) if matches!(parse_size(max), Err(_) | Ok(0)) => warn!(
+            Some((_, Some(max))) if usable_cap(Some(max)).is_none() => warn!(
                 "MIME rules: ignoring the max-size {max:?} on {mime:?} in {} (the rule still applies)",
                 path.display()
             ),
@@ -1337,6 +1350,55 @@ mod tests {
     fn ensure_does_not_duplicate_a_type_already_present_as_an_invalid_value() {
         let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"allwo\"\n", MimePolicy::Deny);
         assert!(!rules.ensure([&s("image/png")]), "ensure duplicated a type");
+    }
+
+    #[test]
+    fn a_rules_write_replaces_the_file_atomically_through_a_symlink() {
+        // The rules file is rewritten on every unseen MIME type and shared
+        // mesh-wide, so it goes through fsutil::write_atomic: the live file is
+        // only ever replaced by a completed rename (no truncate-and-write window
+        // a crash could leave behind), a stow-managed symlink keeps pointing at
+        // its target instead of being replaced by a regular file, and the temp
+        // does not survive the write.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles-mimetypes");
+        write(&target, "[rules]\n\"image/png\" = \"allow\"\n");
+        let link = dir.path().join("mimetypes");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut rules = MimeRules::load(Some(link.clone()), MimePolicy::Deny);
+        assert!(rules.ensure([&s("text/plain")]));
+        assert!(rules.persist());
+
+        assert!(
+            crate::fsutil::is_symlink(&link),
+            "the symlink was replaced by a regular file"
+        );
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.contains("\"text/plain\""), "write missed:\n{body}");
+        assert!(body.contains("\"image/png\""), "write lost a rule:\n{body}");
+        let temps = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!temps, "the write left its temp file behind");
+        // Our own write is still recognised as ours, so it can't ping a reload.
+        assert!(!rules.reload_if_changed());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_changes_pending() {
+        // A directory at the rules path makes every write fail. persist() must
+        // report not-in-sync and keep `dirty` set so the next attempt retries,
+        // rather than letting the in-memory rules silently diverge from disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        std::fs::create_dir(&path).unwrap();
+        let mut rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert!(rules.ensure([&s("text/plain")]));
+        assert!(!rules.persist(), "a failed write must report not-in-sync");
+        assert!(rules.is_dirty(), "the change must stay pending");
+        assert!(path.is_dir(), "the unwritable path must be untouched");
     }
 
     #[test]

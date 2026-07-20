@@ -39,19 +39,51 @@ fn copy_type(kind: SelectionKind) -> copy::ClipboardType {
     }
 }
 
-pub(crate) fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
-    let ct = paste_type(kind);
-    // get_mime_types_ordered (not get_mime_types) preserves the compositor's
-    // advertise order — preference order, richest first — so the offer we build
-    // carries it through to remote pasters. get_mime_types returns a HashSet,
-    // discarding that order before we ever see it.
-    let types = match paste::get_mime_types_ordered(ct, paste::Seat::Unspecified) {
-        Ok(t) => t,
+/// The advertised types for `kind`, in the compositor's preference order.
+///
+/// `get_mime_types_ordered` (not `get_mime_types`) preserves that order —
+/// richest first — so the offer we build carries it through to remote pasters.
+/// `get_mime_types` returns a HashSet, discarding the order before we see it.
+///
+/// An empty clipboard is not an error: the three "nothing there" errors become
+/// an empty list, matching `read_offer`'s empty offer.
+fn advertised_types(kind: SelectionKind) -> Result<Vec<String>> {
+    match paste::get_mime_types_ordered(paste_type(kind), paste::Seat::Unspecified) {
+        Ok(t) => Ok(t),
         Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => {
-            return Ok(Offer::new())
+            Ok(Vec::new())
         }
-        Err(e) => return Err(e.into()),
-    };
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The offered type names, with no content read at all.
+///
+/// This is the whole point of `Clipboard::list_types`: it costs one connection
+/// and one roundtrip, where reading the offer costs one *per representation*.
+pub(crate) fn list_types_blocking(kind: SelectionKind) -> Result<Vec<String>> {
+    let mut types = advertised_types(kind)?;
+    // Machinery targets are never content, so they are not "offered types" as
+    // far as a caller is concerned — `assemble_offer` drops them too.
+    types.retain(|m| !atoms::is_machinery(m));
+    types.dedup();
+    debug!("listed the {kind:?} clipboard types: {types:?}");
+    Ok(types)
+}
+
+pub(crate) fn read_offer_blocking(
+    kind: SelectionKind,
+    max: usize,
+    only: Option<&str>,
+) -> Result<Offer> {
+    let ct = paste_type(kind);
+    let mut types = advertised_types(kind)?;
+    // Narrow before reading, not after: each surviving type costs its own
+    // connection and pipe read, so filtering here is the difference between
+    // reading one representation and reading a 30 MB image alongside it.
+    if let Some(want) = only {
+        types.retain(|m| crate::protocol::type_matches(m, want));
+    }
     debug!("reading the {kind:?} clipboard; offered types: {types:?}");
     // Bound each read by the remaining budget (+1 to detect overflow) so a
     // huge or unbounded representation can't OOM the daemon.
@@ -65,7 +97,13 @@ pub(crate) fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Off
             paste::Seat::Unspecified,
             paste::MimeType::Specific(mime),
         )?;
-        let mut data = Vec::new();
+        // Pre-size rather than let `read_to_end` walk the doubling ladder from
+        // zero: an 8 MiB image otherwise costs ~8 MiB of extra memcpy growing
+        // the buffer, and leaves a capacity `into_boxed_slice` then reallocs to
+        // shrink. Capped so a huge `budget` can't be turned into a huge
+        // allocation before a single byte has arrived.
+        const PRESIZE_CAP: usize = 256 * 1024;
+        let mut data = Vec::with_capacity((budget + 1).min(PRESIZE_CAP));
         pipe.take(budget as u64 + 1).read_to_end(&mut data)?;
         Ok(data)
     });
@@ -209,9 +247,14 @@ impl Clipboard for WaylandClipboard {
         rx
     }
 
-    async fn read_offer(&self, kind: SelectionKind) -> Result<Offer> {
+    async fn list_types(&self, kind: SelectionKind) -> Result<Vec<String>> {
+        tokio::task::spawn_blocking(move || list_types_blocking(kind)).await?
+    }
+
+    async fn read_offer(&self, kind: SelectionKind, only: Option<&str>) -> Result<Offer> {
         let max = self.max_payload;
-        tokio::task::spawn_blocking(move || read_offer_blocking(kind, max)).await?
+        let only = only.map(str::to_string); // the blocking task outlives the borrow
+        tokio::task::spawn_blocking(move || read_offer_blocking(kind, max, only.as_deref())).await?
     }
 
     async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()> {

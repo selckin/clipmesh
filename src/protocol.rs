@@ -18,6 +18,18 @@ pub const PROTOCOL_VERSION: u32 = 6;
 /// sorts a copy internally, so identity/dedup stays order-independent.
 pub type Offer = IndexMap<String, Vec<u8>>;
 
+/// Whether an offered MIME type satisfies a requested one.
+///
+/// One definition because this is a **wire contract**: for `wl-paste -t <mime>`
+/// the serving node narrows its read by this rule and the client then picks the
+/// representation out of the reply by the same rule. With the two spelled out
+/// separately, a normalization added to one side (stripping `;charset=…`,
+/// trimming, Unicode folding) silently returns a representation the user didn't
+/// ask for, or an offer whose only key the client then rejects as absent.
+pub fn type_matches(offered: &str, requested: &str) -> bool {
+    offered.eq_ignore_ascii_case(requested)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SelectionKind {
     Clipboard,

@@ -83,13 +83,17 @@ fn jitter_ms(delay: Duration, divisor: u32) -> u64 {
 
 /// Restart policy shared by the long-lived watcher threads, so the two
 /// supervisors can't drift apart.
-pub const RESTART_MIN: Duration = Duration::from_secs(1);
-pub const RESTART_MAX: Duration = Duration::from_secs(30);
+///
+/// Private, along with `watcher_restart`: [`supervise`] is the whole policy, and
+/// exposing its ingredients invites a caller to reassemble the loop by hand —
+/// which is precisely what `supervise` exists to stop happening twice.
+const RESTART_MIN: Duration = Duration::from_secs(1);
+const RESTART_MAX: Duration = Duration::from_secs(30);
 /// A run shorter than this counts as a failure and escalates backoff.
-pub const RESTART_STABLE_AFTER: Duration = Duration::from_secs(5);
+const RESTART_STABLE_AFTER: Duration = Duration::from_secs(5);
 
 /// A [`Backoff`] tuned for a watcher-thread restart loop.
-pub fn watcher_restart() -> Backoff {
+fn watcher_restart() -> Backoff {
     Backoff::new(RESTART_MIN, RESTART_MAX)
 }
 

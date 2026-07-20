@@ -156,11 +156,13 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
     // in lockstep. The watchers are per-host and have nothing to desynchronise
     // from, which is why only this loop asks for it.
     let mut backoff = Backoff::new(INITIAL, CAP).with_jitter(2);
-    let mut dial_failures: u32 = 0;
+    // Only "is this the first failure of a streak?" is ever asked, so a flag
+    // says what a counter would only imply.
+    let mut reported_unreachable = false;
     loop {
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
-                dial_failures = 0;
+                reported_unreachable = false;
                 let _ = stream.set_nodelay(true);
                 info!("connected to {addr}");
                 let started = Instant::now();
@@ -186,12 +188,12 @@ async fn dial_loop(addr: String, cfg: Arc<Config>, mesh: Arc<Mesh>) {
             Err(e) => {
                 // first failure of a streak at warn so a dead peer is
                 // visible at the default log level; repeats at debug
-                if dial_failures == 0 {
+                if !reported_unreachable {
                     warn!("can't reach {addr}: {e} — will keep retrying");
                 } else {
                     debug!("still can't reach {addr}: {e}");
                 }
-                dial_failures += 1;
+                reported_unreachable = true;
             }
         }
         sleep(backoff.next_delay()).await;

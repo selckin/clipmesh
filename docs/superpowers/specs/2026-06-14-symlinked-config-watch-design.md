@@ -160,13 +160,19 @@ narrow case of a symlink created while its target is mid-write cannot cause
 a spurious restart or a bad rule load.
 
 The existing loop-prevention also still holds under the two-site model.
-clipmesh's own rules writes (`mime.rs::write_file`, via `fs::write`
-following the symlink) now land in the **target's** directory, so the
-resulting `CLOSE_WRITE` arrives on the target-site watch rather than the
-link-site one — but `write_file` records the bytes it wrote in `self.loaded`,
-so `reload_if_changed()` sees no change and sends no ping. The write
-location moved; the guard that prevents a write→reload→rebroadcast loop did
-not.
+clipmesh's own rules writes land in the **target's** directory, so the
+resulting event arrives on the target-site watch rather than the link-site
+one — but the write records the bytes it wrote in `self.loaded`, so
+`reload_if_changed()` sees no change and sends no ping. The write location
+moved; the guard that prevents a write→reload→rebroadcast loop did not.
+
+> **Updated since this spec:** rules writes now go through
+> `fsutil::write_atomic` (temp file in the resolved target's directory, then
+> `rename` onto it) rather than `fs::write` following the symlink in place, so
+> a crash or full disk can no longer leave a truncated rules file. The event
+> that arrives is therefore `MOVED_TO` rather than `CLOSE_WRITE`; both are in
+> `target_mask()`, and the `self.loaded` content compare is unchanged, so the
+> conclusion above still holds.
 
 ### Self-healing scenarios
 

@@ -2,18 +2,24 @@
 //! node over the encrypted mesh protocol and print it to stdout — for hosts
 //! with no Wayland compositor (or scripts) that want the mesh's clipboard.
 //!
-//! It reuses **resync-on-connect**: the client dials a node as an ephemeral peer
-//! with `peer::run_connection` and takes the `Clip` the node already pushes on
-//! connect, so there is no wire-format change. The two inherent consequences —
-//! the target must have `resync_on_connect` on and not be `receive_only`, and
-//! `--primary` needs the target's `sync_selection` — are documented in the spec
-//! (`docs/superpowers/specs/2026-06-21-wl-paste-mode-design.md`) and surface as
-//! a clear timeout error.
+//! The client dials a node with `peer::run_connection`, announcing itself as
+//! [`PeerRole::Paster`], and **asks**: `Message::Get`, answered with `GetReply`.
+//! Because it is a request, the node can narrow the reply to what the invocation
+//! needs ([`GetWant`]) and name the reason when it has nothing to give
+//! ([`GetResult`]) instead of leaving the client to time out.
+//!
+//! A node only serves a selection it is configured to send, so `receive_only`
+//! refuses and `--primary` needs the target's `sync_selection`. `resync_on_connect`
+//! is NOT a prerequisite: it governs what a node pushes to a rejoining peer, not
+//! whether it answers a question.
+//!
+//! The spec (`docs/superpowers/specs/2026-06-21-wl-paste-mode-design.md`)
+//! describes the original push-scraping design and is superseded on that point.
 
 use crate::config::{self, Config};
 use crate::mesh::Mesh;
 use crate::peer;
-use crate::protocol::{GetResult, GetWant, Message, Offer, PeerRole, SelectionKind};
+use crate::protocol::{self, GetResult, GetWant, Message, Offer, PeerRole, SelectionKind};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,9 +28,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// How long to wait for the node's resync push (connect + handshake + transfer
-/// of the whole offer) before giving up. Generous so a large clipboard over a
-/// slow link isn't mistaken for a misconfigured node.
+/// How long to wait for the node's answer (connect + handshake + transfer)
+/// before giving up. Generous so a large clipboard over a slow link isn't
+/// mistaken for an unreachable node — a *misconfigured* one now answers with a
+/// reason rather than going quiet, so this bound is only about slowness.
 const PASTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Parsed `wl-paste`-style arguments for paste mode. `list` takes precedence
@@ -99,13 +106,13 @@ fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str>
         offer
             .keys()
             .map(String::as_str)
-            .find(|k| k.eq_ignore_ascii_case(want))
+            .find(|k| protocol::type_matches(k, want))
     };
     if let Some(req) = requested {
         return find(req).ok_or_else(|| {
             anyhow!(
                 "type {req:?} is not offered (available: {})",
-                list_available(offer)
+                list_available(offer.keys().map(String::as_str))
             )
         });
     }
@@ -116,12 +123,18 @@ fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str>
         .ok_or_else(|| anyhow!("the clipboard is empty"))
 }
 
-/// A comma-separated list of the offered types, for error messages.
-fn list_available(offer: &Offer) -> String {
-    if offer.is_empty() {
+/// A comma-separated list of offered types, for error messages.
+///
+/// Takes names rather than an `Offer` so the two "that type isn't offered"
+/// errors a user can hit — one raised locally by `select_type`, one relayed from
+/// the node as [`GetResult::NotOffered`] — render identically instead of
+/// drifting apart.
+fn list_available<'a>(types: impl IntoIterator<Item = &'a str>) -> String {
+    let names: Vec<&str> = types.into_iter().collect();
+    if names.is_empty() {
         return "none".to_string();
     }
-    offer.keys().cloned().collect::<Vec<_>>().join(", ")
+    names.join(", ")
 }
 
 /// The offered types, one per line in advertise order, newline-terminated.
@@ -218,9 +231,16 @@ pub async fn fetch_offer(
                 Ok(()) => anyhow!("connection to {addr} closed before answering"),
                 Err(e) => e.context(format!("connecting to clipmesh node {addr}")),
             },
-            // Registered, so the writer is live: ask.
-            Some(_) = connect_rx.recv() => {
-                mesh.broadcast(&Message::Get { kind: want, want: narrow.clone() });
+            // Registered, so the writer is live: ask. The connect event carries
+            // the node's ID, so this is a targeted send — reaching one known
+            // connection through a fan-out primitive would work only by
+            // accident, and only while `broadcast`'s role filter happens to keep
+            // the remote in.
+            Some(node) = connect_rx.recv() => {
+                let frame = protocol::encode_frame(
+                    &Message::Get { kind: want, want: narrow.clone() },
+                );
+                mesh.send_frame_to(node, &frame);
             }
             msg = inbound_rx.recv() => match msg {
                 Some((_from, Message::GetReply { kind, result })) if kind == want => {
@@ -247,11 +267,7 @@ fn interpret(result: GetResult, addr: &str, want: SelectionKind) -> Result<Offer
         GetResult::Empty => bail!("the {want:?} clipboard on {addr} is empty"),
         GetResult::NotOffered { available } => bail!(
             "that type is not offered by {addr} (available: {})",
-            if available.is_empty() {
-                "none".to_string()
-            } else {
-                available.join(", ")
-            }
+            list_available(available.iter().map(String::as_str))
         ),
         GetResult::NotSynced => bail!(
             "{addr} does not serve its {want:?} selection — it is configured \

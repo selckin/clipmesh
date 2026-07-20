@@ -91,15 +91,21 @@ fn watch_once(
     // primary selection, added in zwlr v2, is available). Match whatever
     // wl-clipboard-rs's read/write side uses. Keep both bind errors so the
     // failure says *why* (e.g. version mismatch) rather than only "unsupported".
-    let manager = match globals.bind::<ExtDataControlManagerV1, _, _>(&qh, 1..=1, ()) {
+    //
+    // The device is built directly in each arm: the manager is used once, right
+    // here, so naming it in its own enum would be a second two-variant type to
+    // keep in lockstep with `Device` for every protocol version added.
+    //
+    // Keep the device alive for the lifetime of this connection.
+    let _device = match globals.bind::<ExtDataControlManagerV1, _, _>(&qh, 1..=1, ()) {
         Ok(m) => {
             info!("clipboard watcher connected (ext-data-control-v1)");
-            Manager::Ext(m)
+            Device::Ext(m.get_data_device(&_seat, &qh, ()))
         }
         Err(ext_err) => match globals.bind::<ZwlrDataControlManagerV1, _, _>(&qh, 1..=2, ()) {
             Ok(m) => {
                 info!("clipboard watcher connected (zwlr-data-control-unstable-v1)");
-                Manager::Zwlr(m)
+                Device::Zwlr(m.get_data_device(&_seat, &qh, ()))
             }
             Err(zwlr_err) => bail!(
                 "compositor provides no usable data-control protocol (need \
@@ -107,12 +113,6 @@ fn watch_once(
                  is unsupported. ext: {ext_err}; zwlr: {zwlr_err}"
             ),
         },
-    };
-
-    // Keep the device alive for the lifetime of this connection.
-    let _device = match &manager {
-        Manager::Ext(m) => Device::Ext(m.get_data_device(&_seat, &qh, ())),
-        Manager::Zwlr(m) => Device::Zwlr(m.get_data_device(&_seat, &qh, ())),
     };
 
     let mut state = State {
@@ -146,7 +146,7 @@ fn watch_once(
     // in `wayland.rs` needs — worth doing once, for both.
     state.draining_initial = false;
     for kind in std::mem::take(&mut state.initial) {
-        match read_offer_blocking(kind, max_payload) {
+        match read_offer_blocking(kind, max_payload, None) {
             Ok(offer) if !offer.is_empty() => {
                 if tx.send(ClipboardEvent::Initial { kind, offer }).is_err() {
                     return Ok(StopReason::ReceiverGone);
@@ -168,11 +168,6 @@ fn watch_once(
             .blocking_dispatch(&mut state)
             .context("Wayland event dispatch")?;
     }
-}
-
-enum Manager {
-    Ext(ExtDataControlManagerV1),
-    Zwlr(ZwlrDataControlManagerV1),
 }
 
 #[allow(dead_code)] // held only to keep the device proxy alive

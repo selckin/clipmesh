@@ -57,12 +57,39 @@ impl<C: Clipboard> ClipboardIo<C> {
         self.clipboard.watch(kinds)
     }
 
-    /// Read a selection, bounded by [`READ_TIMEOUT`]. `None` on error or
-    /// timeout, both already logged — a failed read means "no update this
-    /// round", never a stall.
+    /// Read every representation of a selection, bounded by [`READ_TIMEOUT`].
+    /// `None` on error or timeout, both already logged — a failed read means "no
+    /// update this round", never a stall.
     pub async fn read(&self, kind: SelectionKind) -> Option<Hashed> {
-        match tokio::time::timeout(READ_TIMEOUT, self.clipboard.read_offer(kind)).await {
-            Ok(Ok(o)) => Some(Hashed::new(o)),
+        self.bounded(kind, self.clipboard.read_offer(kind, None))
+            .await
+            .map(Hashed::new)
+    }
+
+    /// Read only `mime` from a selection. Same bound and failure handling as
+    /// [`read`](ClipboardIo::read), but the backend never touches the other
+    /// representations — on Wayland each one costs its own connection.
+    pub async fn read_one(&self, kind: SelectionKind, mime: &str) -> Option<Hashed> {
+        self.bounded(kind, self.clipboard.read_offer(kind, Some(mime)))
+            .await
+            .map(Hashed::new)
+    }
+
+    /// The types a selection offers, with no content read at all.
+    pub async fn list_types(&self, kind: SelectionKind) -> Option<Vec<String>> {
+        self.bounded(kind, self.clipboard.list_types(kind)).await
+    }
+
+    /// Apply [`READ_TIMEOUT`] to one backend call and fold both failure modes
+    /// into `None`, logged. One place, so a new read can't quietly go unbounded
+    /// and stall the engine's select loop.
+    async fn bounded<T>(
+        &self,
+        kind: SelectionKind,
+        op: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> Option<T> {
+        match tokio::time::timeout(READ_TIMEOUT, op).await {
+            Ok(Ok(v)) => Some(v),
             Ok(Err(e)) => {
                 warn!("couldn't read the clipboard: {e:#}");
                 None

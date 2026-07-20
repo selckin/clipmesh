@@ -166,9 +166,12 @@ where
     let _reader_guard = AbortGuard(reader.abort_handle());
     let _writer_guard = AbortGuard(writer.abort_handle());
 
+    // Whichever half ends first, the guards above abort the other as they drop,
+    // so neither arm tears down its sibling by hand — a third teardown path is
+    // exactly what the guards exist to make unnecessary.
     tokio::select! {
-        r = &mut reader => { writer.abort(); flatten(r) }
-        w = &mut writer => { reader.abort(); flatten(w) }
+        r = &mut reader => flatten(r),
+        w = &mut writer => flatten(w),
     }
     // `_registration` unregisters the peer as it drops here.
 }

@@ -17,6 +17,11 @@ const HEADER: usize = 4;
 /// lifetime, and the mesh holds roughly two connections per peer, so one 32 MiB
 /// copy could pin 64 MiB per peer indefinitely, long after the copy is gone.
 const PLAIN_BUF_KEEP: usize = NOISE_MAX;
+/// Floor for one reassembly growth step (see `absorb`). Large enough that an
+/// ordinary message settles into a single allocation instead of climbing rungs
+/// a record at a time, small enough that it is a rounding error next to the
+/// `max_message` a peer is allowed to claim.
+const PLAIN_BUF_STEP: usize = 1024 * 1024;
 
 /// An empty reassembly buffer, pre-sized to `PLAIN_BUF_KEEP`.
 ///
@@ -250,8 +255,29 @@ impl<R: AsyncRead + Unpin> RecvHalf<R> {
                 (len, rest)
             }
         };
-        if self.plain_buf.len() + payload.len() > len {
+        let needed = self.plain_buf.len() + payload.len();
+        if needed > len {
             bail!("framing desync: record overruns the {len}-byte message");
+        }
+        // Grow in one bounded jump rather than letting `extend_from_slice` walk
+        // a doubling ladder — 64 KiB, 128 KiB, ... `max_message` — re-copying
+        // everything received so far at every rung, and re-walking it for every
+        // message, since `recv` installs a fresh `PLAIN_BUF_KEEP` buffer.
+        //
+        // Deliberately *not* `reserve(len)`. `len` is a number the peer
+        // asserted, not bytes it has delivered: a 4-byte prefix claiming
+        // `max_message` would cost 32 MiB, and the accept loop admits 64
+        // inbound connections, so a few hundred bytes of traffic could pin
+        // ~2 GB. So the buffer only grows once the bytes actually in hand no
+        // longer fit, and then only to twice them — a peer must deliver ~C/2
+        // bytes to cost C, and one that announces a huge message and then
+        // stalls holds nothing beyond `PLAIN_BUF_KEEP`. `PLAIN_BUF_STEP` floors
+        // that so growth is geometric rather than per-record (bounding the
+        // free allocation at one step), and `len` caps it, since the message
+        // cannot need more and reassembly hands this buffer out as-is.
+        if self.plain_buf.capacity() < needed {
+            let target = needed.saturating_mul(2).max(PLAIN_BUF_STEP).min(len);
+            self.plain_buf.reserve_exact(target - self.plain_buf.len());
         }
         self.plain_buf.extend_from_slice(payload);
         self.expected_len = Some(len);
@@ -373,6 +399,80 @@ mod tests {
         // Still usable afterwards.
         atx.send(b"after").await.unwrap();
         assert_eq!(brx.recv().await.unwrap(), b"after");
+    }
+
+    /// Build a first chunk that *claims* `len` bytes but carries `payload`,
+    /// so a test can lie about a message's size the way a hostile peer would.
+    /// `send` never does this — it always announces what it goes on to write.
+    fn claiming(len: usize, payload: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(HEADER + payload.len());
+        chunk.extend_from_slice(&(len as u32).to_be_bytes());
+        chunk.extend_from_slice(payload);
+        chunk
+    }
+
+    /// A length prefix is a *claim*, and reserving against it is a memory
+    /// amplification bug: the accept loop admits 64 inbound connections, so
+    /// honouring 64 unbacked claims of `max_message` would turn a few hundred
+    /// bytes of traffic into gigabytes of allocation. Announcing a huge message
+    /// and then going quiet must cost the announcer nothing.
+    #[tokio::test]
+    async fn a_claimed_length_alone_does_not_allocate() {
+        let psk = [7u8; 32];
+        let (ca, cb) = pair(psk, psk).await;
+        let (mut atx, _) = ca.unwrap();
+        let (_, mut brx) = cb.unwrap();
+
+        // Claim the largest message this receiver accepts, deliver 64 bytes of
+        // it, and hang up (so `recv` fails instead of waiting forever).
+        atx.write_chunk(&claiming(MAX, &[0xCDu8; 64]))
+            .await
+            .unwrap();
+        drop(atx);
+
+        assert!(
+            brx.recv().await.is_err(),
+            "a truncated message must not complete"
+        );
+        assert!(
+            brx.plain_buf.capacity() <= PLAIN_BUF_KEEP,
+            "{} bytes of reassembly capacity for 64 delivered bytes of a claimed {MAX}",
+            brx.plain_buf.capacity(),
+        );
+    }
+
+    /// The bound the growth ladder rests on: capacity follows delivered bytes.
+    /// A partially delivered message may hold about twice what arrived plus one
+    /// step — never the announced size.
+    #[tokio::test]
+    async fn reassembly_capacity_tracks_delivered_bytes_not_the_claim() {
+        let psk = [7u8; 32];
+        let (ca, cb) = pair(psk, psk).await;
+        let (mut atx, _) = ca.unwrap();
+        let (_, mut brx) = cb.unwrap();
+
+        let first = vec![0xCDu8; CHUNK - HEADER];
+        atx.write_chunk(&claiming(MAX, &first)).await.unwrap();
+        let mut delivered = first.len();
+        for _ in 0..16 {
+            let rest = vec![0xCDu8; CHUNK];
+            atx.write_chunk(&rest).await.unwrap();
+            delivered += rest.len();
+        }
+        drop(atx);
+
+        assert!(brx.recv().await.is_err());
+        let cap = brx.plain_buf.capacity();
+        assert!(cap >= delivered, "{cap} bytes cannot hold {delivered}");
+        assert!(
+            cap <= 2 * delivered + PLAIN_BUF_STEP,
+            "{cap} bytes of capacity for {delivered} delivered bytes",
+        );
+        assert!(
+            cap < MAX / 2,
+            "{cap} bytes of capacity is tracking the {MAX}-byte claim, not the \
+             {delivered} bytes delivered",
+        );
     }
 
     #[tokio::test]

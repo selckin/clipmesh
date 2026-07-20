@@ -78,7 +78,7 @@ Distribute the same psk file to every host, then:
 `clipmesh --paste` prints a node's current clipboard to stdout — a drop-in
 `wl-paste` for a host with **no Wayland compositor** (a server, a container, an
 SSH session, a script). It connects to a node over the same encrypted protocol,
-takes the clipboard the node already pushes on connect, and writes it out:
+asks it for the clipboard, and writes the answer out:
 
     clipmesh --paste                        # best text type (else first offered)
     clipmesh --paste -t image/png > x.png   # a specific MIME type

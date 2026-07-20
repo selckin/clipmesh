@@ -242,6 +242,19 @@ impl Stages {
         rules: RulesStage::Skip,
         cap: false,
     };
+    /// Answering a remote `--paste` query. The same filters as `BROADCAST` — a
+    /// pull must not expose what a push wouldn't, password-manager contents
+    /// included — but `Apply`, not `Record`.
+    ///
+    /// That difference is the point: `Record` appends unseen types, persists the
+    /// rules file and broadcasts it mesh-wide. Answering a question is not
+    /// capturing, so a stranger's `wl-paste` must not make this node write its
+    /// rules file and push it to every peer.
+    const SERVE: Stages = Stages {
+        synthesize: true,
+        rules: RulesStage::Apply,
+        cap: true,
+    };
 }
 
 /// Why the engine writes a selection during a batch — selects the reconcile
@@ -413,20 +426,19 @@ fn plan_batch(changed: &[SelectionKind], link: LinkSelections, own: bool) -> Bat
     // partner still reaches the mesh, as today). The caller applies may_send +
     // content filters + mesh-current dedup, so a non-synced or unchanged
     // selection yields no actual send.
-    let broadcasts = direct.iter().chain(&mirrors).copied().collect();
+    let broadcasts: Vec<Action> = direct.iter().chain(&mirrors).copied().collect();
 
     // Writes, each selection at most once:
     //  - own on  -> Own (unconditional) for every genuine change AND every mirror
     //    target (the mirror+own merge: one owned write, no separate mirror write).
-    //    Same set as the broadcasts, which the shared iterator makes explicit.
+    //    That is exactly the broadcast set, so it is *derived* from `broadcasts`
+    //    rather than rebuilt from the same two pieces — a second `direct.chain(
+    //    &mirrors)` would leave the sets equal only by the two expressions
+    //    staying in step, with a comment standing in for the guarantee.
     //  - own off -> Mirror (reconciled) for mirror targets only; genuine changes
     //    are broadcast but not written locally.
     let writes = if own {
-        direct
-            .iter()
-            .chain(&mirrors)
-            .map(|&a| (a, Provenance::Own))
-            .collect()
+        broadcasts.iter().map(|&a| (a, Provenance::Own)).collect()
     } else {
         mirrors.iter().map(|&a| (a, Provenance::Mirror)).collect()
     };
@@ -478,7 +490,7 @@ impl<C: Clipboard> SyncEngine<C> {
 
     /// Selections worth observing. Broader than `synced_kinds`: the local bridge
     /// may need a selection this node never syncs. Handed to `Clipboard::watch`,
-    /// and used by `prime` to decide what to seed.
+    /// and by the startup-restore path to decide what to adopt.
     fn watched_kinds(&self) -> Vec<SelectionKind> {
         self.policies.kinds(|p| p.watch)
     }
@@ -1107,30 +1119,92 @@ impl<C: Clipboard> SyncEngine<C> {
             .send_frame_to(from, &encode_frame(&Message::GetReply { kind, result }));
     }
 
+    /// Serve one request, reading only what it actually asked for.
+    ///
+    /// The narrowing reaches the *backend*, not just the wire: on Wayland a
+    /// content read costs one connection and one pipe read per representation,
+    /// so `TypesOnly` reads no contents at all and `One` reads exactly one.
+    /// Narrowing only the reply would leave `wl-paste -l` pulling a 30 MB image
+    /// off the compositor to print a list of names.
     async fn serve_get(&self, kind: SelectionKind, want: GetWant) -> GetResult {
         if !self.policies.get(kind).send {
             return GetResult::NotSynced;
         }
-        let Some(content) = self.capture_offer(kind).await else {
-            return GetResult::Empty;
+        // Names are not content, so they bypass the content pipeline entirely.
+        // The rules still govern what leaves this host, so the list is filtered
+        // to the types this node would actually serve.
+        if want == GetWant::TypesOnly {
+            let Some(types) = self.io.list_types(kind).await else {
+                return GetResult::Empty;
+            };
+            let allowed = self.filter_names(types).await;
+            return if allowed.is_empty() {
+                GetResult::Empty
+            } else {
+                GetResult::Types(allowed)
+            };
+        }
+        let only = match &want {
+            GetWant::One(t) => Some(t.as_str()),
+            _ => None,
         };
-        let offer = content.into_offer();
-        if offer.is_empty() {
+        // Two ways a narrowed request comes back with nothing, and they mean the
+        // same thing to the caller: the type wasn't offered at all, or it was
+        // offered and the rules/cap dropped it. Either way the useful answer is
+        // "not that one — here is what I do serve", never a bare "empty" that
+        // implies the clipboard holds nothing.
+        let served = match self.read_for_serve(kind, only).await {
+            Some(raw) => self.apply_stages(raw, Stages::SERVE).await,
+            None => None,
+        };
+        match (served, only) {
+            (Some(content), _) => GetResult::Offer(content.into_offer()),
+            (None, Some(_)) => self.not_offered(kind).await,
+            (None, None) => GetResult::Empty,
+        }
+    }
+
+    /// Read for a `Get`, narrowed to `only` when one type was asked for. A
+    /// narrowed read that comes back empty means the type simply isn't offered.
+    async fn read_for_serve(&self, kind: SelectionKind, only: Option<&str>) -> Option<Hashed> {
+        let raw = match only {
+            Some(mime) => self.io.read_one(kind, mime).await?,
+            None => self.io.read(kind).await?,
+        };
+        (!raw.is_empty()).then_some(raw)
+    }
+
+    /// `GetResult::NotOffered` carrying the types this node would serve, so the
+    /// paster can say what *was* available. Costs one names-only roundtrip.
+    ///
+    /// Degrades to `Empty` when there is nothing at all: "that type is not
+    /// offered (available: none)" is a worse answer than "the clipboard is
+    /// empty" for the same situation.
+    async fn not_offered(&self, kind: SelectionKind) -> GetResult {
+        let types = self.io.list_types(kind).await.unwrap_or_default();
+        let available = self.filter_names(types).await;
+        if available.is_empty() {
             return GetResult::Empty;
         }
-        match want {
-            GetWant::All => GetResult::Offer(offer),
-            GetWant::TypesOnly => GetResult::Types(offer.keys().cloned().collect()),
-            GetWant::One(t) => match offer.iter().find(|(k, _)| k.eq_ignore_ascii_case(&t)) {
-                // Send only the representation asked for: pulling a whole offer
-                // to print one type is what made `-t text/plain` transfer a
-                // 30 MB image alongside it.
-                Some((k, v)) => GetResult::Offer(Offer::from_iter([(k.clone(), v.clone())])),
-                None => GetResult::NotOffered {
-                    available: offer.keys().cloned().collect(),
-                },
-            },
-        }
+        GetResult::NotOffered { available }
+    }
+
+    /// Drop the type names this node's MIME rules would not send.
+    ///
+    /// Size 0 asks "allowed ignoring size": a per-type cap is a maximum, so a
+    /// zero-byte representation clears every cap and only the allow/deny
+    /// decision remains. That is the most a names-only answer can know — a
+    /// listed type may still be dropped by its cap once actually read, which is
+    /// the honest cost of not reading it to answer `--list-types`.
+    async fn filter_names(&self, types: Vec<String>) -> Vec<String> {
+        self.with_rules(move |rules| {
+            let compiled = rules.compile();
+            types
+                .into_iter()
+                .filter(|m| compiled.allows(m, 0))
+                .collect()
+        })
+        .await
     }
 
     async fn on_inbound_clip(
@@ -1676,7 +1750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_is_handled_while_priming_is_still_blocked() {
+    async fn inbound_is_handled_while_a_startup_read_is_still_blocked() {
         // Priming reads the existing clipboard, which can block on a slow source.
         // That must not stall the engine's handling of peer messages/connects —
         // otherwise a node can't participate in the mesh until the local
@@ -1688,7 +1762,7 @@ mod tests {
         let in_tx = w.in_tx.clone();
         tokio::spawn(w.engine.run(w.in_rx, w.connect_rx, w.rules_rx));
 
-        // prime() is now awaiting read_offer (gated). A peer update should still
+        // The startup read is gated and still pending. A peer update should still
         // be applied to the local clipboard.
         let o = offer("from-peer");
         in_tx
@@ -1710,21 +1784,14 @@ mod tests {
             }
         })
         .await;
-        clip.allow_reads(); // let priming finish so the task winds down
-        handled.expect("inbound update was not handled while priming was blocked");
+        clip.allow_reads(); // let the startup read finish so the task winds down
+        handled.expect("inbound update was not handled while the startup read was blocked");
         assert_eq!(clip.get(SelectionKind::Clipboard).as_ref(), Some(&o));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn capture_offer_times_out_on_a_hung_read() {
-        // A read that never completes must yield None after the timeout rather
-        // than awaiting forever — otherwise it would freeze the select loop it
-        // runs in. (start_paused auto-advances time to the pending timeout.)
-        let clip = MockClipboard::new();
-        clip.block_reads(); // never released
-        let w = engine(clip, Config::for_test("s"));
-        assert_eq!(w.engine.capture_offer(SelectionKind::Clipboard).await, None);
-    }
+    // The read timeout itself is tested where it now lives, in
+    // `clipboard::io` (`a_read_that_never_answers_times_out_instead_of_stalling`);
+    // this module used to carry a second copy of that test.
 
     struct Harness {
         clip: Arc<MockClipboard>,
@@ -1738,13 +1805,13 @@ mod tests {
         start_seeded_with(cfg, &[]).await
     }
 
-    /// Start the engine with clipboard content already present before it primes
+    /// Start the engine with clipboard content already present before it adopts
     /// (models a daemon restart over an existing clipboard).
     async fn start_seeded(cfg: Config, seed: Offer) -> Harness {
         start_seeded_with(cfg, &[(SelectionKind::Clipboard, seed)]).await
     }
 
-    /// Like `start_seeded` but seeds arbitrary selections before priming, so a
+    /// Like `start_seeded` but seeds arbitrary selections first, so a
     /// restart over existing SELECTION content can be modelled too.
     async fn start_seeded_with(cfg: Config, seeds: &[(SelectionKind, Offer)]) -> Harness {
         let clip = MockClipboard::new();
@@ -1767,15 +1834,15 @@ mod tests {
         while clip.watcher_count() == 0 {
             tokio::task::yield_now().await;
         }
-        // ...and, when the clipboard was seeded, until priming has recorded it.
+        // ...and, when the clipboard was seeded, until it has been adopted.
         // The engine deliberately does NOT gate connect/inbound handling on
-        // priming (a slow selection owner must not make the node unreachable),
-        // so without this a test racing a peer connect against prime would pass
+        // the startup adopt (a slow selection owner must not make the node unreachable),
+        // so without this a test racing a peer connect against it would pass
         // or fail on scheduling luck rather than on behaviour.
         for (kind, _) in seeds.iter().filter(|(k, _)| synced.contains(k)) {
             let engine = engine.clone();
             let kind = *kind;
-            wait_for("prime to record the seeded clipboard", move || {
+            wait_for("the seeded clipboard to be adopted", move || {
                 engine.current.lock().unwrap().contains_key(&kind)
             })
             .await;
@@ -2007,7 +2074,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_copy_made_right_after_startup_is_still_broadcast() {
-        // `prime` attributes whatever it reads to "the clipboard at startup", so
+        // Reading startup content back later attributes whatever it reads to "the
+        // clipboard at startup", so
         // anything that delays its read past a real copy makes that copy look
         // restored: dropped as an echo, and recorded at stamp 0 where a peer's
         // older content outranks it. `start` returns as soon as the watcher is
@@ -2015,7 +2083,7 @@ mod tests {
         //
         // Real time, not paused: the failure mode is a scheduling order, and
         // auto-advance would hide it. This is the test that goes red if anything
-        // yieldable is added between `watch()` and prime's spawn in `run`.
+        // yieldable is added between `watch()` and the adopt path in `run`.
         let mut h = start(Config::for_test("s")).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("raced"));
         let (kind, _, o) = recv_clip(&mut h).await;
@@ -2839,7 +2907,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primed_content_loses_resync_to_real_remote_content() {
+    async fn restored_content_loses_resync_to_real_remote_content() {
         // a restarted node's restored clipboard (stamp 0) must yield to a
         // peer's genuinely-stamped content
         let h = start_seeded(Config::for_test("s"), offer("restored")).await;
@@ -2854,7 +2922,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primed_content_is_not_rebroadcast_as_fresh() {
+    async fn restored_content_is_not_rebroadcast_as_fresh() {
         // the compositor's subscribe-time event for restored content (modelled
         // by a local_copy of the same bytes) must be suppressed, not broadcast
         let mut h = start_seeded(Config::for_test("s"), offer("restored")).await;
@@ -2864,7 +2932,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn primed_content_resyncs_with_stamp_zero() {
+    async fn restored_content_resyncs_with_stamp_zero() {
         let h = start_seeded(Config::for_test("s"), offer("restored")).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         h.mesh.register(Uuid::new_v4(), tx2, PeerRole::Peer);

@@ -35,14 +35,21 @@ impl Target {
     /// order-independent (the targets are distinct files with distinct watches).
     const ALL: [Target; 2] = [Target::Config, Target::Rules];
 
-    /// This target's slot in a [`PerTarget`] flag set. Exhaustive, so adding a
-    /// third watched file is a compile error here rather than a flag silently
-    /// left unhandled at one of the sites that set or read it.
+    /// This target's slot in a [`PerTarget`] flag set — its position in [`ALL`],
+    /// so `ALL` is the single hand-maintained list.
+    ///
+    /// Deriving it matters: with the slot numbers written out separately, adding
+    /// a third watched file compiles as soon as the new match arm returns `2`,
+    /// leaving `PerTarget`'s array to panic at runtime and `ALL` to silently skip
+    /// the new target in the re-resolve pass. Now the array is sized from `ALL`
+    /// and the lookup is derived from it, so there is nothing left to forget.
+    ///
+    /// [`ALL`]: Target::ALL
     fn index(self) -> usize {
-        match self {
-            Target::Config => 0,
-            Target::Rules => 1,
-        }
+        Self::ALL
+            .iter()
+            .position(|&t| t == self)
+            .expect("ALL lists every Target")
     }
 
     fn label(self) -> &'static str {
@@ -58,11 +65,11 @@ impl Target {
 /// that set or tested one, so a third watched file meant finding them all with
 /// no help from the compiler.
 #[derive(Default, Clone, Copy)]
-struct PerTarget([bool; 2]);
+struct PerTarget([bool; Target::ALL.len()]);
 
 impl PerTarget {
     /// Every target flagged — what a dropped-event queue overflow implies.
-    const ALL: PerTarget = PerTarget([true; 2]);
+    const ALL: PerTarget = PerTarget([true; Target::ALL.len()]);
 
     fn set(&mut self, target: Target) {
         self.0[target.index()] = true;
@@ -513,8 +520,6 @@ fn restart_on_config_change(config_path: &Path, original: &str) {
     }
 }
 
-/// The directory to watch for a file: its parent, or "." when the path is a
-/// bare file name.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,7 +69,7 @@ impl MockClipboard {
 
     /// Seed existing clipboard content without notifying watchers, modelling
     /// a selection that already existed before the daemon started (so tests
-    /// can exercise startup priming).
+    /// can exercise the startup-restore path).
     pub fn seed(&self, kind: SelectionKind, offer: Offer) {
         self.state.lock().unwrap().insert(kind, offer);
     }
@@ -137,7 +137,17 @@ impl Clipboard for MockClipboard {
         rx
     }
 
-    async fn read_offer(&self, kind: SelectionKind) -> Result<Offer> {
+    async fn list_types(&self, kind: SelectionKind) -> Result<Vec<String>> {
+        // Deliberately NOT gated by `read_gate`/`fail_reads`: the whole point of
+        // `list_types` is that it doesn't read contents, so a test that blocks
+        // content reads must still be able to list.
+        Ok(self
+            .get(kind)
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn read_offer(&self, kind: SelectionKind, only: Option<&str>) -> Result<Offer> {
         if self.fail_reads.load(Ordering::SeqCst) {
             anyhow::bail!("simulated clipboard read failure");
         }
@@ -147,7 +157,11 @@ impl Clipboard for MockClipboard {
         if let Some(gate) = gate {
             let _permit = gate.acquire().await;
         }
-        Ok(self.get(kind).unwrap_or_default())
+        let mut offer = self.get(kind).unwrap_or_default();
+        if let Some(want) = only {
+            offer.retain(|k, _| crate::protocol::type_matches(k, want));
+        }
+        Ok(offer)
     }
 
     async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()> {
@@ -176,7 +190,9 @@ mod tests {
             Some(ClipboardEvent::Changed(SelectionKind::Clipboard))
         );
         assert_eq!(
-            clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
+            clip.read_offer(SelectionKind::Clipboard, None)
+                .await
+                .unwrap(),
             offer("hello")
         );
     }
@@ -203,11 +219,15 @@ mod tests {
         let clip = MockClipboard::new();
         clip.local_copy(SelectionKind::Selection, offer("prim"));
         assert_eq!(
-            clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
+            clip.read_offer(SelectionKind::Clipboard, None)
+                .await
+                .unwrap(),
             Offer::new()
         );
         assert_eq!(
-            clip.read_offer(SelectionKind::Selection).await.unwrap(),
+            clip.read_offer(SelectionKind::Selection, None)
+                .await
+                .unwrap(),
             offer("prim")
         );
     }

@@ -55,10 +55,25 @@ pub trait Clipboard: Send + Sync + 'static {
     /// outranks it. Only the backend exists at subscribe time, so only the
     /// backend can answer the question.
     fn watch(&self, kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<ClipboardEvent>;
-    /// Read all offered MIME representations of the given selection.
+    /// The MIME types `kind` currently offers, without reading any contents.
+    ///
+    /// Separate from [`read_offer`](Clipboard::read_offer) because reading is
+    /// not cheap: the Wayland backend spends a whole connection and roundtrip
+    /// **per representation**, so answering "what types are on offer?" by
+    /// reading them all turns one roundtrip into one per type — and for a
+    /// clipboard holding a large image, megabytes of pipe reads to produce a
+    /// list of names.
+    async fn list_types(&self, kind: SelectionKind) -> Result<Vec<String>>;
+
+    /// Read the offered MIME representations of the given selection, restricted
+    /// to a single type (matched case-insensitively) when `only` is set.
+    ///
+    /// `only` exists for the same reason as `list_types`: a caller that wants
+    /// one representation should not pay to read the rest.
+    ///
     /// May return an error if the contents exceed the implementation's
     /// payload cap or a representation cannot be read in full.
-    async fn read_offer(&self, kind: SelectionKind) -> Result<Offer>;
+    async fn read_offer(&self, kind: SelectionKind, only: Option<&str>) -> Result<Offer>;
     /// Set the given selection to the given representations.
     async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()>;
 }

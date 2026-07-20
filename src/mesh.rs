@@ -77,12 +77,22 @@ impl Mesh {
     /// connection (if any) is promoted automatically by position.
     pub fn unregister(&self, remote: Uuid, conn_id: u64) {
         let mut peers = self.peers.lock().unwrap();
-        if let Some(conns) = peers.get_mut(&remote) {
-            conns.retain(|c| c.id != conn_id);
-            if conns.is_empty() {
-                peers.remove(&remote);
-                info!("peer {remote} disconnected");
-            }
+        let Some(conns) = peers.get_mut(&remote) else {
+            return;
+        };
+        let was_paster = conns.iter().any(|c| c.role == PeerRole::Paster);
+        conns.retain(|c| c.id != conn_id);
+        if !conns.is_empty() {
+            return;
+        }
+        peers.remove(&remote);
+        // Symmetric with `register`: a paster's arrival and departure are both
+        // debug, so a node serving `wl-paste` in a loop doesn't report a stream
+        // of phantom peers joining and leaving the mesh at the default level.
+        if was_paster {
+            debug!("paste client {remote} disconnected");
+        } else {
+            info!("peer {remote} disconnected");
         }
     }
 

@@ -216,6 +216,72 @@ fn text_and_big_image() -> Offer {
 }
 
 #[tokio::test]
+async fn listing_types_reads_no_representation_contents() {
+    // Narrowing must reach the BACKEND, not just the wire: on Wayland a content
+    // read costs one connection and one pipe read per representation, so
+    // answering `-l` by reading everything would pull a 30 MB image off the
+    // compositor to print a list of names.
+    //
+    // `MockClipboard::block_reads` gates content reads but not `list_types`, so
+    // a node that can still answer here provably never read a representation.
+    let mut cfg = Config::for_test("list-no-read");
+    cfg.unknown_mime = clipmesh::config::MimePolicy::Allow;
+    let clip = MockClipboard::new();
+    let node = start(cfg.clone(), clip.clone()).await;
+    clip.local_copy(SelectionKind::Clipboard, text_and_big_image());
+    sleep(Duration::from_millis(200)).await;
+    clip.block_reads(); // any content read from here on would hang
+
+    let got = timeout(
+        Duration::from_secs(3),
+        fetch_narrowed(&node, &cfg, GetWant::TypesOnly),
+    )
+    .await
+    .expect("--list-types must not need a content read")
+    .unwrap();
+    assert!(got.contains_key("text/plain") && got.contains_key("image/png"));
+}
+
+#[tokio::test]
+async fn answering_a_paste_does_not_record_types_into_the_rules_file() {
+    // A query is not a capture. `Stages::BROADCAST`'s Record stage appends
+    // unseen types, persists the rules file and broadcasts it mesh-wide — so
+    // serving a paste through it would let any paster make this node rewrite its
+    // rules and push them to every peer. Serving uses `Stages::SERVE` instead.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mimetypes");
+    let mut cfg = Config::for_test("no-record");
+    cfg.unknown_mime = clipmesh::config::MimePolicy::Allow;
+    cfg.mime_rules_path = Some(path.clone());
+    let clip = MockClipboard::new();
+    let node = start(cfg.clone(), clip.clone()).await;
+
+    // Seed a type the shipped defaults say nothing about, WITHOUT a local copy
+    // (which would legitimately record it via the capture path).
+    let probe: Offer = [("application/x-paste-probe".to_string(), b"hi".to_vec())]
+        .into_iter()
+        .collect();
+    clip.seed(SelectionKind::Clipboard, probe);
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let got = fetch(
+        &node,
+        &cfg,
+        SelectionKind::Clipboard,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert!(got.contains_key("application/x-paste-probe"));
+
+    let after = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "serving a paste rewrote the rules file; a query must not record types"
+    );
+}
+
+#[tokio::test]
 async fn asking_for_one_type_transfers_only_that_representation() {
     // The point of asking rather than scraping a push: `-t text/plain` against a
     // clipboard holding a large image must not drag the image over the wire too.

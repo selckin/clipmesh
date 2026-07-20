@@ -1,7 +1,24 @@
 # clipmesh — a `wl-paste` impersonation mode that pulls from a node
 
 **Date:** 2026-06-21
-**Status:** Approved design
+**Status:** Implemented, then **partially superseded** — see below.
+
+> **Superseded: the fetch mechanism.** This spec's central trade — reuse
+> resync-on-connect to avoid a `PROTOCOL_VERSION` bump — was reversed. Paste now
+> **asks** (`Message::Get` → `GetReply`, `PROTOCOL_VERSION` 6) instead of taking
+> whatever the node pushes on connect.
+>
+> The three costs this spec accepted as "inherent" were inherent *to the reuse*,
+> not to paste mode, and all three are gone: the serving node no longer runs a
+> full resync per invocation (a `PeerRole::Paster` fires no connect event), `-t`
+> and `-l` no longer transfer the whole offer, and a failure now names its own
+> cause instead of surfacing as a timeout with four possible explanations.
+> `resync_on_connect` is no longer a prerequisite.
+>
+> Everything below about **motivation, CLI surface, flag semantics, output
+> rules and `resolve_targets`** still holds. The **Constraints** and
+> **Mechanism** sections describe the replaced design; read `src/paste.rs` and
+> the `paste.rs` bullet in `CLAUDE.md` for what is actually implemented.
 
 ## Summary
 
