@@ -204,6 +204,8 @@ pub struct SyncEngine<C> {
     /// apply; echo/dedup is "incoming hash == current hash", ordering is
     /// `(stamp, origin)`.
     current: Mutex<HashMap<SelectionKind, ContentState>>,
+    /// Per-selection decisions, computed once from `cfg` (see [`SelectionPolicy`]).
+    policies: Policies,
     /// Hybrid logical clock: max of wall-clock ms and the highest stamp
     /// seen, so reordered or modestly skewed updates still order sanely.
     clock: Mutex<u64>,
@@ -243,6 +245,84 @@ enum Provenance {
 struct BatchPlan {
     broadcasts: Vec<(SelectionKind, Offer)>,
     writes: Vec<(SelectionKind, Offer, Provenance)>,
+}
+
+/// What this node does with one selection, decided once from the config.
+///
+/// Every per-selection question — may we send it, may we receive it, do we watch
+/// it, do we re-own it, do we mirror it somewhere — used to be answered by its
+/// own predicate re-deriving the rule from `Config`, so the same
+/// `kind != Selection || sync_selection` condition appeared verbatim in several
+/// places and in three more shapes elsewhere. Adding a selection or a
+/// per-selection knob meant finding all of them, with no compiler help.
+#[derive(Debug, Clone, Copy)]
+struct SelectionPolicy {
+    /// Broadcast local changes to this selection.
+    send: bool,
+    /// Apply peers' updates to this selection.
+    recv: bool,
+    /// Observe it at all (a superset of `send`/`recv`: the local bridge may need
+    /// a selection this node never syncs).
+    watch: bool,
+    /// Re-offer it after a local copy so clipmesh owns the content.
+    own: bool,
+    /// The selection local changes to this one are mirrored INTO.
+    mirror_into: Option<SelectionKind>,
+}
+
+impl SelectionPolicy {
+    fn for_kind(kind: SelectionKind, cfg: &Config) -> Self {
+        // SELECTION participates in the mesh only when explicitly enabled;
+        // CLIPBOARD always does. This is the rule that was previously restated
+        // at every call site.
+        let on_mesh = kind != SelectionKind::Selection || cfg.sync_selection;
+        let mirror_into = link_partner(kind, cfg.link_selections);
+        SelectionPolicy {
+            send: on_mesh && cfg.direction != Direction::ReceiveOnly,
+            recv: on_mesh && cfg.direction != Direction::SendOnly,
+            // Watched if it is synced, or if the bridge needs to see its changes
+            // in order to mirror them. Note a mirror *target* is deliberately
+            // NOT watched on that account: `execute_write` reconciles against it
+            // by reading it on demand.
+            watch: on_mesh || mirror_into.is_some(),
+            own: cfg.take_ownership,
+            mirror_into,
+        }
+    }
+
+    /// Whether any local sink would act on a change to this selection: the mesh,
+    /// the bridge, or the ownership rewrite. When none would, the batch skips
+    /// the read entirely.
+    fn has_local_sink(&self) -> bool {
+        self.send || self.mirror_into.is_some() || self.own
+    }
+}
+
+/// The per-selection policies, indexed by `SelectionKind`.
+#[derive(Debug)]
+struct Policies([SelectionPolicy; 2]);
+
+impl Policies {
+    const ORDER: [SelectionKind; 2] = [SelectionKind::Clipboard, SelectionKind::Selection];
+
+    fn new(cfg: &Config) -> Self {
+        Policies(Self::ORDER.map(|k| SelectionPolicy::for_kind(k, cfg)))
+    }
+
+    fn get(&self, kind: SelectionKind) -> &SelectionPolicy {
+        match kind {
+            SelectionKind::Clipboard => &self.0[0],
+            SelectionKind::Selection => &self.0[1],
+        }
+    }
+
+    /// The selections satisfying `pick`, in a stable order (CLIPBOARD first).
+    fn kinds(&self, pick: impl Fn(&SelectionPolicy) -> bool) -> Vec<SelectionKind> {
+        Self::ORDER
+            .into_iter()
+            .filter(|k| pick(self.get(*k)))
+            .collect()
+    }
 }
 
 /// The selection a configured link direction mirrors `kind` INTO, or `None`.
@@ -323,6 +403,7 @@ impl<C: Clipboard> SyncEngine<C> {
         Arc::new(SyncEngine {
             clipboard,
             mesh,
+            policies: Policies::new(&cfg),
             cfg,
             current: Mutex::new(HashMap::new()),
             clock: Mutex::new(0),
@@ -332,40 +413,24 @@ impl<C: Clipboard> SyncEngine<C> {
         })
     }
 
-    /// CLIPBOARD, plus SELECTION when `with_selection`. The two callers below
-    /// differ only in which config flag answers that.
-    fn kinds(with_selection: bool) -> &'static [SelectionKind] {
-        const BOTH: [SelectionKind; 2] = [SelectionKind::Clipboard, SelectionKind::Selection];
-        if with_selection {
-            &BOTH
-        } else {
-            &BOTH[..1]
-        }
+    /// Selections this node syncs over the mesh.
+    fn synced_kinds(&self) -> Vec<SelectionKind> {
+        self.policies.kinds(|p| p.send || p.recv)
     }
 
-    /// Selections this node syncs (Selection only when enabled).
-    fn synced_kinds(&self) -> &'static [SelectionKind] {
-        Self::kinds(self.cfg.sync_selection)
-    }
-
-    /// Selections this node cares about observing — CLIPBOARD always, SELECTION
-    /// per the shared `Config::watch_selection` decision (so this can never drift
-    /// from the backend's watcher wiring in `main`). Used only by `prime` to
-    /// decide which selections to seed; the run loop itself receives every
-    /// selection the backend delivers, regardless of this set. Broader than
-    /// `synced_kinds` (SELECTION may be observed but not synced).
-    fn watched_kinds(&self) -> &'static [SelectionKind] {
-        Self::kinds(self.cfg.watch_selection())
+    /// Selections worth observing. Broader than `synced_kinds`: the local bridge
+    /// may need a selection this node never syncs. Handed to `Clipboard::watch`,
+    /// and used by `prime` to decide what to seed.
+    fn watched_kinds(&self) -> Vec<SelectionKind> {
+        self.policies.kinds(|p| p.watch)
     }
 
     fn may_send(&self, kind: SelectionKind) -> bool {
-        self.cfg.direction != Direction::ReceiveOnly
-            && (kind != SelectionKind::Selection || self.cfg.sync_selection)
+        self.policies.get(kind).send
     }
 
     fn may_recv(&self, kind: SelectionKind) -> bool {
-        self.cfg.direction != Direction::SendOnly
-            && (kind != SelectionKind::Selection || self.cfg.sync_selection)
+        self.policies.get(kind).recv
     }
 
     /// Issue a fresh stamp for locally originated content. saturating_add
@@ -408,7 +473,7 @@ impl<C: Clipboard> SyncEngine<C> {
         mut connects: mpsc::Receiver<Uuid>,
         mut rules_changed: mpsc::Receiver<()>,
     ) {
-        let mut watch = self.clipboard.watch(self.watched_kinds());
+        let mut watch = self.clipboard.watch(&self.watched_kinds());
 
         // Adopt the rules file's persisted version into the clock so the next
         // local edit outranks it after a restart.
@@ -518,7 +583,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// normally.
     async fn prime(&self) {
         let synced = self.synced_kinds();
-        for &kind in self.watched_kinds() {
+        for kind in self.watched_kinds() {
             let Some(raw) = self.read_selection(kind).await else {
                 continue;
             };
@@ -735,9 +800,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// node sends it), the selection bridge, or the ownership rewrite. When none
     /// would, `handle_batch` skips the read entirely.
     fn has_local_sink(&self, kind: SelectionKind) -> bool {
-        self.may_send(kind)
-            || link_partner(kind, self.cfg.link_selections).is_some()
-            || self.cfg.take_ownership
+        self.policies.get(kind).has_local_sink()
     }
 
     /// Drain one debounce batch: read each fired selection once, plan every
@@ -944,7 +1007,7 @@ impl<C: Clipboard> SyncEngine<C> {
         if !self.cfg.resync_on_connect || self.cfg.direction == Direction::ReceiveOnly {
             return;
         }
-        for &kind in self.synced_kinds() {
+        for kind in self.synced_kinds() {
             let Some(state) = self.current.lock().unwrap().get(&kind).copied() else {
                 continue;
             };
@@ -2591,6 +2654,57 @@ mod tests {
         })
         .await
         .expect("inbound starved by local-event storm");
+    }
+
+    /// Pins the whole policy table per config. Every one of these answers used
+    /// to come from its own predicate re-deriving the rule, and none of them had
+    /// direct coverage — a refactor could change which selections get watched
+    /// and no test would notice.
+    #[test]
+    fn selection_policy_matches_the_config() {
+        use SelectionKind::{Clipboard, Selection};
+        let policies = |f: &dyn Fn(&mut Config)| {
+            let mut cfg = Config::for_test("s");
+            f(&mut cfg);
+            Policies::new(&cfg)
+        };
+
+        // Default: CLIPBOARD only, both directions, nothing local.
+        let p = policies(&|_| {});
+        assert!(p.get(Clipboard).send && p.get(Clipboard).recv && p.get(Clipboard).watch);
+        assert!(!p.get(Selection).send && !p.get(Selection).recv && !p.get(Selection).watch);
+        assert_eq!(p.kinds(|x| x.watch), vec![Clipboard]);
+
+        // sync_selection puts SELECTION on the mesh.
+        let p = policies(&|c| c.sync_selection = true);
+        assert!(p.get(Selection).send && p.get(Selection).recv && p.get(Selection).watch);
+        assert_eq!(p.kinds(|x| x.send || x.recv), vec![Clipboard, Selection]);
+
+        // Direction gates send/recv but not watching.
+        let p = policies(&|c| c.direction = Direction::ReceiveOnly);
+        assert!(!p.get(Clipboard).send && p.get(Clipboard).recv && p.get(Clipboard).watch);
+        let p = policies(&|c| c.direction = Direction::SendOnly);
+        assert!(p.get(Clipboard).send && !p.get(Clipboard).recv);
+
+        // selection_to_clipboard needs SELECTION changes, so it must be watched
+        // even though it is not synced.
+        let p = policies(&|c| c.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD);
+        assert!(p.get(Selection).watch, "the bridge source must be observed");
+        assert!(!p.get(Selection).send, "watching does not imply syncing");
+        assert_eq!(p.get(Selection).mirror_into, Some(Clipboard));
+
+        // The reverse direction makes SELECTION a mirror *target*, which is
+        // reconciled by an on-demand read rather than by watching it.
+        let p = policies(&|c| c.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION);
+        assert!(!p.get(Selection).watch, "a mirror target is not watched");
+        assert_eq!(p.get(Clipboard).mirror_into, Some(Selection));
+
+        // take_ownership gives every selection a local sink even with no mesh.
+        let p = policies(&|c| {
+            c.direction = Direction::ReceiveOnly;
+            c.take_ownership = true;
+        });
+        assert!(p.get(Clipboard).has_local_sink());
     }
 
     #[test]
