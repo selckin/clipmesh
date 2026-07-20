@@ -408,7 +408,7 @@ impl<C: Clipboard> SyncEngine<C> {
         mut connects: mpsc::Receiver<Uuid>,
         mut rules_changed: mpsc::Receiver<()>,
     ) {
-        let mut watch = self.clipboard.watch();
+        let mut watch = self.clipboard.watch(self.watched_kinds());
 
         // Adopt the rules file's persisted version into the clock so the next
         // local edit outranks it after a restart.
@@ -1431,7 +1431,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Clipboard for GatedClipboard {
-        fn watch(&self) -> mpsc::UnboundedReceiver<SelectionKind> {
+        fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<SelectionKind> {
             let (tx, rx) = mpsc::unbounded_channel();
             self.watchers.lock().unwrap().push(tx);
             rx

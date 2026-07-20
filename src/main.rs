@@ -106,12 +106,9 @@ async fn main() -> Result<()> {
         clipmesh::protocol::PROTOCOL_VERSION
     );
 
-    // Watch SELECTION if the mesh syncs it cross-host, or if link_selections
-    // needs to mirror it into CLIPBOARD locally (see Config::watch_selection).
-    let clipboard = Arc::new(WaylandClipboard::new(
-        cfg.watch_selection(),
-        cfg.max_payload_size,
-    ));
+    // Which selections get watched is the engine's call, made when it
+    // subscribes (see Clipboard::watch) — the backend needs no config for it.
+    let clipboard = Arc::new(WaylandClipboard::new(cfg.max_payload_size));
     let rules_path = cfg.mime_rules_path.clone();
     // The config text as loaded, so the watcher only restarts on a real content
     // change (not a bare touch). Empty on a read error — any later edit differs.

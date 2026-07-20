@@ -76,7 +76,9 @@ impl MockClipboard {
 
 #[async_trait]
 impl Clipboard for MockClipboard {
-    fn watch(&self) -> mpsc::UnboundedReceiver<SelectionKind> {
+    fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<SelectionKind> {
+        // The mock delivers whatever a test seeds; the engine filters. Honouring
+        // `kinds` here would hide engine-side gating bugs from the tests.
         let (tx, rx) = mpsc::unbounded_channel();
         self.watchers.lock().unwrap().push(tx);
         rx
@@ -109,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn local_copy_notifies_watchers_and_updates_state() {
         let clip = MockClipboard::new();
-        let mut watch = clip.watch();
+        let mut watch = clip.watch(&[SelectionKind::Clipboard, SelectionKind::Selection]);
         clip.local_copy(SelectionKind::Clipboard, offer("hello"));
         assert_eq!(watch.recv().await, Some(SelectionKind::Clipboard));
         assert_eq!(
@@ -121,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn write_offer_counts_and_notifies_like_a_real_clipboard() {
         let clip = MockClipboard::new();
-        let mut watch = clip.watch();
+        let mut watch = clip.watch(&[SelectionKind::Clipboard, SelectionKind::Selection]);
         assert_eq!(clip.write_count(), 0);
         clip.write_offer(SelectionKind::Clipboard, offer("net"))
             .await

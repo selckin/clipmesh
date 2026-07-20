@@ -241,8 +241,9 @@ impl Config {
     /// Whether the SELECTION must be observed by the clipboard watcher:
     /// either it is mesh-synced (`sync_selection`), or the local bridge needs
     /// SELECTION changes so it can mirror them into CLIPBOARD
-    /// (`selection_to_clipboard`/`both`). Single source of truth for both the
-    /// backend wiring (`main`) and the engine's `watched_kinds`.
+    /// (`selection_to_clipboard`/`both`). Feeds the engine's `watched_kinds`,
+    /// which is what the engine hands to `Clipboard::watch` — so the backend
+    /// learns the set from the engine rather than deciding it separately.
     pub fn watch_selection(&self) -> bool {
         self.sync_selection || self.link_selections.selection_to_clipboard
     }
