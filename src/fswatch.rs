@@ -1,7 +1,13 @@
 //! inotify watcher for the config and MIME-rules files. Runs on a dedicated
 //! thread (inotify reads block). A rules-file change reloads the shared ruleset
-//! in place; a config-file change that still parses restarts the process (most
-//! settings can't be hot-applied) — systemd brings the daemon straight back.
+//! in place and pings the engine; a config-file change is reported to `main`,
+//! which restarts the process when the new config is usable (most settings can't
+//! be hot-applied) — systemd brings the daemon straight back.
+//!
+//! Neither file's policy lives here. This module notices changes and says so;
+//! the engine owns what a rules change means and `main` owns what a config change
+//! means. A watcher thread is the wrong place to decide the process should end —
+//! and deciding it here also meant this module parsing the config to find out.
 //!
 //! The parent directories are watched (rather than the files directly) so that
 //! editors which save by writing a temp file and renaming it into place are
@@ -9,7 +15,6 @@
 //! symlink, its resolved target's directory is watched too, so edits made
 //! through the link (e.g. into a dotfiles repo) are seen.
 
-use crate::config::Config;
 use crate::fsutil::{is_symlink, parent_dir, resolve_link_target};
 use crate::mime::{lock_rules, MimeRules};
 use anyhow::{Context, Result};
@@ -148,20 +153,24 @@ fn target_site(path: &Path) -> TargetSite {
 
 /// Spawn the watcher thread. A failure to set it up isn't fatal — the daemon
 /// keeps running, just without auto-reload/restart until the watcher recovers.
+///
+/// Changes are announced on the two channels: `rules_changed_tx` after the shared
+/// ruleset has been reloaded in place (the engine rebroadcasts), and
+/// `config_changed_tx` on every config-file change, for `main` to judge.
 pub fn spawn(
     config_path: PathBuf,
-    original_config: String,
     rules_path: Option<PathBuf>,
     rules: Arc<Mutex<MimeRules>>,
     rules_changed_tx: tokio::sync::mpsc::Sender<()>,
+    config_changed_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     thread::spawn(move || {
         watch_forever(
             &config_path,
-            &original_config,
             rules_path.as_deref(),
             &rules,
             &rules_changed_tx,
+            &config_changed_tx,
         )
     });
 }
@@ -173,20 +182,19 @@ pub fn spawn(
 /// returns on error (its inner loop never ends), so every return reconnects.
 fn watch_forever(
     config_path: &Path,
-    original_config: &str,
     rules_path: Option<&Path>,
     rules: &Arc<Mutex<MimeRules>>,
     rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
+    config_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) {
     crate::backoff::supervise("file watcher", || {
-        let mut on_config_change = || restart_on_config_change(config_path, original_config);
         // run() only returns on error; falling through reconnects.
         if let Err(e) = run(
             config_path,
             rules_path,
             rules,
-            &mut on_config_change,
             rules_changed_tx,
+            config_changed_tx,
         ) {
             warn!("file watcher error ({e:#}); reconnecting");
         }
@@ -213,8 +221,13 @@ fn ensure_watch(
         .with_context(|| format!("watching {}", dir.display()))
 }
 
-/// Register the link-site watch (always) and, for a symlink, the target-site
-/// watch for one file. A broken symlink logs and adds no target watch.
+/// Register the watches for one file: the link site (always), then its target
+/// site via the same reconciliation that runs after a repoint.
+///
+/// Startup deliberately has no target-site registration of its own. Doing it
+/// twice is how a symlink ends up watched one way when the daemon starts and
+/// another way after `ln -sf` — including the case reconciliation already
+/// handles, adding the first target entry to a file that had none.
 fn add_file_watches(
     inotify: &mut Inotify,
     masks: &mut HashMap<PathBuf, WatchMask>,
@@ -234,33 +247,7 @@ fn add_file_watches(
         path: path.to_path_buf(),
         wd,
     });
-
-    match target_site(path) {
-        TargetSite::Watch(target_path) => {
-            let dir = parent_dir(&target_path);
-            let wd = ensure_watch(inotify, masks, &dir, target_mask())?;
-            info!(
-                "{} {} is a symlink; also watching its target directory {}",
-                target.label(),
-                path.display(),
-                dir.display()
-            );
-            entries.push(Entry {
-                target,
-                site: Site::Target,
-                path: target_path,
-                wd,
-            });
-        }
-        TargetSite::NotSymlink => {}
-        TargetSite::Broken(intended) => warn!(
-            "{} {} is a broken symlink (target {} has no directory to watch); \
-             it will be picked up if the link is repaired",
-            target.label(),
-            path.display(),
-            intended.display()
-        ),
-    }
+    reconcile_target(inotify, masks, entries, target, path);
     Ok(())
 }
 
@@ -272,10 +259,15 @@ fn target_mask() -> WatchMask {
     WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO
 }
 
-/// Re-resolve a file's target site after its link fired (the symlink may have
-/// been (re)created or repointed) and update the target-site entry to match:
-/// add the new directory's watch, drop the old entry, and remove the old kernel
-/// watch when nothing else references it.
+/// Resolve a file's target site and make the registered target-site entry match
+/// it: add the new directory's watch, drop the old entry, and remove the old
+/// kernel watch when nothing else references it. A no-op when the resolved
+/// target is already the watched one.
+///
+/// THE place a target-site watch is registered — at startup, and again whenever
+/// a link-site event says the symlink may have been (re)created or repointed. So
+/// the messages below describe the resulting arrangement rather than the event
+/// that prompted it: both callers are the same reconciliation.
 fn reconcile_target(
     inotify: &mut Inotify,
     masks: &mut HashMap<PathBuf, WatchMask>,
@@ -288,7 +280,8 @@ fn reconcile_target(
         TargetSite::Watch(target_path) => Some(target_path),
         TargetSite::Broken(intended) => {
             warn!(
-                "{} {} is now a broken symlink (target {} has no directory to watch)",
+                "{} {} is a broken symlink (target {} has no directory to watch); \
+                 it will be picked up if the link is repaired",
                 target.label(),
                 path.display(),
                 intended.display()
@@ -311,7 +304,7 @@ fn reconcile_target(
         match ensure_watch(inotify, masks, &dir, target_mask()) {
             Ok(wd) => {
                 info!(
-                    "{} {} symlink target changed; now watching {}",
+                    "{} {} is a symlink; watching its target directory {}",
                     target.label(),
                     path.display(),
                     dir.display()
@@ -348,8 +341,8 @@ fn reconcile_target(
     }
 }
 
-/// The inotify loop. Calls `on_config_change` when the config file changes and
-/// reloads `rules` when the rules file changes. Returns only on error.
+/// The inotify loop. Reloads `rules` (and pings the engine) when the rules file
+/// changes, and reports every config-file change. Returns only on error.
 ///
 /// Each watched file is followed through a symlink: the link's own directory
 /// AND (for a symlink) the resolved target's directory are watched, and events
@@ -360,8 +353,8 @@ fn run(
     config_path: &Path,
     rules_path: Option<&Path>,
     rules: &Arc<Mutex<MimeRules>>,
-    on_config_change: &mut dyn FnMut(),
     rules_changed_tx: &tokio::sync::mpsc::Sender<()>,
+    config_changed_tx: &tokio::sync::mpsc::Sender<()>,
 ) -> Result<()> {
     let mut inotify = Inotify::init().context("initializing inotify")?;
 
@@ -446,8 +439,8 @@ fn run(
             }
         }
 
-        // Reload rules before (possibly) restarting on a config change, so a
-        // simultaneous edit to both still takes effect.
+        // Reload rules before reporting a config change, so a simultaneous edit
+        // to both still takes effect: the config change is what ends the process.
         if changed.get(Target::Rules) {
             let changed = lock_rules(rules).reload_if_changed();
             // Only ping on a *real* external change. Our own writes (adopt /
@@ -457,66 +450,13 @@ fn run(
                 let _ = rules_changed_tx.try_send(());
             }
         }
+        // Reported, not judged: whether the change means anything (a bare touch
+        // doesn't) is decided against the file itself, by whoever would act on
+        // it. A full channel already holds an unread "look again", so a dropped
+        // send loses nothing.
         if changed.get(Target::Config) {
-            on_config_change();
+            let _ = config_changed_tx.try_send(());
         }
-    }
-}
-
-/// What to do when the config file changes.
-#[derive(Debug, PartialEq, Eq)]
-enum ConfigChange {
-    /// The new config is usable; restart to apply it.
-    Restart,
-    /// The new config can't be read or parsed; keep the current one.
-    KeepRunning,
-}
-
-/// Decide whether a config change should restart the daemon. Restarts only when
-/// the file's contents actually differ from `original` AND still parse — so a
-/// bare `touch` (or an event we can't attribute, e.g. after a queue overflow)
-/// doesn't trigger a spurious restart, and a typo (or a transient read failure,
-/// e.g. caught mid-rename) keeps the daemon running rather than looping it under
-/// systemd's Restart=always.
-fn config_change_action(config_path: &Path, original: &str) -> ConfigChange {
-    let current = match std::fs::read_to_string(config_path) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(
-                "config file {} changed but can't be read ({e}); keeping the current configuration",
-                config_path.display()
-            );
-            return ConfigChange::KeepRunning;
-        }
-    };
-    if current == original {
-        return ConfigChange::KeepRunning; // unchanged content
-    }
-    match Config::from_toml(&current) {
-        Ok(_) => ConfigChange::Restart,
-        Err(e) => {
-            warn!(
-                "config file {} changed but doesn't parse ({e:#}); keeping the current configuration",
-                config_path.display()
-            );
-            ConfigChange::KeepRunning
-        }
-    }
-}
-
-/// Restart the process if the changed config is usable; otherwise log and keep
-/// running. Splitting the decision out (above) keeps the `exit(0)` out of the
-/// testable path.
-fn restart_on_config_change(config_path: &Path, original: &str) {
-    if config_change_action(config_path, original) == ConfigChange::Restart {
-        info!(
-            "config file {} changed; restarting to apply it",
-            config_path.display()
-        );
-        // Clean exit; the systemd unit (Restart=always) starts a fresh process
-        // with the new config. Abrupt by design — we want a from-scratch reload
-        // rather than trying to hot-apply settings.
-        std::process::exit(0);
     }
 }
 
@@ -545,11 +485,11 @@ mod tests {
         panic!("{what}");
     }
 
-    /// Run the inotify loop under test on its own thread with a no-op
-    /// config-change callback.
+    /// Run the inotify loop under test on its own thread, discarding its
+    /// config-change reports.
     ///
-    /// A test that needs to observe the config-change callback firing spawns
-    /// `run` inline with its own closure instead.
+    /// A test that needs to observe those spawns `run` inline with a channel it
+    /// keeps the receiving end of.
     fn spawn_watcher(
         config: &Path,
         rules_path: Option<&Path>,
@@ -560,9 +500,12 @@ mod tests {
         let rules_path = rules_path.map(Path::to_path_buf);
         let rules = rules.clone();
         let tx = tx.clone();
+        let (config_tx, config_rx) = tokio::sync::mpsc::channel(8);
         thread::spawn(move || {
-            let mut noop = || {};
-            let _ = run(&config, rules_path.as_deref(), &rules, &mut noop, &tx);
+            // Held for the loop's lifetime so the reports are simply dropped
+            // unread, rather than failing against a closed channel.
+            let _config_rx = config_rx;
+            let _ = run(&config, rules_path.as_deref(), &rules, &tx, &config_tx);
         });
     }
 
@@ -736,8 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_a_symlinked_config_target_triggers_on_config_change() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    fn editing_a_symlinked_config_target_is_reported() {
         let dir = tempfile::tempdir().unwrap();
 
         // The real config lives in a separate dir; a symlink points to it.
@@ -752,23 +694,21 @@ mod tests {
         let rules = Arc::new(Mutex::new(MimeRules::load(None, MimePolicy::Deny)));
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
-        // The real daemon would exit(0) here; the test signals instead so it can
-        // assert the config change was actually observed through the symlink.
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_w = fired.clone();
+        // The report `main` restarts on. Here it is only received, so the change
+        // can be observed through the symlink without ending the test process.
+        let (config_tx, mut config_rx) = tokio::sync::mpsc::channel(8);
         let rules_w = rules.clone();
         let link_w = config_link.clone();
         let tx_w = tx.clone();
         thread::spawn(move || {
-            let mut on_change = move || fired_w.store(true, Ordering::SeqCst);
-            let _ = run(&link_w, None, &rules_w, &mut on_change, &tx_w);
+            let _ = run(&link_w, None, &rules_w, &tx_w, &config_tx);
         });
 
         // Edit the REAL config file (in the dotfiles dir), not the symlink path.
         poll_until(
             || std::fs::write(&real_config, "listen = \"y\"\npsk = \"s\"\n").unwrap(),
-            || fired.load(Ordering::SeqCst),
-            "editing the symlinked config target did not trigger on_config_change",
+            || config_rx.try_recv().is_ok(),
+            "editing the symlinked config target was not reported",
         );
     }
 
@@ -806,39 +746,6 @@ mod tests {
             },
             || rx.try_recv().is_ok(),
             "the repaired broken symlink was not picked up",
-        );
-    }
-
-    #[test]
-    fn config_change_action_restarts_only_for_a_changed_usable_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let original = "listen = \"x\"\npsk = \"s\"\n";
-
-        // Same content (e.g. a bare `touch`): no restart, even though it parses.
-        std::fs::write(&path, original).unwrap();
-        assert_eq!(
-            config_change_action(&path, original),
-            ConfigChange::KeepRunning
-        );
-
-        // Changed and still parses: restart to apply it.
-        std::fs::write(&path, "listen = \"y\"\npsk = \"s\"\n").unwrap();
-        assert_eq!(config_change_action(&path, original), ConfigChange::Restart);
-
-        // Changed but doesn't parse: keep running, so a typo can't put us into a
-        // restart loop under systemd's Restart=always.
-        std::fs::write(&path, "this = is = not = toml").unwrap();
-        assert_eq!(
-            config_change_action(&path, original),
-            ConfigChange::KeepRunning
-        );
-
-        // An unreadable/missing file: keep running rather than crash.
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            config_change_action(&path, original),
-            ConfigChange::KeepRunning
         );
     }
 

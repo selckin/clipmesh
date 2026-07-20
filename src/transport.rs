@@ -37,8 +37,10 @@ pub struct SendHalf<W> {
     io: W,
     st: Arc<StatelessTransportState>,
     nonce: u64,
-    /// Ciphertext scratch, sized once to the largest a Noise record can be.
-    /// Reused across sends rather than reallocated (and re-zeroed) per message.
+    /// Record scratch: the length prefix followed by the largest ciphertext a
+    /// Noise record can hold, so a record can go out as one contiguous write
+    /// (see `write_chunk`). Reused across sends rather than reallocated (and
+    /// re-zeroed) per message.
     out: Vec<u8>,
     /// Plaintext scratch for the first chunk (length prefix + its payload).
     /// Reused for the same reason as `out`, and bounded by the same one-record
@@ -109,7 +111,7 @@ where
             io: wr,
             st: st.clone(),
             nonce: 0,
-            out: vec![0u8; NOISE_MAX],
+            out: vec![0u8; HEADER + NOISE_MAX],
             head: Vec::new(),
         },
         RecvHalf {
@@ -125,6 +127,9 @@ where
     ))
 }
 
+/// One-shot record write for the handshake, which has no scratch buffer yet.
+/// The steady-state path is `SendHalf::write_chunk`, which writes a record's
+/// prefix and ciphertext together.
 async fn write_record<W: AsyncWrite + Unpin>(io: &mut W, data: &[u8]) -> Result<()> {
     io.write_all(&(data.len() as u32).to_be_bytes()).await?;
     io.write_all(data).await?;
@@ -184,15 +189,31 @@ impl<W: AsyncWrite + Unpin> SendHalf<W> {
         for chunk in plaintext[head_payload..].chunks(CHUNK) {
             self.write_chunk(chunk).await?;
         }
+        // Once per message, not once per record: flushing is what the records
+        // of a single message have no reason to do between them.
+        self.io.flush().await?;
         Ok(())
     }
 
     /// Encrypt one chunk under the next nonce and write it as a length-prefixed
-    /// record.
+    /// record, prefix and ciphertext in a single write.
+    ///
+    /// `out` reserves room for the prefix ahead of the ciphertext so the record
+    /// leaves as one contiguous buffer, rather than being encrypted here and
+    /// concatenated later. Nagle can't merge a separate prefix write for us —
+    /// both sockets set `TCP_NODELAY` — so it would go out as its own 4-byte
+    /// segment ahead of every record, and a 32 MiB message is ~512 records: ~512
+    /// extra syscalls and 512 tiny packets per peer, per copy.
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        let n = self.st.write_message(self.nonce, chunk, &mut self.out)?;
+        let n = self
+            .st
+            .write_message(self.nonce, chunk, &mut self.out[HEADER..])?;
         self.nonce += 1;
-        write_record(&mut self.io, &self.out[..n]).await
+        // Identical bytes to `write_record`'s prefix — this is the framing the
+        // receiver validates, so the two must stay the same on the wire.
+        self.out[..HEADER].copy_from_slice(&(n as u32).to_be_bytes());
+        self.io.write_all(&self.out[..HEADER + n]).await?;
+        Ok(())
     }
 }
 

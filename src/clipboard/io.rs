@@ -17,6 +17,16 @@ use tracing::warn;
 /// concern, not a sync policy.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Who put the content a read returned onto the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A genuine change — the user, or another application. Propagates.
+    User,
+    /// The watch echo of the engine's own write. Must not propagate, or the
+    /// write re-drives the pipeline that produced it.
+    Echo,
+}
+
 /// The engine's clipboard gateway: every read, write and subscribe it performs
 /// goes through here.
 ///
@@ -39,7 +49,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ClipboardIo<C> {
     clipboard: Arc<C>,
     /// Content the engine itself wrote, awaiting the watch echo it provokes.
-    /// Consumed one-shot by [`take_marker`](ClipboardIo::take_marker).
+    /// Consumed one-shot by
+    /// [`read_classified`](ClipboardIo::read_classified) — the only reader that
+    /// takes it.
     last_written: Mutex<HashMap<SelectionKind, [u8; 32]>>,
 }
 
@@ -114,7 +126,7 @@ impl<C: Clipboard> ClipboardIo<C> {
             .lock()
             .unwrap()
             .insert(kind, content.hash());
-        match self.clipboard.write_offer(kind, content.into_offer()).await {
+        match self.clipboard.write_offer(kind, content.into_arc()).await {
             Ok(()) => true,
             Err(e) => {
                 warn!("couldn't write the {kind:?} selection: {e:#}");
@@ -124,11 +136,31 @@ impl<C: Clipboard> ClipboardIo<C> {
         }
     }
 
-    /// Take the pending echo marker for `kind`, if any. One-shot: the marker
-    /// suppresses exactly the one echo its write provokes, so a second identical
-    /// copy by the user still propagates.
-    pub fn take_marker(&self, kind: SelectionKind) -> Option<[u8; 32]> {
-        self.last_written.lock().unwrap().remove(&kind)
+    /// Read a selection **and** classify what came back against the pending echo
+    /// marker, consuming the marker in the same step.
+    ///
+    /// This is the other half of the write funnel, and it exists for the same
+    /// reason. The marker has two rules pulling in opposite directions: exactly
+    /// one reader — the batch classifier — *must* consume it, or engine writes
+    /// re-drive propagation into the echo storm the marker exists to stop; and
+    /// every other reader *must not*, or a real write's echo is later mistaken
+    /// for a user copy and re-broadcast.
+    ///
+    /// With a free-standing `take_marker` beside a plain `read`, which side a new
+    /// reader landed on was a coin flip, and both mistakes surface as a mesh that
+    /// never settles rather than as a failing test. Now the question is answered
+    /// by *which method you called*: [`read`](ClipboardIo::read) never consumes,
+    /// this always does, and there is no third option to get wrong.
+    pub async fn read_classified(&self, kind: SelectionKind) -> Option<(Hashed, Origin)> {
+        let raw = self.read(kind).await?;
+        // One-shot: the marker suppresses exactly the one echo its write
+        // provokes, so a second identical copy by the user still propagates.
+        let origin = match self.last_written.lock().unwrap().remove(&kind) {
+            // The read already carries its hash, so this is a 32-byte compare.
+            Some(written) if written == raw.hash() => Origin::Echo,
+            _ => Origin::User,
+        };
+        Some((raw, origin))
     }
 }
 
@@ -138,31 +170,61 @@ mod tests {
     use crate::clipboard::mock::MockClipboard;
     use crate::protocol::test_support::text_offer as offer;
 
-    #[tokio::test]
-    async fn a_write_records_a_marker_that_is_taken_once() {
-        let io = ClipboardIo::new(MockClipboard::new());
-        let content = Hashed::new(offer("x"));
-        assert!(io.write(SelectionKind::Clipboard, content.clone()).await);
-        assert_eq!(
-            io.take_marker(SelectionKind::Clipboard),
-            Some(content.hash())
-        );
-        // One-shot: a second identical copy by the user must still propagate.
-        assert_eq!(io.take_marker(SelectionKind::Clipboard), None);
+    /// The origin `read_classified` reports for `kind`, discarding the content.
+    async fn origin_of<C: Clipboard>(io: &ClipboardIo<C>, kind: SelectionKind) -> Origin {
+        io.read_classified(kind).await.expect("read failed").1
     }
 
     #[tokio::test]
-    async fn a_failed_write_leaves_no_marker() {
-        // Otherwise a later genuine copy of the same bytes would be swallowed as
-        // the echo of a write that never happened.
+    async fn a_write_reads_back_as_an_echo_exactly_once() {
+        let io = ClipboardIo::new(MockClipboard::new());
+        io.write(SelectionKind::Clipboard, Hashed::new(offer("x")))
+            .await;
+        assert_eq!(
+            origin_of(&io, SelectionKind::Clipboard).await,
+            Origin::Echo,
+            "the engine's own write must not propagate"
+        );
+        // One-shot: a second identical copy by the user is a real change.
+        assert_eq!(
+            origin_of(&io, SelectionKind::Clipboard).await,
+            Origin::User,
+            "a stale marker must not suppress a later genuine copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_read_does_not_consume_the_echo_marker() {
+        // The distinction `read_classified` exists to make structural: readers
+        // that are not the batch classifier must leave the marker alone, or a
+        // real write's echo is later mistaken for a user copy and re-broadcast.
+        let io = ClipboardIo::new(MockClipboard::new());
+        io.write(SelectionKind::Clipboard, Hashed::new(offer("x")))
+            .await;
+        io.read(SelectionKind::Clipboard)
+            .await
+            .expect("read failed");
+        assert_eq!(
+            origin_of(&io, SelectionKind::Clipboard).await,
+            Origin::Echo,
+            "a plain read consumed the marker the classifier needed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_reads_back_as_a_user_change() {
+        // No echo follows a write that never happened, so a later genuine copy
+        // of the same bytes must not be swallowed as one.
         let clip = MockClipboard::new();
         clip.set_fail_writes(true);
-        let io = ClipboardIo::new(clip);
+        let io = ClipboardIo::new(clip.clone());
         assert!(
             !io.write(SelectionKind::Clipboard, Hashed::new(offer("x")))
                 .await
         );
-        assert_eq!(io.take_marker(SelectionKind::Clipboard), None);
+        clip.set_fail_writes(false);
+        clip.local_copy(SelectionKind::Clipboard, offer("x"));
+        assert_eq!(origin_of(&io, SelectionKind::Clipboard).await, Origin::User);
     }
 
     #[tokio::test]

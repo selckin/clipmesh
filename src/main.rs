@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clipmesh::clipboard::wayland::WaylandClipboard;
 use clipmesh::config::{self, Config, MimePolicy};
 use clipmesh::config_template;
-use clipmesh::mime::{MimeRules, Relation, Verdict};
+use clipmesh::mime::{MimeRules, Relation, RulesFileState, Verdict};
 use clipmesh::{node, paste};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -110,24 +110,97 @@ async fn main() -> Result<()> {
     // subscribes (see Clipboard::watch) — the backend needs no config for it.
     let clipboard = Arc::new(WaylandClipboard::new(cfg.max_payload_size));
     let rules_path = cfg.mime_rules_path.clone();
-    // The config text as loaded, so the watcher only restarts on a real content
-    // change (not a bare touch). Empty on a read error — any later edit differs.
+    // The config text as loaded, so a change is only acted on when the contents
+    // really differ (not a bare touch). Empty on a read error — any later edit
+    // then differs.
     let original_config = std::fs::read_to_string(&config_path).unwrap_or_default();
     let handle = node::spawn_node(cfg, clipboard).await?;
-    // Watch the config and MIME-rules files (inotify): a rules edit reloads in
-    // place, a config edit that changes content and still parses restarts the
-    // daemon (most settings can't be hot-applied).
+    // Watch the config and MIME-rules files (inotify). A rules edit reloads in
+    // place on the watcher thread; a config edit is only *reported* here, since
+    // ending the process is this function's call to make, not a watcher's.
+    let (config_changed_tx, mut config_changed_rx) = tokio::sync::mpsc::channel(1);
     clipmesh::fswatch::spawn(
-        config_path,
-        original_config,
+        config_path.clone(),
         rules_path,
         handle.mime_rules.clone(),
         handle.rules_changed_tx.clone(),
+        config_changed_tx,
     );
-    handle.engine_task.await.context("sync engine panicked")?;
+    let mut engine_task = handle.engine_task;
+    loop {
+        tokio::select! {
+            joined = &mut engine_task => {
+                joined.context("sync engine panicked")?;
+                break;
+            }
+            // A closed channel (the watcher gone for good) disables this branch
+            // instead of spinning on it: the daemon keeps syncing, just without
+            // restart-on-config-change.
+            Some(()) = config_changed_rx.recv() => {
+                restart_on_config_change(&config_path, &original_config)
+            }
+        }
+    }
     // The engine never stops in normal operation; exit non-zero so systemd
     // (Restart=always) brings the daemon back.
     bail!("sync engine exited unexpectedly");
+}
+
+/// What to do when the config file changes.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigChange {
+    /// The new config is usable; restart to apply it.
+    Restart,
+    /// The new config can't be read or parsed; keep the current one.
+    KeepRunning,
+}
+
+/// Decide whether a config change should restart the daemon. Restarts only when
+/// the file's contents actually differ from `original` AND still parse — so a
+/// bare `touch` (or an event we can't attribute, e.g. after a queue overflow)
+/// doesn't trigger a spurious restart, and a typo (or a transient read failure,
+/// e.g. caught mid-rename) keeps the daemon running rather than looping it under
+/// systemd's Restart=always.
+fn config_change_action(config_path: &Path, original: &str) -> ConfigChange {
+    let current = match std::fs::read_to_string(config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                "config file {} changed but can't be read ({e}); keeping the current configuration",
+                config_path.display()
+            );
+            return ConfigChange::KeepRunning;
+        }
+    };
+    if current == original {
+        return ConfigChange::KeepRunning; // unchanged content
+    }
+    match Config::from_toml(&current) {
+        Ok(_) => ConfigChange::Restart,
+        Err(e) => {
+            tracing::warn!(
+                "config file {} changed but doesn't parse ({e:#}); keeping the current configuration",
+                config_path.display()
+            );
+            ConfigChange::KeepRunning
+        }
+    }
+}
+
+/// Restart the process if the changed config is usable; otherwise log and keep
+/// running. Splitting the decision out (above) keeps the `exit(0)` out of the
+/// testable path.
+fn restart_on_config_change(config_path: &Path, original: &str) {
+    if config_change_action(config_path, original) == ConfigChange::Restart {
+        tracing::info!(
+            "config file {} changed; restarting to apply it",
+            config_path.display()
+        );
+        // Clean exit; the systemd unit (Restart=always) starts a fresh process
+        // with the new config. Abrupt by design — we want a from-scratch reload
+        // rather than trying to hot-apply settings.
+        std::process::exit(0);
+    }
 }
 
 /// Normalize the config file (fill in missing options + comments) and exit.
@@ -152,42 +225,38 @@ fn sync_config_action(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// State of the MIME rules file as found on disk by [`open_rules_file`].
-enum RulesFile {
-    /// Exists and parses as TOML.
-    Present,
-    /// Exists but holds only whitespace.
-    Empty,
-    /// Not there at all.
-    Missing,
-}
-
-/// Resolve the MIME rules path from the config and validate the file up front,
-/// for the one-shot CLI commands.
+/// Resolve the MIME rules path from the config and read the file for a one-shot
+/// CLI command, through `MimeRules::open` — the constructor that never writes.
 ///
-/// Validating here is the point: `MimeRules::load` silently heals an unparseable
-/// file into a fresh skeleton — a write, which also drops the `[clipmesh]` sync
-/// version — so a CLI command must refuse before it ever gets that far. Callers
-/// decide for themselves what `Empty`/`Missing` mean: a writer creates the file,
-/// a reader reports and stops.
-fn open_rules_file(config_path: &Path) -> Result<(Config, PathBuf, RulesFile)> {
+/// Which constructor is used is the whole point. `MimeRules::load` heals a file
+/// it can't parse by replacing it with a fresh skeleton, dropping the
+/// `[clipmesh]` mesh version with it; no CLI command may take that path just
+/// because the user has a typo in their file. Reaching for `open` refuses it
+/// here, once, for every command — and for any command added later.
+///
+/// So a file that exists but can't be used is a hard error, and the returned
+/// `Err(RulesFileState)` only ever means "nothing on disk yet". Each command
+/// answers that its own way: a writer creates the file, a reader says so and
+/// stops.
+fn open_rules_file(
+    config_path: &Path,
+) -> Result<(Config, PathBuf, Result<MimeRules, RulesFileState>)> {
     let cfg = Config::load(config_path)?;
     let path = cfg
         .mime_rules_path
         .clone()
         .context("no MIME rules file is configured")?;
-    let state = match std::fs::read_to_string(&path) {
-        Ok(text) if text.trim().is_empty() => RulesFile::Empty,
-        Ok(text) => {
-            text.parse::<toml_edit::DocumentMut>().with_context(|| {
-                format!("{} isn't valid TOML — fix or delete it", path.display())
-            })?;
-            RulesFile::Present
+    let opened = match MimeRules::open(Some(path.clone()), cfg.unknown_mime) {
+        Err(RulesFileState::Malformed(e)) => {
+            return Err(e)
+                .with_context(|| format!("{} isn't valid TOML — fix or delete it", path.display()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RulesFile::Missing,
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Err(RulesFileState::Unreadable(e)) => {
+            return Err(e).with_context(|| format!("reading {}", path.display()))
+        }
+        opened => opened,
     };
-    Ok((cfg, path, state))
+    Ok((cfg, path, opened))
 }
 
 /// Apply a single `--allow`/`--deny` glob to the MIME-rules file and exit. Any
@@ -199,9 +268,12 @@ fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()>
     }
     init_cli_logging();
 
-    // Empty or missing is fine here — MimeRules::load creates a fresh file.
-    let (cfg, path, _) = open_rules_file(config_path)?;
-    let mut rules = MimeRules::load(Some(path.clone()), cfg.unknown_mime);
+    let (cfg, path, opened) = open_rules_file(config_path)?;
+    // Nothing on disk yet is no obstacle to a writer: fall back to the healing
+    // constructor, which creates the file from the built-in skeleton and then
+    // takes the edit.
+    let mut rules =
+        opened.unwrap_or_else(|_| MimeRules::load(Some(path.clone()), cfg.unknown_mime));
     let removed = rules.apply_glob(allow, pattern);
     if !rules.persist() {
         bail!("couldn't write the MIME rules file {}", path.display());
@@ -227,20 +299,23 @@ fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()>
 /// creates or rewrites the file.
 fn print_rules(config_path: &Path) -> Result<()> {
     init_cli_logging();
-    let (cfg, path, state) = open_rules_file(config_path)?;
-    match state {
-        RulesFile::Empty => {
-            println!("The MIME rules file {} is empty.", path.display());
+    let (cfg, path, opened) = open_rules_file(config_path)?;
+    let rules = match opened {
+        Ok(rules) => rules,
+        // Only "nothing on disk yet" reaches here — a file that exists but can't
+        // be used came back as an error above — so there is nothing to list.
+        Err(state) => {
+            println!(
+                "{}",
+                match state {
+                    RulesFileState::Empty =>
+                        format!("The MIME rules file {} is empty.", path.display()),
+                    _ => format!("No MIME rules file yet at {}", path.display()),
+                }
+            );
             return Ok(());
         }
-        RulesFile::Missing => {
-            println!("No MIME rules file yet at {}", path.display());
-            return Ok(());
-        }
-        RulesFile::Present => {}
-    }
-    // The file exists and is valid TOML, so this reads it without writing.
-    let rules = MimeRules::load(Some(path.clone()), cfg.unknown_mime);
+    };
     let report = rules.rules_report();
     let default = match cfg.unknown_mime {
         MimePolicy::Allow => "✅ allow",
@@ -270,7 +345,7 @@ fn print_rules(config_path: &Path) -> Result<()> {
         let pad = " ".repeat(key_w.saturating_sub(entry.key.chars().count()));
         let line = format!(
             "{}  {}{pad}{cap}",
-            verdict_emoji(entry.verdict),
+            verdict_label(entry.verdict),
             colorize_globs(&entry.key, color),
         );
         println!("{}", line.trim_end());
@@ -291,14 +366,23 @@ fn print_rules(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Emoji + left-padded word for a verdict, used by the `--rules` listing so the
-/// key column aligns (the words pad to the width of "invalid").
-fn verdict_emoji(v: Verdict) -> &'static str {
-    match v {
-        Verdict::Allow => "✅ allow  ",
-        Verdict::Deny => "⛔ deny   ",
-        Verdict::Invalid => "⚠️  invalid",
-    }
+/// A verdict as the `--rules` listing writes it: the icon, then the word padded
+/// to the width of the longest ("invalid") so the key column that follows lines
+/// up.
+///
+/// The icon needs padding of its own, which is the part no format width can
+/// express: `⚠️` is emoji-presentation by variation selector and renders one
+/// column narrower than `✅`/`⛔` in most terminals, so it takes a second space
+/// to land the word where the other two rows put it. That is a rendered-width
+/// correction, not a character count — `{word:<7}` after a single space would
+/// pull the whole invalid row one column left.
+fn verdict_label(v: Verdict) -> String {
+    let (word, icon_pad) = match v {
+        Verdict::Allow => ("allow", " "),
+        Verdict::Deny => ("deny", " "),
+        Verdict::Invalid => ("invalid", "  "),
+    };
+    format!("{}{icon_pad}{word:<7}", verdict_icon(v))
 }
 
 /// Just the emoji for a verdict, for inline overlap references.
@@ -373,6 +457,50 @@ mod tests {
         assert_eq!(
             paste_mode_args("/usr/bin/clipmesh", &args(&["--config", "/c"])),
             None
+        );
+    }
+
+    /// The listing's key column is aligned by these labels alone, and the
+    /// correction for `⚠️`'s narrower rendering is invisible in the source. Pin
+    /// the bytes, so a future tidy-up that "simplifies" the padding away has to
+    /// argue with a test rather than silently skew a column.
+    #[test]
+    fn verdict_labels_render_to_one_aligned_column() {
+        assert_eq!(verdict_label(Verdict::Allow), "✅ allow  ");
+        assert_eq!(verdict_label(Verdict::Deny), "⛔ deny   ");
+        assert_eq!(verdict_label(Verdict::Invalid), "⚠️  invalid");
+    }
+
+    #[test]
+    fn config_change_action_restarts_only_for_a_changed_usable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "listen = \"x\"\npsk = \"s\"\n";
+
+        // Same content (e.g. a bare `touch`): no restart, even though it parses.
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(
+            config_change_action(&path, original),
+            ConfigChange::KeepRunning
+        );
+
+        // Changed and still parses: restart to apply it.
+        std::fs::write(&path, "listen = \"y\"\npsk = \"s\"\n").unwrap();
+        assert_eq!(config_change_action(&path, original), ConfigChange::Restart);
+
+        // Changed but doesn't parse: keep running, so a typo can't put us into a
+        // restart loop under systemd's Restart=always.
+        std::fs::write(&path, "this = is = not = toml").unwrap();
+        assert_eq!(
+            config_change_action(&path, original),
+            ConfigChange::KeepRunning
+        );
+
+        // An unreadable/missing file: keep running rather than crash.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            config_change_action(&path, original),
+            ConfigChange::KeepRunning
         );
     }
 }

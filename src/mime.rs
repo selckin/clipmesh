@@ -107,7 +107,12 @@ const TEMPLATE: &str = "\
 /// `examples/mimetypes` is generated from this and pinned by a golden test, so
 /// the shipped example and the file clipmesh creates itself cannot drift — the
 /// same arrangement `config_template` uses for `examples/config.toml`.
-pub fn render_example() -> String {
+///
+/// Test-scoped: both writing the example and pinning it happen in that test.
+/// The daemon never renders the example — it renders the *file*, through
+/// `materialize_fresh`, which is exactly what makes the pin meaningful.
+#[cfg(test)]
+fn render_example() -> String {
     let mut doc: DocumentMut = TEMPLATE.parse().expect("built-in TOML template must parse");
     normalize(&mut doc);
     doc.to_string()
@@ -115,10 +120,12 @@ pub fn render_example() -> String {
 
 /// One rule: whether the type may sync, and an optional per-type size cap
 /// (applied to that representation's bytes, on top of `max_payload_size`).
+/// Internal: callers outside this module ask [`CompiledRules::allows`], which
+/// applies both halves, rather than interpreting a rule themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MimeRule {
-    pub allow: bool,
-    pub max_size: Option<usize>,
+struct MimeRule {
+    allow: bool,
+    max_size: Option<usize>,
 }
 
 /// A rules-file version and body that are durably on disk together.
@@ -203,50 +210,39 @@ pub struct MimeRules {
     dirty: bool,
 }
 
-impl MimeRules {
-    /// Load rules from the file. A missing, empty, or non-TOML file is replaced
-    /// with a fresh skeleton (an old line-format file is discarded). With no
-    /// path, the rules live only in memory.
-    pub fn load(path: Option<PathBuf>, unknown: MimePolicy) -> MimeRules {
-        let mut me = MimeRules {
-            doc: DocumentMut::new(),
-            unknown,
-            path,
-            loaded: None,
-            dirty: false,
-        };
-        let needs_fresh = me.read_file();
-        if me.path.is_some() && needs_fresh {
-            me.materialize_fresh();
-        }
-        me
-    }
+/// Why [`MimeRules::open`] came back without a ruleset.
+///
+/// These are exactly the states [`MimeRules::load`] resolves by writing over the
+/// file, which is why they have names: a caller that must not clobber it sees
+/// what is wrong and decides for itself, instead of classifying the file a second
+/// time — a duplicate that can disagree with this one, and that races the load it
+/// is meant to guard.
+#[derive(Debug)]
+pub enum RulesFileState {
+    /// Nothing at the configured path (including a symlink to a missing target).
+    Missing,
+    /// The file is there but holds only whitespace.
+    Empty,
+    /// The file is there but isn't valid TOML — a typo, or an old line-format
+    /// rules file.
+    Malformed(toml_edit::TomlError),
+    /// The file couldn't be read at all (permissions, a mid-rename catch, ...).
+    Unreadable(std::io::Error),
+}
 
-    /// Read and parse the file. Returns whether a fresh skeleton should be
-    /// written — true when the file is absent, empty, or not valid TOML (an old
-    /// line-format file is discarded), false when it loaded or when the read
-    /// failed transiently (so we never clobber a file we couldn't read).
-    fn read_file(&mut self) -> bool {
-        let Some(path) = self.path.clone() else {
-            return false;
-        };
-        match fs::read_to_string(&path) {
-            Ok(text) if text.trim().is_empty() => true,
-            Ok(text) => match text.parse::<DocumentMut>() {
-                Ok(doc) => {
-                    self.ingest(doc, text, &path);
-                    false
-                }
-                Err(e) => {
-                    warn!(
-                        "MIME rules file {} isn't valid TOML ({e}); replacing it with a fresh one",
-                        path.display()
-                    );
-                    true
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if crate::fsutil::is_symlink(&path) {
+impl RulesFileState {
+    /// Whether [`MimeRules::load`] should replace the file with a fresh
+    /// skeleton, warning about what that costs the user.
+    ///
+    /// Every state but one is rewritten: there is nothing on disk to lose
+    /// (missing, empty) or nothing clipmesh can use (malformed). A file we failed
+    /// to *read* is the exception — the rules are most likely still in it and the
+    /// failure transient — so it is left exactly as it is.
+    fn warrants_a_rewrite(&self, path: &Path) -> bool {
+        match self {
+            RulesFileState::Empty => true,
+            RulesFileState::Missing => {
+                if crate::fsutil::is_symlink(path) {
                     warn!(
                         "MIME-rules file {} is a symlink whose target is missing; \
                          starting from an empty ruleset, then writing a fresh skeleton \
@@ -257,10 +253,90 @@ impl MimeRules {
                 }
                 true
             }
-            Err(e) => {
+            RulesFileState::Malformed(e) => {
+                warn!(
+                    "MIME rules file {} isn't valid TOML ({e}); replacing it with a fresh one",
+                    path.display()
+                );
+                true
+            }
+            RulesFileState::Unreadable(e) => {
                 warn!("couldn't read MIME rules from {}: {e}", path.display());
                 false
             }
+        }
+    }
+}
+
+impl MimeRules {
+    /// An empty in-memory ruleset for `path` — where both constructors below
+    /// start, and what a caller is left with when there is no file to read.
+    fn empty(path: Option<PathBuf>, unknown: MimePolicy) -> MimeRules {
+        MimeRules {
+            doc: DocumentMut::new(),
+            unknown,
+            path,
+            loaded: None,
+            dirty: false,
+        }
+    }
+
+    /// Read the rules file, **never writing to it**: whatever is wrong with the
+    /// file comes back as a [`RulesFileState`] for the caller to act on.
+    ///
+    /// This is the constructor for anything that must not surprise the user by
+    /// rewriting their file — notably the one-shot CLI commands, since replacing
+    /// a file we merely failed to parse also discards the `[clipmesh]` table the
+    /// mesh's last-writer-wins version lives in. With no path the rules live only
+    /// in memory, so there is no file to refuse: that is `Ok`, empty.
+    pub fn open(path: Option<PathBuf>, unknown: MimePolicy) -> Result<MimeRules, RulesFileState> {
+        let mut me = Self::empty(path, unknown);
+        me.read_file()?;
+        Ok(me)
+    }
+
+    /// Read the rules file, healing it in place: a missing, empty, or non-TOML
+    /// file is **replaced** with a fresh skeleton (an old line-format file is
+    /// discarded). With no path, the rules live only in memory.
+    ///
+    /// That write is the daemon's bootstrap — it is how a first run ends up with
+    /// a rules file at all — but it destroys whatever was there, so the choice of
+    /// this constructor over [`open`](Self::open) is the choice to allow it.
+    pub fn load(path: Option<PathBuf>, unknown: MimePolicy) -> MimeRules {
+        let state = match Self::open(path.clone(), unknown) {
+            Ok(rules) => return rules,
+            Err(state) => state,
+        };
+        let mut me = Self::empty(path, unknown);
+        // `open` only ever refuses an actual file, so the path is necessarily
+        // there; asking keeps the pathless case an ordinary in-memory ruleset
+        // rather than an `expect` that would have to stay true forever.
+        if let Some(path) = me.path.clone() {
+            if state.warrants_a_rewrite(&path) {
+                me.materialize_fresh();
+            }
+        }
+        me
+    }
+
+    /// Read and parse the file into `self`, or report the state that stopped it.
+    /// Never writes: what to do about a file that didn't load is the caller's
+    /// decision, made from what comes back here.
+    fn read_file(&mut self) -> Result<(), RulesFileState> {
+        let Some(path) = self.path.clone() else {
+            return Ok(()); // in-memory only; there is nothing to read
+        };
+        match fs::read_to_string(&path) {
+            Ok(text) if text.trim().is_empty() => Err(RulesFileState::Empty),
+            Ok(text) => match text.parse::<DocumentMut>() {
+                Ok(doc) => {
+                    self.ingest(doc, text, &path);
+                    Ok(())
+                }
+                Err(e) => Err(RulesFileState::Malformed(e)),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(RulesFileState::Missing),
+            Err(e) => Err(RulesFileState::Unreadable(e)),
         }
     }
 
@@ -291,7 +367,11 @@ impl MimeRules {
     /// is sorted and any comments interleaved among its entries are dropped, so
     /// the saved/shared form is deterministic. Comments above `[rules]` (the
     /// header and the `[clipmesh]` table) are kept.
-    pub fn body(&self) -> String {
+    ///
+    /// A body reaches a peer only as part of a [`Snapshot`], which is what makes
+    /// "rendered" and "durably on disk at this version" one step rather than two
+    /// a caller could take out of order.
+    fn body(&self) -> String {
         let mut doc = self.doc.clone();
         normalize(&mut doc);
         doc.to_string()
@@ -390,18 +470,34 @@ impl MimeRules {
         true
     }
 
-    /// Whether any of `mimes` is matched by no rule. Test-facing shim; the engine
-    /// asks a [`CompiledRules`] directly, since it has one in hand either way.
-    #[cfg(test)]
+    /// Whether any of `mimes` is matched by no `[rules]` key.
+    ///
+    /// Walks the keys directly rather than going through [`compile`]: the answer
+    /// depends only on key globs, while compiling *also* parses every rule's
+    /// verdict, resolves its size cap and computes specificity weights — all of
+    /// which this question discards. The capture path asks it on every copy, and
+    /// the table is designed to grow (each unseen type is appended to it
+    /// forever), so the saving grows with uptime.
+    ///
+    /// [`compile`]: MimeRules::compile
     pub fn has_unseen<'a>(&self, mimes: impl IntoIterator<Item = &'a String>) -> bool {
-        self.compile().has_unseen(mimes)
+        let Some(table) = self.rules_table() else {
+            // No rules at all: everything is unseen (unless there is nothing to
+            // ask about).
+            return mimes.into_iter().next().is_some();
+        };
+        mimes
+            .into_iter()
+            .any(|m| !table.iter().any(|(key, _)| glob_match(key, m)))
     }
 
     /// Remove every `[rules]` entry whose key the glob `pattern` matches
     /// (case-insensitive), except an entry equal to `pattern` itself. Returns the
-    /// removed entries rendered as copy-pasteable `"key" = value` lines. Used by
-    /// the `--allow`/`--deny` CLI to collapse entries under a new glob.
-    pub fn remove_matching(&mut self, pattern: &str) -> Vec<String> {
+    /// removed entries rendered as copy-pasteable `"key" = value` lines. Half of
+    /// [`apply_glob`](Self::apply_glob), which is how the `--allow`/`--deny` CLI
+    /// collapses entries under a new glob — removing without then setting the
+    /// glob would drop rules and replace them with nothing.
+    fn remove_matching(&mut self, pattern: &str) -> Vec<String> {
         let Some(rules) = self.doc.get_mut("rules").and_then(Item::as_table_mut) else {
             return Vec::new();
         };
@@ -424,8 +520,8 @@ impl MimeRules {
     }
 
     /// Add or replace a single `allow`/`deny` rule for `key` (which may be a
-    /// glob). Used by the `--allow`/`--deny` CLI.
-    pub fn set_rule(&mut self, key: &str, allow: bool) {
+    /// glob). The other half of [`apply_glob`](Self::apply_glob).
+    fn set_rule(&mut self, key: &str, allow: bool) {
         table_mut(&mut self.doc, "rules")[key] = value(rule_word(allow));
         self.dirty = true;
     }
@@ -449,46 +545,65 @@ impl MimeRules {
         let Some(rules) = self.rules_table() else {
             return Vec::new();
         };
-        let mut entries: Vec<(&str, &Item)> = rules.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        let mut out = Vec::with_capacity(entries.len());
-        for &(key, item) in &entries {
-            let (verdict, max) = describe_value(item);
-            let mine = parse_rule_item(item);
-            let mut overlaps = Vec::new();
-            for &(okey, oitem) in &entries {
-                // Only a *different* glob can also match this key.
-                if okey == key || !okey.bytes().any(|b| b == b'*' || b == b'?') {
-                    continue;
-                }
-                if !glob_match(okey, key) {
-                    continue;
-                }
-                let Some(theirs) = parse_rule_item(oitem) else {
-                    continue; // an invalid glob decides nothing
-                };
-                let relation = match mine {
-                    None => Relation::DecidesInstead,
-                    Some(m) if m.allow == theirs.allow => Relation::Redundant,
-                    Some(m) if specificity(key, m.allow) > specificity(okey, theirs.allow) => {
-                        Relation::Overrides
-                    }
-                    Some(_) => Relation::OverriddenBy,
-                };
-                overlaps.push(Overlap {
-                    key: okey.to_string(),
-                    verdict: describe_value(oitem).0,
-                    relation,
-                });
-            }
-            out.push(RuleReport {
-                key: key.to_string(),
-                verdict,
-                max,
-                overlaps,
-            });
+        /// An entry, parsed exactly once. Every entry is also examined as a
+        /// candidate overlap of every other, so parsing on demand re-derived the
+        /// same values O(n²) times — and, worse, left three sites (the verdict,
+        /// the rule, and the overlap's verdict) each having to agree about what
+        /// a rule value means. They are one parse; keep them one value.
+        struct Entry<'a> {
+            key: &'a str,
+            rule: Option<MimeRule>,
+            verdict: Verdict,
+            /// The cap as written, borrowed until the report needs it owned.
+            max: Option<&'a str>,
+            /// Only a glob can also match a *different* entry's key.
+            is_glob: bool,
         }
-        out
+        let mut entries: Vec<Entry<'_>> = rules
+            .iter()
+            .map(|(key, item)| {
+                let (rule, verdict, max) = describe_value(item);
+                Entry {
+                    key,
+                    rule,
+                    verdict,
+                    max,
+                    is_glob: has_wildcard(key),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.key.cmp(b.key));
+        entries
+            .iter()
+            .map(|e| RuleReport {
+                key: e.key.to_string(),
+                verdict: e.verdict,
+                max: e.max.map(str::to_string),
+                overlaps: entries
+                    .iter()
+                    .filter(|o| o.is_glob && o.key != e.key && glob_match(o.key, e.key))
+                    .filter_map(|o| {
+                        let theirs = o.rule?; // an invalid glob decides nothing
+                        let relation = match e.rule {
+                            None => Relation::DecidesInstead,
+                            Some(m) if m.allow == theirs.allow => Relation::Redundant,
+                            Some(m)
+                                if specificity(e.key, m.allow)
+                                    > specificity(o.key, theirs.allow) =>
+                            {
+                                Relation::Overrides
+                            }
+                            Some(_) => Relation::OverriddenBy,
+                        };
+                        Some(Overlap {
+                            key: o.key.to_string(),
+                            verdict: o.verdict,
+                            relation,
+                        })
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Whether there are in-memory rule changes not yet written to disk.
@@ -759,7 +874,25 @@ impl CompiledRules<'_> {
     /// wildcards, always beats a glob.
     fn find_rule(&self, mime: &str) -> Option<MimeRule> {
         let mut best: Option<(Specificity<'_>, MimeRule)> = None;
+        // Set once an exact key has decided this type. From there no glob can
+        // win: a glob matching the same text can never carry *more* literals
+        // than the text has characters, which is what an exact key carries, and
+        // it carries at least one wildcard to lose the next component on — so
+        // every remaining glob is skipped without running the backtracking
+        // matcher against it. This file appends every unseen type, so the table
+        // walked here per representation only ever grows.
+        //
+        // Not a bare early return, deliberately: an exact key can still be tied
+        // by *another* exact key that differs only in case (`TEXT/PLAIN` beside
+        // `text/plain` — both match, neither is more specific), and returning
+        // the first one found would decide that by table order instead of by the
+        // documented deny-then-lexicographic tie-break.
+        let mut decided_exactly = false;
         for entry in &self.entries {
+            let is_exact = entry.wildcards == 0;
+            if decided_exactly && !is_exact {
+                continue;
+            }
             let Some(rule) = entry.rule else { continue };
             if !glob_match(entry.key, mime) {
                 continue;
@@ -768,6 +901,7 @@ impl CompiledRules<'_> {
             if best.as_ref().map_or(true, |(b, _)| spec > *b) {
                 best = Some((spec, rule));
             }
+            decided_exactly |= is_exact;
         }
         best.map(|(_, r)| r)
     }
@@ -809,7 +943,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     // Fast path: a wildcard-free pattern (every exact key) is just a
     // case-insensitive compare. This is the hot path, since `find_rule`/
     // `any_match` run it against every rule key per type.
-    if !pattern.bytes().any(|b| b == b'*' || b == b'?') {
+    if !has_wildcard(pattern) {
         return pattern.eq_ignore_ascii_case(text);
     }
     // Byte slices, not `Vec<char>`: the wildcard path used to collect both sides
@@ -849,6 +983,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// (a stable, arbitrary final tie-break so the result is deterministic). The key
 /// is borrowed (`&str`), so building a `Specificity` per lookup never allocates.
 type Specificity<'a> = (usize, Reverse<usize>, bool, Reverse<&'a str>);
+
+/// Whether `key` is a glob rather than an exact key. The one definition of what
+/// makes a key a pattern, so "is this a glob?" cannot be answered one way where
+/// matching short-circuits and another way where the report decides which keys
+/// can overlap.
+fn has_wildcard(key: &str) -> bool {
+    key.bytes().any(|b| b == b'*' || b == b'?')
+}
 
 /// A key's `(literals, wildcards)` counts — the two O(key length) scans that
 /// [`specificity_of`] orders by. Split out so a compiled ruleset can precompute
@@ -894,23 +1036,32 @@ fn quoted_key_repr(k: &str) -> String {
     Value::from(k).to_string().trim().to_string()
 }
 
-/// Classify a `[rules]` value for the report: its verdict, and the size cap as
+/// Classify a `[rules]` value for the report: the rule it parses to (`None` when
+/// the value isn't a usable one), the verdict that follows, and the size cap as
 /// written (only when the cap is a usable size).
-fn describe_value(item: &Item) -> (Verdict, Option<String>) {
+///
+/// The rule and the verdict come back together because they are one parse — the
+/// report needs both, and deriving them separately is how a report starts
+/// disagreeing with the rule actually enforced. A bad cap doesn't make the
+/// verdict invalid: `parse_rule` decides validity from the rule word alone and
+/// `usable_cap` drops the cap, so both fall out of the single parse below.
+fn describe_value(item: &Item) -> (Option<MimeRule>, Verdict, Option<&str>) {
     let Some((rule, max)) = rule_fields(item) else {
-        return (Verdict::Invalid, None);
+        return (None, Verdict::Invalid, None);
     };
-    // Both halves defer to the definitions `parse_rule` itself uses, so the
-    // report can't disagree with the rule actually applied. The verdict is asked
-    // for with no cap, since a bad cap doesn't make the verdict invalid.
-    let verdict = match parse_rule(rule, None) {
+    // Defers to the definitions the enforced rule itself comes from.
+    let parsed = parse_rule(rule, max);
+    let verdict = match parsed {
         Some(r) if r.allow => Verdict::Allow,
         Some(_) => Verdict::Deny,
         None => Verdict::Invalid,
     };
     // Echo the cap as the user wrote it, but only when it's one that survives.
-    let cap = max.filter(|s| usable_cap(Some(s)).is_some());
-    (verdict, cap.map(str::to_string))
+    (
+        parsed,
+        verdict,
+        max.filter(|s| usable_cap(Some(s)).is_some()),
+    )
 }
 
 /// Render one `[rules]` entry as a clean, copy-pasteable `"key" = value` line
@@ -1095,16 +1246,141 @@ mod tests {
         (dir, rules)
     }
 
+    /// One question put to a ruleset — a type and a size — with the answer it
+    /// must give and the precedence rule that answer pins.
+    type Decision<'a> = (&'a str, usize, bool, &'a str);
+
+    /// A `[rules]` body, the unknown-type policy it loads under, and every
+    /// decision that pair fixes.
+    type AllowCase<'a> = (&'a str, MimePolicy, &'a [Decision<'a>]);
+
+    /// Whether a representation may sync is a pure decision over (rules table,
+    /// unknown-type policy, MIME type, size): no file state, no ordering, no
+    /// engine. So the cases belong in one table, where a new precedence rule is
+    /// a row instead of another copy of the same load-and-assert scaffolding.
+    /// The per-row and per-case notes are the substance — each one is a
+    /// precedence rule the module docs promise a user.
     #[test]
-    fn allows_respects_rules_and_size_caps() {
-        let (_dir, rules) = loaded(
-            "[rules]\n\"image/png\" = { rule = \"allow\", max = \"100B\" }\n\"image/bmp\" = \"deny\"\n",
-            MimePolicy::Deny,
-        );
-        assert!(rules.allows("image/png", 100)); // exactly at the cap
-        assert!(!rules.allows("image/png", 101)); // over the cap
-        assert!(!rules.allows("image/bmp", 1)); // denied outright
-        assert!(!rules.allows("text/plain", 1)); // unknown -> deny policy
+    fn allows_decides_by_rule_size_cap_and_specificity() {
+        let cases: &[AllowCase<'_>] = &[
+            // A cap bounds an allow, and only that entry.
+            (
+                "[rules]\n\"image/png\" = { rule = \"allow\", max = \"100B\" }\n\"image/bmp\" = \"deny\"\n",
+                MimePolicy::Deny,
+                &[
+                    ("image/png", 100, true, "exactly at the cap"),
+                    ("image/png", 101, false, "over the cap"),
+                    ("image/bmp", 1, false, "denied outright"),
+                    ("text/plain", 1, false, "no rule -> the deny policy"),
+                ],
+            ),
+            // A 0-byte cap would turn `allow` into `deny` (nothing is <= 0), so
+            // it is dropped rather than honoured.
+            (
+                "[rules]\n\"image/png\" = { rule = \"allow\", max = \"0B\" }\n",
+                MimePolicy::Deny,
+                &[
+                    ("image/png", 1, true, "a zero cap is ignored, not enforced"),
+                    ("image/png", 10_000, true, "at any size"),
+                ],
+            ),
+            // A cap only narrows an allow; it can't soften a deny.
+            (
+                "[rules]\n\"image/png\" = { rule = \"deny\", max = \"100B\" }\n",
+                MimePolicy::Deny,
+                &[
+                    ("image/png", 1, false, "under the cap, still denied"),
+                    ("image/png", 50, false, "size is irrelevant to a deny"),
+                ],
+            ),
+            // A typo in the cap drops the cap, not the rule — it must not
+            // quietly stop a type from syncing.
+            (
+                "[rules]\n\"image/png\" = { rule = \"allow\", max = \"notasize\" }\n",
+                MimePolicy::Deny,
+                &[("image/png", 999_999, true, "the allow survives a bad cap")],
+            ),
+            // Globs fold case on both sides (MIME types are ASCII).
+            (
+                "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n\"*;charset=utf-16BE\" = \"deny\"\n",
+                MimePolicy::Allow,
+                &[
+                    (
+                        "JAVA_DATATRANSFER_COOKIE_9147594d",
+                        1,
+                        false,
+                        "a trailing * covers the whole family",
+                    ),
+                    (
+                        "text/plain;charset=utf-16be",
+                        1,
+                        false,
+                        "the pattern's case differs from the type's",
+                    ),
+                    ("text/plain", 1, true, "no glob matches -> the allow policy"),
+                ],
+            ),
+            // An exact key carves an exception out of a glob's family: it has
+            // the most literals and no wildcards, so it always wins.
+            (
+                "[rules]\n\"*;charset=utf-16*\" = \"deny\"\n\"text/uri-list;charset=utf-16\" = \"allow\"\n",
+                MimePolicy::Deny,
+                &[
+                    (
+                        "text/uri-list;charset=utf-16",
+                        1,
+                        true,
+                        "the exact key beats the glob",
+                    ),
+                    ("text/plain;charset=utf-16le", 1, false, "only the glob matches"),
+                ],
+            ),
+            // Between two globs, more literal characters wins.
+            (
+                "[rules]\n\"text/plain*\" = \"deny\"\n\"*plain*\" = \"allow\"\n",
+                MimePolicy::Deny,
+                &[
+                    (
+                        "text/plain;charset=utf-8",
+                        1,
+                        false,
+                        "text/plain* (10 literals) beats *plain* (5)",
+                    ),
+                    ("application/plain-text", 1, true, "only *plain* matches"),
+                ],
+            ),
+            // A genuine tie breaks to deny — the safe direction, since this
+            // decision is what lets content leave the host.
+            (
+                "[rules]\n\"a/x*\" = \"allow\"\n\"a/*y\" = \"deny\"\n",
+                MimePolicy::Allow,
+                &[("a/xy", 1, false, "3 literals and 1 wildcard each -> deny wins")],
+            ),
+            // Two exact keys for one type, differing only in case, tie the same
+            // way. This is the case that stops `find_rule` from returning the
+            // first exact match it finds: doing so would answer by table order
+            // rather than by the tie-break.
+            (
+                "[rules]\n\"TEXT/PLAIN\" = \"allow\"\n\"text/plain\" = \"deny\"\n",
+                MimePolicy::Allow,
+                &[(
+                    "text/plain",
+                    1,
+                    false,
+                    "neither case-variant is more specific -> deny wins",
+                )],
+            ),
+        ];
+        for &(body, unknown, expected) in cases {
+            let (_dir, rules) = loaded(body, unknown);
+            for &(mime, size, may_sync, why) in expected {
+                assert_eq!(
+                    rules.allows(mime, size),
+                    may_sync,
+                    "{why}: {mime} ({size} bytes) under\n{body}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1127,35 +1403,6 @@ mod tests {
     fn unknown_allow_policy_permits_unseen_types() {
         let rules = MimeRules::load(None, MimePolicy::Allow);
         assert!(rules.allows("anything/new", 999));
-    }
-
-    #[test]
-    fn zero_size_cap_is_ignored_so_allow_still_allows() {
-        let (_dir, rules) = loaded(
-            "[rules]\n\"image/png\" = { rule = \"allow\", max = \"0B\" }\n",
-            MimePolicy::Deny,
-        );
-        assert!(rules.allows("image/png", 1));
-        assert!(rules.allows("image/png", 10_000));
-    }
-
-    #[test]
-    fn deny_rule_with_a_cap_still_denies_regardless_of_size() {
-        let (_dir, rules) = loaded(
-            "[rules]\n\"image/png\" = { rule = \"deny\", max = \"100B\" }\n",
-            MimePolicy::Deny,
-        );
-        assert!(!rules.allows("image/png", 1));
-        assert!(!rules.allows("image/png", 50));
-    }
-
-    #[test]
-    fn a_bad_max_size_keeps_the_allow_deny_and_drops_the_cap() {
-        let (_dir, rules) = loaded(
-            "[rules]\n\"image/png\" = { rule = \"allow\", max = \"notasize\" }\n",
-            MimePolicy::Deny,
-        );
-        assert!(rules.allows("image/png", 999_999));
     }
 
     #[test]
@@ -1243,6 +1490,46 @@ mod tests {
             path.is_dir(),
             "load overwrote a path it merely failed to read"
         );
+    }
+
+    /// `open` is what the one-shot CLI commands use, and its whole job is to
+    /// report instead of heal: the rewrite `load` would do here also drops the
+    /// `[clipmesh]` table, i.e. this node's place in the mesh's rules version
+    /// ordering, over what may be a single typo.
+    #[test]
+    fn open_reports_a_bad_file_and_leaves_every_byte_of_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        let body = "[clipmesh]\nversion = 42\nthis is = = not toml\n";
+        write(&path, body);
+        let err = MimeRules::open(Some(path.clone()), MimePolicy::Deny)
+            .err()
+            .expect("invalid TOML must be reported, not repaired");
+        assert!(matches!(err, RulesFileState::Malformed(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+
+        // The same file through `load`, the healing constructor, IS rewritten —
+        // the two constructors are the choice this test exists to keep visible.
+        let _rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_example());
+    }
+
+    #[test]
+    fn open_reports_an_absent_or_empty_file_without_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        let missing = MimeRules::open(Some(path.clone()), MimePolicy::Deny)
+            .err()
+            .expect("a missing file must be reported");
+        assert!(matches!(missing, RulesFileState::Missing), "{missing:?}");
+        assert!(!path.exists(), "open must not create the rules file");
+
+        write(&path, "  \n\t\n");
+        let empty = MimeRules::open(Some(path.clone()), MimePolicy::Deny)
+            .err()
+            .expect("a whitespace-only file must be reported");
+        assert!(matches!(empty, RulesFileState::Empty), "{empty:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "  \n\t\n");
     }
 
     #[test]
@@ -1666,65 +1953,6 @@ mod tests {
         assert!(!glob_match("a*a", "a")); // a trailing literal a star can't fill
         assert!(glob_match("a*a", "aba"));
         assert!(glob_match("*x", "x")); // leading star may match empty
-    }
-
-    #[test]
-    fn globs_decide_types_case_insensitively() {
-        let (_dir, rules) = loaded(
-            "[rules]\n\"JAVA_DATATRANSFER*\" = \"deny\"\n\"*;charset=utf-16BE\" = \"deny\"\n",
-            MimePolicy::Allow,
-        );
-        assert!(!rules.allows("JAVA_DATATRANSFER_COOKIE_9147594d", 1));
-        // pattern's case differs from the type's — must still match
-        assert!(!rules.allows("text/plain;charset=utf-16be", 1));
-        assert!(rules.allows("text/plain", 1)); // no glob matches -> unknown=allow
-    }
-
-    #[test]
-    fn an_exact_rule_beats_a_matching_glob() {
-        // glob denies the family; an exact key carves out an allow exception
-        let (_dir, rules) = loaded(
-            "[rules]\n\"*;charset=utf-16*\" = \"deny\"\n\"text/uri-list;charset=utf-16\" = \"allow\"\n",
-            MimePolicy::Deny,
-        );
-        assert!(
-            rules.allows("text/uri-list;charset=utf-16", 1),
-            "exact key must win over the glob"
-        );
-        assert!(
-            !rules.allows("text/plain;charset=utf-16le", 1),
-            "only-the-glob matches -> deny"
-        );
-    }
-
-    #[test]
-    fn the_more_specific_glob_wins() {
-        // "text/plain*" has 10 literals; "*plain*" has 5, so the former wins overlap
-        let (_dir, rules) = loaded(
-            "[rules]\n\"text/plain*\" = \"deny\"\n\"*plain*\" = \"allow\"\n",
-            MimePolicy::Deny,
-        );
-        assert!(
-            !rules.allows("text/plain;charset=utf-8", 1),
-            "text/plain* (10 literals) wins over *plain* (5)"
-        );
-        assert!(
-            rules.allows("application/plain-text", 1),
-            "only *plain* matches"
-        );
-    }
-
-    #[test]
-    fn deny_breaks_a_specificity_tie() {
-        // both globs: 3 literals and 1 wildcard each -> a genuine tie -> deny wins
-        let (_dir, rules) = loaded(
-            "[rules]\n\"a/x*\" = \"allow\"\n\"a/*y\" = \"deny\"\n",
-            MimePolicy::Allow,
-        );
-        assert!(
-            !rules.allows("a/xy", 1),
-            "tie on specificity -> deny is chosen"
-        );
     }
 
     #[test]

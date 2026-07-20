@@ -164,12 +164,14 @@ impl Clipboard for MockClipboard {
         Ok(offer)
     }
 
-    async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()> {
+    async fn write_offer(&self, kind: SelectionKind, offer: Arc<Offer>) -> Result<()> {
         if self.fail_writes.load(Ordering::SeqCst) {
             anyhow::bail!("simulated clipboard write failure");
         }
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.set_and_notify(kind, offer);
+        // The mock owns its state, so it takes a copy here — the real backend
+        // has to copy into `copy_multi`'s boxed slices anyway.
+        self.set_and_notify(kind, (*offer).clone());
         Ok(())
     }
 }
@@ -202,7 +204,7 @@ mod tests {
         let clip = MockClipboard::new();
         let mut watch = clip.watch(&[SelectionKind::Clipboard, SelectionKind::Selection]);
         assert_eq!(clip.write_count(), 0);
-        clip.write_offer(SelectionKind::Clipboard, offer("net"))
+        clip.write_offer(SelectionKind::Clipboard, offer("net").into())
             .await
             .unwrap();
         assert_eq!(clip.write_count(), 1);

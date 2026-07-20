@@ -1,30 +1,35 @@
 # clipmesh configuration. Generate/refresh with `clipmesh --sync-config`:
-# it fills in every option (commented = default) and these comments,
-# keeping the values you've set. clipmesh watches this file and restarts
-# to apply a change.
+# it fills in every option and these comments, keeping the values you've
+# set. A commented-out line means the option is unset and its default
+# applies; the value shown is that default, except where the comment
+# calls it an example. clipmesh watches this file and restarts to apply
+# a change.
 
 # 0.0.0.0 binds every interface; restrict to a specific LAN address (or
 # firewall the port) on hosts reachable from untrusted networks. Traffic is
 # Noise-encrypted, so peers without the psk can neither read nor inject.
 listen = "0.0.0.0"
 
-# Port to listen on (default 48100). Peers below that omit their own port
-# reuse this one. Put the port here, not in `listen`.
+# Port to listen on. Peers below that omit their own port reuse this one.
+# Put the port here, not in `listen`.
 port = 48100
 
 # List every other node directly. clipmesh connects peers point-to-point
 # and never forwards between them, so a node left out here won't receive
 # copies. Add ":port" to override the shared port for one peer.
+# The hosts below are an example: unset, this node dials nobody and only
+# accepts connections others make to it.
 peers = ["host-b", "host-c"]
 
 # Exactly one of psk_file / psk / psk_env must be set: psk_file points to a
 # file holding the shared secret, psk is the secret inline, psk_env names an
-# environment variable holding it.
+# environment variable holding it. The values below are examples — every
+# node in the mesh must end up with the same secret.
 psk_file = "~/.config/clipmesh/psk"
 # psk = "supersecret"
 # psk_env = "CLIPMESH_PSK"
 
-# Everything below is optional; the commented value is the default.
+# Everything below is optional.
 
 # Skip clipboard contents larger than this (whole offer).
 # max_payload_size = "32MiB"
@@ -56,8 +61,8 @@ psk_file = "~/.config/clipmesh/psk"
 # Overridable with RUST_LOG.
 # log_level = "info"
 
-# What to do with a MIME type that has no rule yet: "deny" (default) syncs
-# nothing until you allow it; "allow" syncs everything not explicitly denied.
+# What to do with a MIME type that has no rule yet: "deny" syncs nothing
+# until you allow it; "allow" syncs everything not explicitly denied.
 # unknown_mime = "deny"
 
 # When a copied selection offers only a legacy X11 plain-text atom
@@ -73,7 +78,9 @@ psk_file = "~/.config/clipmesh/psk"
 # take_ownership = false
 
 # Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside
-# this config. clipmesh creates it, appends any new type it sees (per
+# this config, wherever this config lives — so the path below is an example
+# of that, not a fixed default: setting it pins the rules file even if the
+# config moves. clipmesh creates the file, appends any new type it sees (per
 # unknown_mime), keeps it sorted, and reloads on change. Edit it or run
 # `clipmesh --allow/--deny "<glob>"` (and `clipmesh --rules` to list).
 # mime_rules_file = "~/.config/clipmesh/mimetypes"

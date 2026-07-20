@@ -9,16 +9,26 @@ use uuid::Uuid;
 struct ConnHandle {
     id: u64,
     tx: mpsc::Sender<Frame>,
-    role: PeerRole,
 }
 
-/// Live peer table. Connections are grouped by remote node ID; index 0 in
-/// each group is the designated send connection, the rest are warm
-/// standbys (we still receive on them; we just don't send).
+/// Live connection tables, split by what the far end *is*.
+///
+/// A one-shot `--paste` client is not a mesh member, and this is where that
+/// stops being a convention every reader has to remember: it lives in
+/// `clients`, so `broadcast` and `peer_count` cannot see one at all. Keeping
+/// both in `peers` also put a client on the designated-sender ladder, where
+/// landing at index 0 of a real peer's group would have silently swallowed
+/// every send to that peer instead of falling through to a live connection.
 pub struct Mesh {
     own_id: Uuid,
     next_conn_id: AtomicU64,
+    /// Mesh members. Connections are grouped by remote node ID; index 0 in each
+    /// group is the designated send connection, the rest are warm standbys (we
+    /// still receive on them; we just don't send).
     peers: Mutex<HashMap<Uuid, Vec<ConnHandle>>>,
+    /// Paste clients, which ask one question and leave. Exactly one connection
+    /// each, so there is no group and no designated sender to pick.
+    clients: Mutex<HashMap<Uuid, mpsc::Sender<Frame>>>,
     inbound_tx: mpsc::Sender<(Uuid, Message)>,
     /// Notified with the remote node ID when a peer gains its first
     /// connection (i.e. it just joined or rejoined the mesh).
@@ -35,6 +45,7 @@ impl Mesh {
             own_id,
             next_conn_id: AtomicU64::new(0),
             peers: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
             inbound_tx,
             connect_tx,
         })
@@ -44,24 +55,26 @@ impl Mesh {
         self.own_id
     }
 
-    /// Add a connection for a peer; returns its connection ID.
+    /// Add a connection for a peer or a paste client; returns its connection ID.
     ///
-    /// A [`PeerRole::Paster`] is registered so its request can be answered, but
-    /// is deliberately inert as a mesh member: it fires no connect event (so the
-    /// engine spends no resync on a client that will never sync) and is skipped
-    /// by `broadcast`. Only a real peer joining is mesh news.
+    /// This is the one place the role is dispatched on: a [`PeerRole::Paster`]
+    /// goes into `clients`, where it can be answered but is invisible to every
+    /// reader that means "mesh member". It fires no connect event either — the
+    /// engine would spend a full resync on a client that will never sync. Only
+    /// a real peer joining is mesh news.
     pub fn register(&self, remote: Uuid, tx: mpsc::Sender<Frame>, role: PeerRole) -> u64 {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let first_connection = {
-            let mut peers = self.peers.lock().unwrap();
-            let conns = peers.entry(remote).or_default();
-            conns.push(ConnHandle { id, tx, role });
-            conns.len() == 1
-        };
         if role == PeerRole::Paster {
+            self.clients.lock().unwrap().insert(remote, tx);
             debug!("paste client {remote} connected (connection {id})");
             return id;
         }
+        let first_connection = {
+            let mut peers = self.peers.lock().unwrap();
+            let conns = peers.entry(remote).or_default();
+            conns.push(ConnHandle { id, tx });
+            conns.len() == 1
+        };
         if first_connection {
             info!("peer {remote} connected (connection {id})");
             if self.connect_tx.try_send(remote).is_err() {
@@ -75,25 +88,31 @@ impl Mesh {
 
     /// Remove a connection. If it was the designated sender, the next
     /// connection (if any) is promoted automatically by position.
+    ///
+    /// Which table a node ID is in decides how it leaves, so a caller cannot
+    /// retire a connection under the wrong role and strand it — a peer left
+    /// behind in `peers` would be a dead designated sender swallowing every
+    /// later send to it.
     pub fn unregister(&self, remote: Uuid, conn_id: u64) {
+        // A client has exactly one connection, so its node ID identifies it;
+        // `conn_id` is bookkeeping for the peer groups only. Symmetric with
+        // `register`, its arrival and departure are both debug, so a node
+        // serving `wl-paste` in a loop doesn't report a stream of phantom peers
+        // joining and leaving the mesh at the default level.
+        if self.clients.lock().unwrap().remove(&remote).is_some() {
+            debug!("paste client {remote} disconnected");
+            return;
+        }
         let mut peers = self.peers.lock().unwrap();
         let Some(conns) = peers.get_mut(&remote) else {
             return;
         };
-        let was_paster = conns.iter().any(|c| c.role == PeerRole::Paster);
         conns.retain(|c| c.id != conn_id);
         if !conns.is_empty() {
             return;
         }
         peers.remove(&remote);
-        // Symmetric with `register`: a paster's arrival and departure are both
-        // debug, so a node serving `wl-paste` in a loop doesn't report a stream
-        // of phantom peers joining and leaving the mesh at the default level.
-        if was_paster {
-            debug!("paste client {remote} disconnected");
-        } else {
-            info!("peer {remote} disconnected");
-        }
+        info!("peer {remote} disconnected");
     }
 
     /// Forward an inbound message to the sync engine.
@@ -110,13 +129,7 @@ impl Mesh {
             .lock()
             .unwrap()
             .iter()
-            // Skip pasters: a one-shot client is not a sync destination.
-            .filter_map(|(id, conns)| {
-                conns
-                    .first()
-                    .filter(|c| c.role == PeerRole::Peer)
-                    .map(|c| (*id, c.tx.clone()))
-            })
+            .filter_map(|(id, conns)| conns.first().map(|c| (*id, c.tx.clone())))
             .collect();
         debug!("broadcasting clipboard update to {} peer(s)", targets.len());
         if targets.is_empty() {
@@ -131,8 +144,24 @@ impl Mesh {
         }
     }
 
-    /// Send an already-encoded frame to one peer's designated connection (used
-    /// for targeted resyncs). Same try_send semantics as broadcast.
+    /// The designated send connection for a peer, if it is connected.
+    ///
+    /// A method rather than an inline lookup so the table lock is released on
+    /// return, and `send_frame_to` never holds both locks at once.
+    fn peer_sender(&self, peer: Uuid) -> Option<mpsc::Sender<Frame>> {
+        self.peers
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .and_then(|conns| conns.first().map(|c| c.tx.clone()))
+    }
+
+    /// Send an already-encoded frame to one remote's designated connection (used
+    /// for targeted resyncs, and to answer a paste client). Same try_send
+    /// semantics as broadcast.
+    ///
+    /// The only reader that consults both tables: a reply has to reach a paste
+    /// client precisely because it never will via `broadcast`.
     ///
     /// Takes an encoded frame rather than a `&Message` so a caller with the same
     /// message for several peers encodes it once and hands each a refcount,
@@ -140,11 +169,8 @@ impl Mesh {
     /// whole clipboard payload (up to `max_payload_size`) per recipient.
     pub fn send_frame_to(&self, peer: Uuid, frame: &Frame) {
         let target = self
-            .peers
-            .lock()
-            .unwrap()
-            .get(&peer)
-            .and_then(|conns| conns.first().map(|c| c.tx.clone()));
+            .peer_sender(peer)
+            .or_else(|| self.clients.lock().unwrap().get(&peer).cloned());
         match target {
             Some(tx) => {
                 if tx.try_send(frame.clone()).is_err() {
@@ -157,6 +183,8 @@ impl Mesh {
         }
     }
 
+    /// How many mesh members are connected. Paste clients are not members and
+    /// are not counted — by construction, not by filtering.
     pub fn peer_count(&self) -> usize {
         self.peers.lock().unwrap().len()
     }
@@ -237,11 +265,12 @@ mod tests {
         let (mesh, _rx, mut connects) = new_mesh();
         let paster = Uuid::new_v4();
         let (tx, mut paste_rx) = mpsc::channel(8);
-        mesh.register(paster, tx, PeerRole::Paster);
+        let conn = mesh.register(paster, tx, PeerRole::Paster);
         assert!(
             connects.try_recv().is_err(),
             "a paster must not trigger a resync"
         );
+        assert_eq!(mesh.peer_count(), 0, "a paster is not a mesh member");
 
         // It is still reachable for its reply...
         mesh.send_frame_to(paster, &encode_frame(&clip("the answer")));
@@ -253,6 +282,11 @@ mod tests {
             paste_rx.try_recv().is_err(),
             "a paster must not receive broadcasts"
         );
+
+        // ...and leaves without disturbing the peer table it was never in.
+        mesh.unregister(paster, conn);
+        mesh.send_frame_to(paster, &encode_frame(&clip("too late")));
+        assert!(paste_rx.try_recv().is_err());
     }
 
     #[tokio::test]

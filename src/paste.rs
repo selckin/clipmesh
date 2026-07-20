@@ -19,7 +19,9 @@
 use crate::config::{self, Config};
 use crate::mesh::Mesh;
 use crate::peer;
-use crate::protocol::{self, GetResult, GetWant, Message, Offer, PeerRole, SelectionKind};
+use crate::protocol::{
+    self, GetResult, GetWant, Message, Offer, PeerRole, SelectionKind, Unavailable,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
@@ -92,15 +94,9 @@ impl PasteArgs {
     }
 }
 
-/// Whether a MIME type is textual (gets a trailing newline by default).
-fn is_text(mime: &str) -> bool {
-    mime.get(..5)
-        .is_some_and(|p| p.eq_ignore_ascii_case("text/"))
-}
-
 /// Pick the MIME type to print. With an explicit request, require an exact
-/// (case-insensitive) match. Otherwise prefer `text/plain;charset=utf-8`, then
-/// `text/plain`, then the first `text/*`, then the first offered type.
+/// (case-insensitive) match. Otherwise prefer the `text/plain` representations
+/// richest-first, then the first `text/*`, then the first offered type.
 fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str> {
     let find = |want: &str| {
         offer
@@ -116,9 +112,16 @@ fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str>
             )
         });
     }
-    find("text/plain;charset=utf-8")
-        .or_else(|| find("text/plain"))
-        .or_else(|| offer.keys().map(String::as_str).find(|k| is_text(k)))
+    // Same list, same order the synthesizer produces them in — see `TEXT_PLAIN`.
+    protocol::TEXT_PLAIN
+        .iter()
+        .find_map(|want| find(want))
+        .or_else(|| {
+            offer
+                .keys()
+                .map(String::as_str)
+                .find(|k| protocol::is_text(k))
+        })
         .or_else(|| offer.keys().next().map(String::as_str))
         .ok_or_else(|| anyhow!("the clipboard is empty"))
 }
@@ -150,7 +153,7 @@ fn list_types(offer: &Offer) -> String {
 /// The bytes to emit for `mime`: the representation's data, with a trailing
 /// newline appended for `text/*` types unless `no_newline`. Binary-safe.
 fn render(mut data: Vec<u8>, mime: &str, no_newline: bool) -> Vec<u8> {
-    if !no_newline && is_text(mime) {
+    if !no_newline && protocol::is_text(mime) {
         data.push(b'\n');
     }
     data
@@ -264,14 +267,41 @@ fn interpret(result: GetResult, addr: &str, want: SelectionKind) -> Result<Offer
     match result {
         GetResult::Offer(o) => Ok(o),
         GetResult::Types(types) => Ok(types.into_iter().map(|t| (t, Vec::new())).collect()),
-        GetResult::Empty => bail!("the {want:?} clipboard on {addr} is empty"),
         GetResult::NotOffered { available } => bail!(
             "that type is not offered by {addr} (available: {})",
             list_available(available.iter().map(String::as_str))
         ),
-        GetResult::NotSynced => bail!(
+        GetResult::Unavailable(reason) => bail!("{}", explain(reason, addr, want)),
+    }
+}
+
+/// Render a node's reason for having nothing, in the second person.
+///
+/// The point of `Unavailable` being a value rather than a log line on the
+/// serving host: each of these used to arrive as "the clipboard is empty", and
+/// three of them are things the user can act on.
+fn explain(reason: Unavailable, addr: &str, want: SelectionKind) -> String {
+    match reason {
+        Unavailable::NotSynced => format!(
             "{addr} does not serve its {want:?} selection — it is configured \
              receive-only, or (for --primary) without sync_selection"
+        ),
+        Unavailable::Empty => format!("the {want:?} clipboard on {addr} is empty"),
+        Unavailable::Sensitive => format!(
+            "the {want:?} clipboard on {addr} is flagged as a password-manager \
+             secret, and that node has exclude_sensitive on"
+        ),
+        Unavailable::Denied => format!(
+            "every type on {addr}'s {want:?} clipboard is denied by its MIME \
+             rules (see `clipmesh --rules` on that host)"
+        ),
+        Unavailable::TooLarge => format!(
+            "the {want:?} clipboard on {addr} exceeds that node's \
+             max_payload_size"
+        ),
+        Unavailable::Unreadable => format!(
+            "{addr} could not read its own {want:?} clipboard — the application \
+             owning the selection may not be responding"
         ),
     }
 }

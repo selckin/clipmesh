@@ -10,7 +10,9 @@ use uuid::Uuid;
 /// v5: `Clip`/`Rules` carry a single `Version` instead of loose `stamp`/`origin`.
 /// v6: `Hello` carries a `PeerRole`, and `--paste` asks with `Get`/`GetReply`
 /// instead of scraping the connect-time resync push.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7: `GetReply` answers "nothing to give" with a reason (`Unavailable`)
+/// instead of a bare `Empty` that covered six distinct causes.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// All MIME representations of one clipboard state, in the source compositor's
 /// advertise order (preference order — richest first), which `IndexMap`
@@ -28,6 +30,27 @@ pub type Offer = IndexMap<String, Vec<u8>>;
 /// ask for, or an offer whose only key the client then rejects as absent.
 pub fn type_matches(offered: &str, requested: &str) -> bool {
     offered.eq_ignore_ascii_case(requested)
+}
+
+/// The `text/plain` representations, richest first.
+///
+/// One list because both ends depend on this exact order: `sync` synthesizes
+/// them in it when back-filling from a legacy X11 atom, and `paste` prefers them
+/// in it when picking what to print. Two copies would let a paster prefer a
+/// representation the synthesizer had stopped producing.
+pub const TEXT_PLAIN: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
+
+/// Whether `mime` is textual — the `text/*` family.
+pub fn is_text(mime: &str) -> bool {
+    mime.get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("text/"))
+}
+
+/// Whether `mime` is a `text/plain` variant (`text/plain`,
+/// `text/plain;charset=…`), i.e. matches the `text/plain*` glob.
+pub fn is_text_plain(mime: &str) -> bool {
+    mime.get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case("text/plain"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -111,26 +134,52 @@ pub enum GetWant {
     TypesOnly,
 }
 
+/// Why a node has nothing to hand back.
+///
+/// These are the distinct outcomes the serving node's own pipeline already
+/// distinguishes — it logs a different line for each — so returning the reason
+/// as a value rather than a log string is what lets the *asking* side say
+/// something true. Collapsing them loses real information: "the clipboard is
+/// empty" is a actively misleading answer when the clipboard is full and every
+/// type in it is denied by that node's MIME rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Unavailable {
+    /// The node does not serve that selection at all — `sync_selection` is off
+    /// for SELECTION, or `direction` makes this node receive-only.
+    NotSynced,
+    /// The selection genuinely holds nothing.
+    Empty,
+    /// Content exists but is password-manager-flagged, and `exclude_sensitive`
+    /// is on. Deliberately still refused for a pull: what a push won't expose, a
+    /// pull must not either.
+    Sensitive,
+    /// Content exists, but every representation is denied by that node's MIME
+    /// rules.
+    Denied,
+    /// Content exists, but everything exceeds that node's `max_payload_size`.
+    TooLarge,
+    /// The node could not read its own clipboard — an error, or a selection
+    /// owner that never answered.
+    Unreadable,
+}
+
 /// The answer to a [`Message::Get`].
 ///
-/// The variants exist so a failure names its own cause. The pushed-resync design
-/// this replaced could only ever time out, and its message had to list four
-/// unrelated possibilities — empty clipboard, `resync_on_connect` off,
-/// `sync_selection` off, or a slow transfer still in flight — because the client
-/// had never actually asked a question.
+/// Every failure names its own cause. The pushed-resync design this replaced
+/// could only ever time out, and its message had to list four unrelated
+/// possibilities — empty clipboard, `resync_on_connect` off, `sync_selection`
+/// off, or a slow transfer still in flight — because the client had never
+/// actually asked a question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GetResult {
     /// The requested representation(s), in the source's advertise order.
     Offer(Offer),
     /// The available type names, for [`GetWant::TypesOnly`].
     Types(Vec<String>),
-    /// The node has nothing on that selection.
-    Empty,
     /// The node has content, but not the requested type.
     NotOffered { available: Vec<String> },
-    /// The node does not serve that selection at all — `sync_selection` is off
-    /// for SELECTION, or `direction` makes this node receive-only.
-    NotSynced,
+    /// Nothing to hand back, and why.
+    Unavailable(Unavailable),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,7 +211,13 @@ pub enum Message {
     Clip {
         kind: SelectionKind,
         hash: [u8; 32],
-        offer: Offer,
+        /// Shared, not owned: this is the payload's terminal hop out of the
+        /// engine, and the engine holds every planned action's content alive at
+        /// once. Taking an owned `Offer` here would deep-copy the whole
+        /// clipboard — up to `max_payload_size` — per broadcast. serde's `rc`
+        /// feature serializes the pointee, so this is byte-identical on the wire
+        /// to an owned `Offer`.
+        offer: Arc<Offer>,
         /// Orders this update against every other, live or reconnect resync.
         version: Version,
     },
@@ -210,8 +265,18 @@ pub fn content_hash(offer: &Offer) -> [u8; 32] {
 /// safe, and the engine clones a `Hashed` several times per copy event (one per
 /// planned broadcast and write). Copying the payload each time would cost a full
 /// duplicate of the clipboard — up to `max_payload_size` — per clone, so clones
-/// bump a refcount instead and `into_offer` only copies when it isn't the last
-/// holder.
+/// bump a refcount instead.
+///
+/// **Terminal consumers take [`into_arc`], not [`into_offer`].** The `Arc` only
+/// pays off if the *last* step keeps sharing: the engine's batch holds every
+/// planned action's content alive at once, so a terminal `into_offer` finds
+/// refcount > 1 and deep-copies — moving the copy rather than removing it. Both
+/// ends of the wire and the clipboard write therefore carry `Arc<Offer>`, and
+/// `into_offer` is left for the transform steps that genuinely need to take the
+/// map apart and rebuild it.
+///
+/// [`into_arc`]: Hashed::into_arc
+/// [`into_offer`]: Hashed::into_offer
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hashed {
     offer: Arc<Offer>,
@@ -220,11 +285,15 @@ pub struct Hashed {
 
 impl Hashed {
     pub fn new(offer: Offer) -> Hashed {
+        Hashed::from_arc(Arc::new(offer))
+    }
+
+    /// Hash content that is already shared — an offer straight off the wire,
+    /// which arrives inside its own `Arc` and would otherwise be unwrapped and
+    /// rewrapped for nothing.
+    pub fn from_arc(offer: Arc<Offer>) -> Hashed {
         let hash = content_hash(&offer);
-        Hashed {
-            offer: Arc::new(offer),
-            hash,
-        }
+        Hashed { offer, hash }
     }
 
     pub fn hash(&self) -> [u8; 32] {
@@ -235,8 +304,16 @@ impl Hashed {
         &self.offer
     }
 
-    /// Free when this is the last holder; copies the offer only when it is
-    /// still shared.
+    /// The shared offer. Always free — this is what terminal consumers (the
+    /// wire, the clipboard write) take, so the payload is never copied on its
+    /// way out.
+    pub fn into_arc(self) -> Arc<Offer> {
+        self.offer
+    }
+
+    /// Take ownership of the map to rebuild it. Free when this is the last
+    /// holder, a full copy when it is still shared — so this is for the
+    /// transform steps that must take the offer apart, never for handing it on.
     pub fn into_offer(self) -> Offer {
         Arc::try_unwrap(self.offer).unwrap_or_else(|shared| (*shared).clone())
     }
@@ -346,7 +423,7 @@ pub(crate) mod test_support {
         Message::Clip {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&offer),
-            offer,
+            offer: offer.into(),
             version: Version::new(0, Uuid::nil()),
         }
     }
@@ -421,7 +498,7 @@ mod tests {
         let clip = Message::Clip {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&o),
-            offer: o,
+            offer: o.into(),
             version: Version::new(123, Uuid::new_v4()),
         };
         assert_eq!(decode(&encode(&clip)).unwrap(), clip);
@@ -453,7 +530,7 @@ mod tests {
         let clip = Message::Clip {
             kind: SelectionKind::Clipboard,
             hash: content_hash(&o),
-            offer: o,
+            offer: o.into(),
             version: Version::new(1, Uuid::new_v4()),
         };
         let Message::Clip { offer, .. } = decode(&encode(&clip)).unwrap() else {

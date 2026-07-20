@@ -40,27 +40,35 @@ pub async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
     node
 }
 
-/// Poll `cond` until it holds, panicking with `what` if it never does.
-pub async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+/// Poll `cond` until it holds, panicking with `label` if it never does.
+///
+/// Argument order deliberately mirrors `protocol::test_support::wait_for`, the
+/// unit-test crate's copy. The two cannot share code — a `tests/` crate sees
+/// only clipmesh's public API — so the next best thing is that a test moved
+/// between them either compiles or doesn't, rather than silently transposing
+/// its arguments. The timings differ on purpose: an integration test waits on a
+/// real socket and a real mesh, so it polls less often and for longer than a
+/// unit test waiting on an in-process engine.
+pub async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
     timeout(Duration::from_secs(10), async {
         while !cond() {
             sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
 
 /// Poll until `clip`'s `kind` selection holds exactly `want`.
 pub async fn wait_applied(
+    label: &str,
     clip: &Arc<MockClipboard>,
     kind: SelectionKind,
     want: &Offer,
-    what: &str,
 ) {
     let clip = clip.clone();
     let want = want.clone();
-    wait_for(move || clip.get(kind).as_ref() == Some(&want), what).await;
+    wait_for(label, move || clip.get(kind).as_ref() == Some(&want)).await;
 }
 
 /// Reserve a free port by binding and dropping (small reuse race, fine for tests).

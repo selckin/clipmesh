@@ -18,23 +18,52 @@ const PSK_SAMPLES: [(&str, &str); 3] = [
     ("psk_env", "\"CLIPMESH_PSK\""),
 ];
 
+/// What a commented-out line in the generated file is showing.
+///
+/// The rendered text is the same either way; the distinction is a *promise*.
+/// `Default` claims "uncommenting this line changes nothing", which
+/// `commented_defaults_are_the_parsers_defaults` then holds the template to —
+/// so the TOML text here and `config.rs`'s `default_*` functions can no longer
+/// drift apart unnoticed. `Sample` makes no such claim, and is the honest
+/// answer for an option whose default isn't a literal this file could print.
+#[derive(Clone, Copy)]
+enum Shown {
+    /// Exactly the value the parser applies when the key is absent.
+    Default(&'static str),
+    /// An illustrative value only: the option either has no default worth
+    /// printing (`peers` is empty) or resolves one from the environment
+    /// (`mime_rules_file` follows wherever the config lives). Uncommenting such
+    /// a line *does* change behaviour, so its comment must say so.
+    Sample(&'static str),
+}
+
+impl Shown {
+    /// The TOML text rendered beside the key.
+    fn text(self) -> &'static str {
+        match self {
+            Shown::Default(text) | Shown::Sample(text) => text,
+        }
+    }
+}
+
 /// One block of the canonical config file, in render order.
 enum Block {
     /// Free prose not tied to a key (e.g. the file header).
     Prose(&'static str),
     /// A required scalar (no usable default): always active. `sample` is the
-    /// illustrative value used to generate `examples/config.toml`.
+    /// illustrative value used to generate `examples/config.toml`. Deliberately
+    /// not a `Shown`: a required key cannot have a default to promise.
     Required {
         key: &'static str,
         comment: &'static str,
         sample: &'static str,
     },
     /// An optional scalar: active with the user's value when present, else
-    /// `# key = default`.
+    /// `# key = <shown>`.
     Optional {
         key: &'static str,
         comment: &'static str,
-        default: &'static str,
+        shown: Shown,
     },
     /// The psk source group: exactly one of psk_file/psk/psk_env is active.
     PskGroup { comment: &'static str },
@@ -106,10 +135,10 @@ fn push_block(block: &Block, values: &Values, out: &mut String) {
         Block::Optional {
             key,
             comment,
-            default,
+            shown,
         } => {
             push_comment(comment, out);
-            push_option(key, values, default, out);
+            push_option(key, values, shown.text(), out);
         }
         Block::PskGroup { comment } => {
             push_comment(comment, out);
@@ -236,37 +265,75 @@ pub fn sync_config(path: &Path) -> Result<SyncOutcome> {
     Ok(SyncOutcome::Rewrote { added })
 }
 
-/// Every top-level scalar key the template can render. The set `sync_config`
-/// checks a user's file against, so a key with no `Block` is reported rather
-/// than quietly dropped. (`link_selections` is a table, handled separately.)
-fn template_keys() -> Vec<&'static str> {
+/// One scalar key the template renders, and what the template knows about it.
+struct TemplateKey {
+    key: &'static str,
+    /// The value shown beside the key while the user hasn't set it.
+    shown: Shown,
+    /// True only for `Block::Optional` — a plain setting a config may leave
+    /// out. `listen` and the psk sources are not optional (a bind address and
+    /// exactly one psk source are always required), so `--sync-config` doesn't
+    /// count them among the options it added a commented default for.
+    optional: bool,
+}
+
+/// Every scalar key `TEMPLATE` can render. **The one place `TEMPLATE` is
+/// scanned by shape**: the match below has no `_` arm, so a new `Block` variant
+/// stops the build here instead of quietly falling out of the sets derived from
+/// this function. Those gaps are invisible — a missing key makes `--sync-config`
+/// refuse a perfectly valid config, or drop a line from it. (`link_selections`
+/// is a table with its own block, not a scalar key.)
+fn key_defaults() -> Vec<TemplateKey> {
     TEMPLATE
         .iter()
         .flat_map(|b| match b {
-            Block::Required { key, .. } | Block::Optional { key, .. } => vec![*key],
-            Block::PskGroup { .. } => PSK_SAMPLES.iter().map(|(k, _)| *k).collect(),
             Block::Prose(_) | Block::LinkSelections { .. } => Vec::new(),
+            Block::Required { key, sample, .. } => vec![TemplateKey {
+                key,
+                shown: Shown::Sample(sample),
+                optional: false,
+            }],
+            Block::Optional { key, shown, .. } => vec![TemplateKey {
+                key,
+                shown: *shown,
+                optional: true,
+            }],
+            Block::PskGroup { .. } => PSK_SAMPLES
+                .iter()
+                .map(|(key, sample)| TemplateKey {
+                    key,
+                    shown: Shown::Sample(sample),
+                    optional: false,
+                })
+                .collect(),
         })
         .collect()
 }
 
+/// Every top-level scalar key the template can render. The set `sync_config`
+/// checks a user's file against, so a key with no `Block` is reported rather
+/// than quietly dropped.
+fn template_keys() -> Vec<&'static str> {
+    key_defaults().into_iter().map(|k| k.key).collect()
+}
+
 /// The optional scalar keys in the template, for the "added" summary.
 fn optional_keys() -> Vec<&'static str> {
-    TEMPLATE
-        .iter()
-        .filter_map(|b| match b {
-            Block::Optional { key, .. } => Some(*key),
-            _ => None,
-        })
+    key_defaults()
+        .into_iter()
+        .filter(|k| k.optional)
+        .map(|k| k.key)
         .collect()
 }
 
 const TEMPLATE: &[Block] = &[
     Block::Prose(
         "clipmesh configuration. Generate/refresh with `clipmesh --sync-config`:\n\
-         it fills in every option (commented = default) and these comments,\n\
-         keeping the values you've set. clipmesh watches this file and restarts\n\
-         to apply a change.",
+         it fills in every option and these comments, keeping the values you've\n\
+         set. A commented-out line means the option is unset and its default\n\
+         applies; the value shown is that default, except where the comment\n\
+         calls it an example. clipmesh watches this file and restarts to apply\n\
+         a change.",
     ),
     Block::Required {
         key: "listen",
@@ -277,76 +344,79 @@ const TEMPLATE: &[Block] = &[
     },
     Block::Optional {
         key: "port",
-        comment: "Port to listen on (default 48100). Peers below that omit their own port\n\
-                  reuse this one. Put the port here, not in `listen`.",
-        default: "48100",
+        comment: "Port to listen on. Peers below that omit their own port reuse this one.\n\
+                  Put the port here, not in `listen`.",
+        shown: Shown::Default("48100"),
     },
     Block::Optional {
         key: "peers",
         comment: "List every other node directly. clipmesh connects peers point-to-point\n\
                   and never forwards between them, so a node left out here won't receive\n\
-                  copies. Add \":port\" to override the shared port for one peer.",
-        default: "[\"host-b\", \"host-c\"]",
+                  copies. Add \":port\" to override the shared port for one peer.\n\
+                  The hosts below are an example: unset, this node dials nobody and only\n\
+                  accepts connections others make to it.",
+        shown: Shown::Sample("[\"host-b\", \"host-c\"]"),
     },
     Block::PskGroup {
         comment: "Exactly one of psk_file / psk / psk_env must be set: psk_file points to a\n\
                   file holding the shared secret, psk is the secret inline, psk_env names an\n\
-                  environment variable holding it.",
+                  environment variable holding it. The values below are examples — every\n\
+                  node in the mesh must end up with the same secret.",
     },
-    Block::Prose("Everything below is optional; the commented value is the default."),
+    Block::Prose("Everything below is optional."),
     Block::Optional {
         key: "max_payload_size",
         comment: "Skip clipboard contents larger than this (whole offer).",
-        default: "\"32MiB\"",
+        shown: Shown::Default("\"32MiB\""),
     },
     Block::Optional {
         key: "debounce_ms",
         comment: "Quiet period (ms) before broadcasting, to coalesce rapid copies.",
-        default: "100",
+        shown: Shown::Default("100"),
     },
     Block::Optional {
         key: "sync_selection",
         comment: "Also sync the middle-click selection across the mesh.",
-        default: "false",
+        shown: Shown::Default("false"),
     },
     Block::Optional {
         key: "direction",
         comment: "\"both\" | \"send_only\" | \"receive_only\".",
-        default: "\"both\"",
+        shown: Shown::Default("\"both\""),
     },
     Block::Optional {
         key: "exclude_sensitive",
         comment: "Skip password-manager-flagged contents.",
-        default: "true",
+        shown: Shown::Default("true"),
     },
     Block::Optional {
         key: "resync_on_connect",
         comment: "Push current clipboard to peers when they (re)connect.",
-        default: "true",
+        shown: Shown::Default("true"),
     },
     Block::Optional {
         key: "share_mime_rules",
         comment: "Share the MIME-rules file across the mesh (whole-file last-writer-wins:\n\
                   the most recently edited file wins outright and replaces the others, not\n\
                   a per-type merge). Turn off to keep each host's rules independent.",
-        default: "true",
+        shown: Shown::Default("true"),
     },
     Block::Optional {
         key: "verbose",
         comment: "Log a one-line summary (at info level, so needs log_level >= info) per\n\
                   detected copy and received update.",
-        default: "false",
+        shown: Shown::Default("false"),
     },
     Block::Optional {
         key: "log_level",
         comment: "Overridable with RUST_LOG.",
-        default: "\"info\"",
+        shown: Shown::Default("\"info\""),
     },
     Block::Optional {
         key: "unknown_mime",
-        comment: "What to do with a MIME type that has no rule yet: \"deny\" (default) syncs\n\
-                  nothing until you allow it; \"allow\" syncs everything not explicitly denied.",
-        default: "\"deny\"",
+        comment: "What to do with a MIME type that has no rule yet: \"deny\" syncs nothing\n\
+                  until you allow it; \"allow\" syncs everything not explicitly denied.",
+        shown: Shown::Default("\"deny\""),
     },
     Block::Optional {
         key: "synthesize_text_plain",
@@ -354,7 +424,7 @@ const TEMPLATE: &[Block] = &[
                   (UTF8_STRING/STRING/TEXT) and no text/plain* rep, synthesize\n\
                   text/plain;charset=utf-8 and text/plain from it so Wayland-native apps\n\
                   can paste it. The synthesized types go through the MIME rules below.",
-        default: "false",
+        shown: Shown::Default("false"),
     },
     Block::Optional {
         key: "take_ownership",
@@ -362,15 +432,17 @@ const TEMPLATE: &[Block] = &[
                   clipboard then survives the source app exiting, and (with\n\
                   synthesize_text_plain) X11-sourced content pastes on THIS host too. Never\n\
                   re-owns password-manager-flagged content while exclude_sensitive is on.",
-        default: "false",
+        shown: Shown::Default("false"),
     },
     Block::Optional {
         key: "mime_rules_file",
         comment: "Per-type allow/deny rules file (TOML). Defaults to \"mimetypes\" beside\n\
-                  this config. clipmesh creates it, appends any new type it sees (per\n\
+                  this config, wherever this config lives — so the path below is an example\n\
+                  of that, not a fixed default: setting it pins the rules file even if the\n\
+                  config moves. clipmesh creates the file, appends any new type it sees (per\n\
                   unknown_mime), keeps it sorted, and reloads on change. Edit it or run\n\
                   `clipmesh --allow/--deny \"<glob>\"` (and `clipmesh --rules` to list).",
-        default: "\"~/.config/clipmesh/mimetypes\"",
+        shown: Shown::Sample("\"~/.config/clipmesh/mimetypes\""),
     },
     Block::LinkSelections {
         comment: "Locally mirror between the Ctrl+C clipboard and the mouse-highlight /\n\
@@ -382,21 +454,12 @@ const TEMPLATE: &[Block] = &[
     },
 ];
 
-/// The value this file already shows for `key`: a `Required` block's sample, an
-/// `Optional` block's default, or a psk source's sample.
+/// The value this file already shows for `key`, whatever kind of block it is in.
 fn template_value(key: &str) -> Option<&'static str> {
-    let from_blocks = TEMPLATE.iter().find_map(|block| match block {
-        Block::Required { key: k, sample, .. } if *k == key => Some(*sample),
-        Block::Optional {
-            key: k, default, ..
-        } if *k == key => Some(*default),
-        _ => None,
-    });
-    from_blocks.or_else(|| {
-        PSK_SAMPLES
-            .iter()
-            .find_map(|(k, sample)| (*k == key).then_some(*sample))
-    })
+    key_defaults()
+        .into_iter()
+        .find(|k| k.key == key)
+        .map(|k| k.shown.text())
 }
 
 /// The illustrative values used to generate `examples/config.toml`: the example
@@ -453,7 +516,7 @@ mod tests {
             Block::Optional {
                 key: "debounce_ms",
                 comment: "quiet period",
-                default: "100",
+                shown: Shown::Default("100"),
             },
         ];
         // `listen` set by the user, `debounce_ms` not.
@@ -610,6 +673,71 @@ mod tests {
                  delete it from a config that sets it"
             );
         }
+    }
+
+    /// The generated file tells the reader that a commented line is the option's
+    /// default. Prove it: render with nothing set, uncomment every line that
+    /// isn't declared a `Shown::Sample`, and the result must parse to exactly
+    /// what the parser produces from a config that sets none of them.
+    ///
+    /// Without this the template's TOML text and `config.rs`'s `default_*()`
+    /// functions are two unlinked copies of the same ~15 values. The existing
+    /// checks only compare key *presence*, so changing a default in `config.rs`
+    /// left every generated config documenting the old one, golden test green.
+    /// (Two had already drifted this way: `peers` and `mime_rules_file`, now
+    /// declared samples because neither has a literal default to print.)
+    #[test]
+    fn commented_defaults_are_the_parsers_defaults() {
+        use crate::config::Config;
+
+        // Uncommenting `# key = value` lines can't supply a psk (one of three
+        // mutually exclusive sources), so set one; both sides use the same
+        // secret, since the config holds its derived key rather than the text.
+        let listen = template_value("listen").expect("listen is in the template");
+        let rendered = render(TEMPLATE, &vals(&[("psk", "\"s\"")]));
+
+        // Deliberately opt *out* by name rather than in: anything that renders
+        // commented is treated as a promised default unless declared a sample,
+        // so a new option is covered the moment it is added.
+        let samples: Vec<&str> = key_defaults()
+            .into_iter()
+            .filter(|k| matches!(k.shown, Shown::Sample(_)))
+            .map(|k| k.key)
+            .collect();
+        let mut activated = Vec::new();
+        let mut toml = String::new();
+        for line in rendered.lines() {
+            // A commented setting is `# key = value` or the `# [table]` header;
+            // prose comments are neither. `[link_selections]` renders last, so
+            // activating its header can't capture a key meant for the top level.
+            let setting = line.strip_prefix("# ").filter(|bare| {
+                bare.starts_with('[')
+                    || bare
+                        .split_once(" = ")
+                        .is_some_and(|(key, _)| !key.contains(' ') && !samples.contains(&key))
+            });
+            match setting {
+                Some(bare) => {
+                    activated.push(bare.to_string());
+                    toml.push_str(bare);
+                }
+                None => toml.push_str(line),
+            }
+            toml.push('\n');
+        }
+        // Guard against the line-shape sniffing above silently matching nothing.
+        assert!(
+            activated.len() > 10,
+            "expected the template's defaults to be activated, got {activated:?}"
+        );
+
+        let from_template = Config::from_toml(&toml)
+            .unwrap_or_else(|e| panic!("the activated template must parse: {e:#}\n{toml}"));
+        let from_minimal = Config::from_toml(&format!("listen = {listen}\npsk = \"s\"\n")).unwrap();
+        assert_eq!(
+            from_template, from_minimal,
+            "a value the template shows as a default is not the parser's default"
+        );
     }
 
     #[test]

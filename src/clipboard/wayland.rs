@@ -5,6 +5,7 @@ use crate::protocol::{describe_offer, human_bytes, Offer, SelectionKind};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::io::Read;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use wl_clipboard_rs::copy;
@@ -208,7 +209,7 @@ fn assemble_offer(
     (offer, total)
 }
 
-fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
+fn write_offer_blocking(kind: SelectionKind, offer: Arc<Offer>) -> Result<()> {
     if offer.is_empty() {
         debug!("nothing to write to the {kind:?} clipboard (empty offer)");
         return Ok(());
@@ -217,11 +218,14 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
         "writing the {kind:?} clipboard ({})",
         describe_offer(&offer)
     );
+    // `copy_multi` needs owned boxed bytes per representation, so the payload is
+    // copied here regardless of how it arrived — taking the `Arc` by value just
+    // means the *caller* never had to copy it to hand it over.
     let sources: Vec<copy::MimeSource> = offer
-        .into_iter()
+        .iter()
         .map(|(mime, data)| copy::MimeSource {
-            source: copy::Source::Bytes(data.into_boxed_slice()),
-            mime_type: copy::MimeType::Specific(mime),
+            source: copy::Source::Bytes(data.clone().into_boxed_slice()),
+            mime_type: copy::MimeType::Specific(mime.clone()),
         })
         .collect();
     let mut opts = copy::Options::new();
@@ -257,7 +261,7 @@ impl Clipboard for WaylandClipboard {
         tokio::task::spawn_blocking(move || read_offer_blocking(kind, max, only.as_deref())).await?
     }
 
-    async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()> {
+    async fn write_offer(&self, kind: SelectionKind, offer: Arc<Offer>) -> Result<()> {
         tokio::task::spawn_blocking(move || write_offer_blocking(kind, offer)).await?
     }
 }

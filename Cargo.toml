@@ -13,7 +13,10 @@ blake3 = "1"
 indexmap = { version = "2", features = ["serde"] }
 inotify = { version = "0.11.2", default-features = false }
 rand = "0.8"
-serde = { version = "1", features = ["derive"] }
+# "rc": lets `Arc<Offer>` cross the wire by serializing the pointee, so a
+# clipboard payload can be shared in memory without a copy on the way to the
+# encoder. Wire-identical to serializing the `Offer` directly.
+serde = { version = "1", features = ["derive", "rc"] }
 shellexpand = "3"
 snow = "0.9"
 tokio = { version = "1", features = ["full"] }

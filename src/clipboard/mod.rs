@@ -7,6 +7,7 @@ pub mod wayland;
 use crate::protocol::{Offer, SelectionKind};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// What a [`Clipboard`] watcher reports.
@@ -75,5 +76,12 @@ pub trait Clipboard: Send + Sync + 'static {
     /// payload cap or a representation cannot be read in full.
     async fn read_offer(&self, kind: SelectionKind, only: Option<&str>) -> Result<Offer>;
     /// Set the given selection to the given representations.
-    async fn write_offer(&self, kind: SelectionKind, offer: Offer) -> Result<()>;
+    ///
+    /// Takes a shared offer for the same reason [`Message::Clip`] does: this is
+    /// a terminal hop for the payload, and the engine's batch holds every
+    /// planned action's content alive, so an owned parameter would deep-copy the
+    /// whole clipboard per write.
+    ///
+    /// [`Message::Clip`]: crate::protocol::Message::Clip
+    async fn write_offer(&self, kind: SelectionKind, offer: Arc<Offer>) -> Result<()>;
 }

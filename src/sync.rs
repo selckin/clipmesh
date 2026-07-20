@@ -1,11 +1,11 @@
-use crate::clipboard::io::ClipboardIo;
+use crate::clipboard::io::{ClipboardIo, Origin};
 use crate::clipboard::{Clipboard, ClipboardEvent};
 use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
-    describe_offer, encode_frame, human_bytes, GetResult, GetWant, Hashed, Message, Offer,
-    SelectionKind, Version,
+    describe_offer, encode_frame, human_bytes, is_text_plain, GetResult, GetWant, Hashed, Message,
+    Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -35,13 +35,6 @@ fn offer_size(offer: &Offer) -> usize {
     offer.iter().map(|(m, d)| m.len() + d.len()).sum()
 }
 
-/// Whether `mime` is a `text/plain` variant (`text/plain`, `text/plain;charset=…`).
-/// Matches the `text/plain*` glob, case-insensitively.
-fn is_text_plain(mime: &str) -> bool {
-    mime.get(..10)
-        .is_some_and(|p| p.eq_ignore_ascii_case("text/plain"))
-}
-
 /// Optional compatibility shim (`synthesize_text_plain` config): when an offer
 /// carries a legacy plain-text atom but no `text/plain*` representation,
 /// synthesize `text/plain;charset=utf-8` and `text/plain` immediately before the
@@ -62,11 +55,13 @@ fn synthesize_text_plain(content: Hashed) -> Hashed {
     let Some((src, value)) = crate::clipboard::atoms::text_value(offer) else {
         return content; // no legacy atom to derive from
     };
-    let mut out = Offer::with_capacity(offer.len() + 2);
+    let mut out = Offer::with_capacity(offer.len() + TEXT_PLAIN.len());
     for (k, v) in content.into_offer() {
         if k == src {
-            out.insert("text/plain;charset=utf-8".to_string(), value.clone());
-            out.insert("text/plain".to_string(), value.clone());
+            // Richest first, the order `paste::select_type` prefers them in.
+            for mime in TEXT_PLAIN {
+                out.insert(mime.to_string(), value.clone());
+            }
         }
         out.insert(k, v);
     }
@@ -205,60 +200,95 @@ struct Stages {
     cap: bool,
 }
 
-impl Stages {
-    /// Locally captured content heading for the mesh: everything applies.
-    const BROADCAST: Stages = Stages {
-        synthesize: true,
-        rules: RulesStage::Record,
-        cap: true,
-    };
-    /// A peer's offer being applied locally. The receiver enforces its own
-    /// content policy (configs differ between peers, and a node must not write
-    /// contents it would never have sent), but records nothing.
-    const INBOUND: Stages = Stages {
-        synthesize: false,
-        rules: RulesStage::Apply,
-        cap: true,
-    };
-    /// The `take_ownership` re-offer. Synthesis is on so the back-filled
-    /// `text/plain` pastes on this host too, and the cap keeps the rewrite
-    /// round-tripping the read-back budget — an over-budget rewrite would be
-    /// re-read smaller, miss its marker, and churn.
-    ///
-    /// Rules are deliberately skipped: a deny rule governs what leaves this
-    /// host, not what the user may paste locally. Filtering here would strip
-    /// types out of the user's own clipboard.
-    const OWN: Stages = Stages {
-        synthesize: true,
-        rules: RulesStage::Skip,
-        cap: true,
-    };
-    /// The local bridge mirror. Deliberately unfiltered, so locally denied or
-    /// oversized representations still reach the partner selection — the bridge
-    /// moves content between two selections on one host and never touches the
-    /// wire.
-    const MIRROR: Stages = Stages {
-        synthesize: false,
-        rules: RulesStage::Skip,
-        cap: false,
-    };
-    /// Answering a remote `--paste` query. The same filters as `BROADCAST` — a
-    /// pull must not expose what a push wouldn't, password-manager contents
-    /// included — but `Apply`, not `Record`.
-    ///
-    /// That difference is the point: `Record` appends unseen types, persists the
-    /// rules file and broadcasts it mesh-wide. Answering a question is not
-    /// capturing, so a stranger's `wl-paste` must not make this node write its
-    /// rules file and push it to every peer.
-    const SERVE: Stages = Stages {
-        synthesize: true,
-        rules: RulesStage::Apply,
-        cap: true,
-    };
+/// Why content is moving — and therefore which transforms apply to it.
+///
+/// **One taxonomy for every pipeline.** `Provenance` used to name only the two
+/// *write* pipelines and map to `Stages` through a partial function, leaving the
+/// other selections spelled out as constants at their call sites. Each new
+/// consumer then went around the mapping rather than through it — `Serve` was
+/// added that way — so the two taxonomies drifted apart by construction.
+/// Naming the pipeline here and asking it for its stages means a sixth one is a
+/// variant plus a match arm the compiler demands, not a new constant somebody
+/// has to notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pipeline {
+    /// Locally captured content heading for the mesh.
+    Broadcast,
+    /// A peer's offer being applied locally.
+    Inbound,
+    /// The `take_ownership` re-offer.
+    Own,
+    /// The local bridge mirror.
+    Mirror,
+    /// Answering a remote `--paste` query.
+    Serve,
+}
+
+impl Pipeline {
+    /// The transforms this pipeline applies, in order. Total by construction —
+    /// the one place a pipeline turns into transforms.
+    fn stages(self) -> Stages {
+        match self {
+            // Everything applies.
+            Pipeline::Broadcast => Stages {
+                synthesize: true,
+                rules: RulesStage::Record,
+                cap: true,
+            },
+            // The receiver enforces its own content policy (configs differ
+            // between peers, and a node must not write contents it would never
+            // have sent), but records nothing — a peer must not be able to write
+            // to our rules file.
+            Pipeline::Inbound => Stages {
+                synthesize: false,
+                rules: RulesStage::Apply,
+                cap: true,
+            },
+            // Synthesis is on so the back-filled `text/plain` pastes on this
+            // host too, and the cap keeps the rewrite round-tripping the
+            // read-back budget — an over-budget rewrite would be re-read
+            // smaller, miss its marker, and churn.
+            //
+            // Rules are deliberately skipped: a deny rule governs what leaves
+            // this host, not what the user may paste locally. Filtering here
+            // would strip types out of the user's own clipboard.
+            Pipeline::Own => Stages {
+                synthesize: true,
+                rules: RulesStage::Skip,
+                cap: true,
+            },
+            // Deliberately unfiltered, so locally denied or oversized
+            // representations still reach the partner selection — the bridge
+            // moves content between two selections on one host and never
+            // touches the wire.
+            Pipeline::Mirror => Stages {
+                synthesize: false,
+                rules: RulesStage::Skip,
+                cap: false,
+            },
+            // The same filters as `Broadcast` — a pull must not expose what a
+            // push wouldn't, password-manager contents included — but `Apply`,
+            // not `Record`. That difference is the point: `Record` appends
+            // unseen types, persists the rules file and broadcasts it mesh-wide,
+            // and answering a question is not capturing. A stranger's
+            // `wl-paste` must not make this node rewrite its rules and push them
+            // to every peer.
+            Pipeline::Serve => Stages {
+                synthesize: true,
+                rules: RulesStage::Apply,
+                cap: true,
+            },
+        }
+    }
 }
 
 /// Why the engine writes a selection during a batch — selects the reconcile
 /// rule in `execute_write`.
+///
+/// Deliberately narrower than [`Pipeline`]: only two pipelines can be the reason
+/// for a *write*, and `plan_batch` should not be able to emit "broadcast" as a
+/// write provenance. It converts into `Pipeline` rather than carrying its own
+/// stage mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provenance {
     /// `take_ownership` re-offer: write unconditionally (ownership transfer),
@@ -270,11 +300,11 @@ enum Provenance {
 }
 
 impl Provenance {
-    /// The transforms this kind of write applies.
-    fn stages(self) -> Stages {
+    /// The pipeline this kind of write runs through.
+    fn pipeline(self) -> Pipeline {
         match self {
-            Provenance::Own => Stages::OWN,
-            Provenance::Mirror => Stages::MIRROR,
+            Provenance::Own => Pipeline::Own,
+            Provenance::Mirror => Pipeline::Mirror,
         }
     }
 }
@@ -670,7 +700,7 @@ impl<C: Clipboard> SyncEngine<C> {
         if raw.is_empty() || !(p.send || p.recv) {
             return;
         }
-        let Some(content) = self.apply_stages(raw, Stages::BROADCAST).await else {
+        let Ok(content) = self.apply_stages(raw, Pipeline::Broadcast).await else {
             return;
         };
         debug!(
@@ -697,21 +727,32 @@ impl<C: Clipboard> SyncEngine<C> {
         self.cfg.exclude_sensitive && is_sensitive(offer)
     }
 
-    /// Run the declared [`Stages`] over an already-read offer. Returns `None`
-    /// when nothing syncable survives.
+    /// Run the declared [`Stages`] over an already-read offer.
+    ///
+    /// Returns **why** nothing survived rather than a bare `None`. Most callers
+    /// only branch on success, but a `--paste` client is told this over the wire,
+    /// and "the clipboard is empty" is a bad answer to "every type you offered is
+    /// denied by my rules". The reason existed already — each arm below logs a
+    /// distinct line — it was just rendered into a debug string on the serving
+    /// host instead of returned as a value.
     ///
     /// Sensitivity is checked first and is not a stage: it applies to every
     /// pipeline unconditionally, and checking it before synthesis skips needless
     /// work on secret content (synthesis never changes the verdict — it adds no
     /// password-manager hint).
-    async fn apply_stages(&self, content: Hashed, stages: Stages) -> Option<Hashed> {
+    async fn apply_stages(
+        &self,
+        content: Hashed,
+        pipeline: Pipeline,
+    ) -> Result<Hashed, Unavailable> {
+        let stages = pipeline.stages();
         if content.is_empty() {
             debug!("nothing to sync: the clipboard is empty");
-            return None;
+            return Err(Unavailable::Empty);
         }
         if self.excludes_sensitive(content.offer()) {
             debug!("not syncing: clipboard is flagged sensitive (password-manager contents)");
-            return None;
+            return Err(Unavailable::Sensitive);
         }
         let content = if stages.synthesize && self.cfg.synthesize_text_plain {
             synthesize_text_plain(content)
@@ -726,21 +767,21 @@ impl<C: Clipboard> SyncEngine<C> {
                     .await;
                 if content.is_empty() {
                     debug!("nothing to sync: every MIME type was blocked by the rules");
-                    return None;
+                    return Err(Unavailable::Denied);
                 }
                 content
             }
         };
         if !stages.cap {
             // Nothing below can empty the offer, so it is still non-empty here.
-            return Some(content);
+            return Ok(content);
         }
         let content = cap_to_payload_size(content, self.cfg.max_payload_size);
         if content.is_empty() {
             debug!("nothing to sync: everything was over the max_payload_size budget");
-            return None;
+            return Err(Unavailable::TooLarge);
         }
-        Some(content)
+        Ok(content)
     }
 
     async fn apply_mime_rules(&self, content: Hashed, record_unseen: bool) -> Hashed {
@@ -749,7 +790,10 @@ impl<C: Clipboard> SyncEngine<C> {
             .with_rules(move |rules| {
                 let mut appended = false;
                 if record_unseen {
-                    if rules.compile().has_unseen(content.offer().keys()) {
+                    // A keys-only probe, not a full compile: the common capture
+                    // has nothing new, and building the compiled view here would
+                    // be thrown away and rebuilt below anyway.
+                    if rules.has_unseen(content.offer().keys()) {
                         rules.reload_if_changed();
                         appended = rules.ensure(content.offer().keys());
                     }
@@ -800,7 +844,7 @@ impl<C: Clipboard> SyncEngine<C> {
     async fn capture_offer(&self, kind: SelectionKind) -> Option<Hashed> {
         let content = self.io.read(kind).await?;
         // Local content: record brand-new types so the user can curate them.
-        self.apply_stages(content, Stages::BROADCAST).await
+        self.apply_stages(content, Pipeline::Broadcast).await.ok()
     }
 
     /// Broadcast `raw` (the freshly-read content of `kind`) to the mesh after
@@ -817,7 +861,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // The bracketed list means "what was copied" in every outcome below
         // (consistent with the received-update summary).
         let copied = self.cfg.verbose.then(|| describe_offer(raw.offer()));
-        let Some(content) = self.apply_stages(raw, Stages::BROADCAST).await else {
+        let Ok(content) = self.apply_stages(raw, Pipeline::Broadcast).await else {
             if let Some(copied) = &copied {
                 info!("copied {kind:?} [{copied}]: not sent (nothing passed the content filters)");
             }
@@ -849,7 +893,7 @@ impl<C: Clipboard> SyncEngine<C> {
         self.mesh.broadcast(&Message::Clip {
             kind,
             hash,
-            offer: content.into_offer(),
+            offer: content.into_arc(),
             version,
         });
     }
@@ -870,17 +914,23 @@ impl<C: Clipboard> SyncEngine<C> {
         for kind in batch {
             if !self.policies.get(kind).has_local_sink() {
                 if self.cfg.verbose {
-                    info!("copied {kind:?}: not sent (this node does not send)");
+                    // Distinct from `broadcast_selection`'s "does not send":
+                    // this selection has no local sink AT ALL — not the mesh,
+                    // not the bridge, not the ownership rewrite — so the batch
+                    // skips even reading it. Sharing one message for both made
+                    // the reason it gives wrong half the time.
+                    info!("copied {kind:?}: ignored (nothing on this node acts on it)");
                 }
                 continue;
             }
-            let Some(raw) = self.io.read(kind).await else {
+            // The one read that consumes the echo marker. Every other reader in
+            // the engine uses `io.read`, which leaves it alone — see
+            // `read_classified` for why that distinction is a method rather than
+            // a rule.
+            let Some((raw, origin)) = self.io.read_classified(kind).await else {
                 continue;
             };
-            // One-shot consume the echo memo and compare it to what we read.
-            // The read already carries its hash, so this is a 32-byte compare.
-            let marker = self.io.take_marker(kind);
-            if marker != Some(raw.hash()) {
+            if origin == Origin::User {
                 changed.push(kind); // else: our own write echoing back — no propagation
             }
             read.insert(kind, raw);
@@ -915,7 +965,7 @@ impl<C: Clipboard> SyncEngine<C> {
         prov: Provenance,
         read: &IndexMap<SelectionKind, Hashed>,
     ) {
-        let Some(final_content) = self.apply_stages(content, prov.stages()).await else {
+        let Ok(final_content) = self.apply_stages(content, prov.pipeline()).await else {
             if prov == Provenance::Own {
                 debug!("not taking ownership of {kind:?}: nothing left after its stages");
             }
@@ -1075,7 +1125,7 @@ impl<C: Clipboard> SyncEngine<C> {
             let frame = encode_frame(&Message::Clip {
                 kind,
                 hash: state.hash,
-                offer: content.into_offer(),
+                offer: content.into_arc(),
                 version: state.version,
             });
             for &peer in peers {
@@ -1109,7 +1159,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// Answer a `--paste` client's request for one selection.
     ///
     /// Reads live rather than serving `current`, so the paster gets what is on
-    /// the clipboard now, and applies `Stages::BROADCAST` so a pull respects
+    /// the clipboard now, and applies `Pipeline::Serve` so a pull respects
     /// exactly the same content filters as a push — notably, password-manager
     /// content is dropped here too rather than being pullable.
     async fn on_get(&self, from: Uuid, kind: SelectionKind, want: GetWant) {
@@ -1128,65 +1178,81 @@ impl<C: Clipboard> SyncEngine<C> {
     /// off the compositor to print a list of names.
     async fn serve_get(&self, kind: SelectionKind, want: GetWant) -> GetResult {
         if !self.policies.get(kind).send {
-            return GetResult::NotSynced;
+            return GetResult::Unavailable(Unavailable::NotSynced);
         }
         // Names are not content, so they bypass the content pipeline entirely.
         // The rules still govern what leaves this host, so the list is filtered
         // to the types this node would actually serve.
         if want == GetWant::TypesOnly {
             let Some(types) = self.io.list_types(kind).await else {
-                return GetResult::Empty;
+                return GetResult::Unavailable(Unavailable::Unreadable);
             };
+            let had_types = !types.is_empty();
             let allowed = self.filter_names(types).await;
-            return if allowed.is_empty() {
-                GetResult::Empty
-            } else {
-                GetResult::Types(allowed)
+            return match (allowed.is_empty(), had_types) {
+                (false, _) => GetResult::Types(allowed),
+                // The distinction the reason exists for: nothing offered at all,
+                // versus types offered and all of them denied by our rules.
+                (true, true) => GetResult::Unavailable(Unavailable::Denied),
+                (true, false) => GetResult::Unavailable(Unavailable::Empty),
             };
         }
         let only = match &want {
             GetWant::One(t) => Some(t.as_str()),
             _ => None,
         };
-        // Two ways a narrowed request comes back with nothing, and they mean the
-        // same thing to the caller: the type wasn't offered at all, or it was
-        // offered and the rules/cap dropped it. Either way the useful answer is
-        // "not that one — here is what I do serve", never a bare "empty" that
-        // implies the clipboard holds nothing.
         let served = match self.read_for_serve(kind, only).await {
-            Some(raw) => self.apply_stages(raw, Stages::SERVE).await,
-            None => None,
+            Ok(raw) => self.apply_stages(raw, Pipeline::Serve).await,
+            Err(reason) => Err(reason),
         };
         match (served, only) {
-            (Some(content), _) => GetResult::Offer(content.into_offer()),
-            (None, Some(_)) => self.not_offered(kind).await,
-            (None, None) => GetResult::Empty,
+            (Ok(content), _) => GetResult::Offer(content.into_offer()),
+            // A narrowed request that came back with nothing: the type wasn't
+            // offered, or it was and the rules/cap dropped it. Either way the
+            // useful answer names what this node *would* serve.
+            (Err(_), Some(_)) => self.not_offered(kind).await,
+            (Err(reason), None) => GetResult::Unavailable(reason),
         }
     }
 
-    /// Read for a `Get`, narrowed to `only` when one type was asked for. A
-    /// narrowed read that comes back empty means the type simply isn't offered.
-    async fn read_for_serve(&self, kind: SelectionKind, only: Option<&str>) -> Option<Hashed> {
+    /// Read for a `Get`, narrowed to `only` when one type was asked for.
+    ///
+    /// A narrowed read that comes back empty means that type isn't offered,
+    /// which is `Empty` *for this request* — the caller turns it into the
+    /// "here's what I do have" answer.
+    async fn read_for_serve(
+        &self,
+        kind: SelectionKind,
+        only: Option<&str>,
+    ) -> Result<Hashed, Unavailable> {
         let raw = match only {
-            Some(mime) => self.io.read_one(kind, mime).await?,
-            None => self.io.read(kind).await?,
+            Some(mime) => self.io.read_one(kind, mime).await,
+            None => self.io.read(kind).await,
         };
-        (!raw.is_empty()).then_some(raw)
+        // `None` here is a failed or timed-out read, already logged — distinct
+        // from a successful read of an empty selection.
+        let raw = raw.ok_or(Unavailable::Unreadable)?;
+        if raw.is_empty() {
+            return Err(Unavailable::Empty);
+        }
+        Ok(raw)
     }
 
     /// `GetResult::NotOffered` carrying the types this node would serve, so the
     /// paster can say what *was* available. Costs one names-only roundtrip.
     ///
-    /// Degrades to `Empty` when there is nothing at all: "that type is not
-    /// offered (available: none)" is a worse answer than "the clipboard is
-    /// empty" for the same situation.
+    /// Degrades to a plain reason when there is nothing to list: "that type is
+    /// not offered (available: none)" is a worse answer than naming why the
+    /// node has nothing.
     async fn not_offered(&self, kind: SelectionKind) -> GetResult {
         let types = self.io.list_types(kind).await.unwrap_or_default();
+        let had_types = !types.is_empty();
         let available = self.filter_names(types).await;
-        if available.is_empty() {
-            return GetResult::Empty;
+        match (available.is_empty(), had_types) {
+            (false, _) => GetResult::NotOffered { available },
+            (true, true) => GetResult::Unavailable(Unavailable::Denied),
+            (true, false) => GetResult::Unavailable(Unavailable::Empty),
         }
-        GetResult::NotOffered { available }
     }
 
     /// Drop the type names this node's MIME rules would not send.
@@ -1212,7 +1278,7 @@ impl<C: Clipboard> SyncEngine<C> {
         from: Uuid,
         kind: SelectionKind,
         hash: [u8; 32],
-        offer: Offer,
+        offer: Arc<Offer>,
         version: Version,
     ) {
         // Describe before the offer is filtered/moved, for the verbose summary.
@@ -1234,10 +1300,12 @@ impl<C: Clipboard> SyncEngine<C> {
         from: Uuid,
         kind: SelectionKind,
         hash: [u8; 32],
-        offer: Offer,
+        offer: Arc<Offer>,
         version: Version,
     ) -> &'static str {
-        let content = Hashed::new(offer);
+        // from_arc, not new: the offer arrives inside its own Arc off the wire,
+        // so unwrapping and rewrapping it would copy the payload for nothing.
+        let content = Hashed::from_arc(offer);
         debug!(
             "received {kind:?} update from peer {from} ({}, stamp {})",
             describe_offer(content.offer()),
@@ -1258,7 +1326,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // between peers, and a node must not write contents it would never
         // have sent (e.g. password-manager secrets, or denied MIME types). Do
         // NOT record unseen types here — a peer must not write to our rules file.
-        let Some(content) = self.apply_stages(content, Stages::INBOUND).await else {
+        let Ok(content) = self.apply_stages(content, Pipeline::Inbound).await else {
             debug!("dropping inbound {kind:?} from peer {from}: our content filters removed everything");
             return "dropped (content filters removed everything)";
         };
@@ -1771,7 +1839,7 @@ mod tests {
                 Message::Clip {
                     kind: SelectionKind::Clipboard,
                     hash: content_hash(&o),
-                    offer: o.clone(),
+                    offer: o.clone().into(),
                     version: Version::new(now_ms() + 10_000, remote_id),
                 },
             ))
@@ -1871,6 +1939,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_get_distinguishes_empty_from_denied_and_sensitive() {
+        // The whole reason `Unavailable` is a value rather than a debug line on
+        // the serving host. All three used to arrive at the paster as "the
+        // clipboard is empty", and two of them are things the user can act on.
+        let kind = SelectionKind::Clipboard;
+
+        // Nothing on the clipboard at all.
+        let clip = MockClipboard::new();
+        let w = engine(clip, Config::for_test("s"));
+        assert_eq!(
+            w.engine.serve_get(kind, GetWant::All).await,
+            GetResult::Unavailable(Unavailable::Empty)
+        );
+
+        // Full clipboard, every type denied by this node's rules.
+        let clip = MockClipboard::new();
+        clip.seed(kind, offer("denied"));
+        let mut cfg = Config::for_test("s");
+        let (_dir, _) = with_rules(&mut cfg, MimePolicy::Deny, &[("text/plain", "deny")]);
+        let w = engine(clip, cfg);
+        assert_eq!(
+            w.engine.serve_get(kind, GetWant::All).await,
+            GetResult::Unavailable(Unavailable::Denied),
+            "a denied clipboard must not read as an empty one"
+        );
+
+        // Full clipboard, flagged as a password-manager secret.
+        let clip = MockClipboard::new();
+        clip.seed(
+            kind,
+            crate::protocol::test_support::offer(&[
+                ("text/plain", b"hunter2"),
+                (SENSITIVE_MIME, b"secret"),
+            ]),
+        );
+        let w = engine(clip, Config::for_test("s"));
+        assert_eq!(
+            w.engine.serve_get(kind, GetWant::All).await,
+            GetResult::Unavailable(Unavailable::Sensitive),
+            "a pull must refuse secrets, and say that is why"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_inbound_clip_reports_each_outcome() {
         // A standalone engine (not driven by run()), so we can call the inbound
         // handler directly and assert the one-line verbose summary's outcome.
@@ -1886,37 +1998,61 @@ mod tests {
         let a = offer("hello");
         let ha = content_hash(&a);
         assert_eq!(
-            e.apply_inbound_clip(from, kind, ha, a.clone(), Version::new(1000, from))
+            e.apply_inbound_clip(from, kind, ha, a.clone().into(), Version::new(1000, from))
                 .await,
             "applied"
         );
         assert_eq!(
-            e.apply_inbound_clip(from, kind, ha, a, Version::new(1000, from))
+            e.apply_inbound_clip(from, kind, ha, a.into(), Version::new(1000, from))
                 .await,
             "already our current content"
         );
         let b = offer("older");
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&b), b, Version::new(1, from))
-                .await,
+            e.apply_inbound_clip(
+                from,
+                kind,
+                content_hash(&b),
+                b.into(),
+                Version::new(1, from)
+            )
+            .await,
             "ignored (older than our content)"
         );
         assert_eq!(
-            e.apply_inbound_clip(from, kind, [0u8; 32], offer("x"), Version::new(2000, from))
-                .await,
+            e.apply_inbound_clip(
+                from,
+                kind,
+                [0u8; 32],
+                offer("x").into(),
+                Version::new(2000, from)
+            )
+            .await,
             "rejected (content hash mismatch)"
         );
         let f = offer("future");
         let future = now_ms() + MAX_FUTURE_SKEW_MS + 60_000;
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&f), f, Version::new(future, from))
-                .await,
+            e.apply_inbound_clip(
+                from,
+                kind,
+                content_hash(&f),
+                f.into(),
+                Version::new(future, from)
+            )
+            .await,
             "rejected (timestamp too far in the future)"
         );
         // Exercise the verbose logging wrapper end-to-end (must not panic).
         let g = offer("newer");
-        e.on_inbound_clip(from, kind, content_hash(&g), g, Version::new(5000, from))
-            .await;
+        e.on_inbound_clip(
+            from,
+            kind,
+            content_hash(&g),
+            g.into(),
+            Version::new(5000, from),
+        )
+        .await;
 
         // Send-only engine: inbound is dropped by the direction policy.
         let mut cfg = Config::for_test("s");
@@ -1924,8 +2060,14 @@ mod tests {
         let e = standalone(cfg);
         let c = offer("blocked");
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&c), c, Version::new(1000, from))
-                .await,
+            e.apply_inbound_clip(
+                from,
+                kind,
+                content_hash(&c),
+                c.into(),
+                Version::new(1000, from)
+            )
+            .await,
             "dropped (blocked by direction/sync_selection config)"
         );
 
@@ -1935,8 +2077,14 @@ mod tests {
         let e = standalone(cfg);
         let d = offer("denied");
         assert_eq!(
-            e.apply_inbound_clip(from, kind, content_hash(&d), d, Version::new(1000, from))
-                .await,
+            e.apply_inbound_clip(
+                from,
+                kind,
+                content_hash(&d),
+                d.into(),
+                Version::new(1000, from)
+            )
+            .await,
             "dropped (content filters removed everything)"
         );
     }
@@ -1952,7 +2100,7 @@ mod tests {
                     hash,
                     offer,
                     version,
-                } => return (kind, hash, offer, version.stamp),
+                } => return (kind, hash, (*offer).clone(), version.stamp),
                 Message::Rules { .. } => continue,
                 other => panic!("expected Clip, got {other:?}"),
             }
@@ -1990,7 +2138,7 @@ mod tests {
         let msg = Message::Clip {
             kind,
             hash: content_hash(&o),
-            offer: o,
+            offer: o.into(),
             version: Version::new(stamp, h.remote_id),
         };
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
@@ -2061,7 +2209,7 @@ mod tests {
             Message::Clip {
                 offer: o, version, ..
             } => {
-                assert_eq!(o, offer("fresh"), "the racing copy must reach the mesh");
+                assert_eq!(*o, offer("fresh"), "the racing copy must reach the mesh");
                 assert!(
                     version.stamp > 0,
                     "a user copy must carry a real stamp; stamp 0 would let a \
@@ -2516,7 +2664,7 @@ mod tests {
         let msg = Message::Clip {
             kind: SelectionKind::Clipboard,
             hash: [9u8; 32],
-            offer: o,
+            offer: o.into(),
             version: Version::new(1, h.remote_id),
         };
         h.in_tx.send((h.remote_id, msg)).await.unwrap();
@@ -2696,7 +2844,7 @@ mod tests {
         h.mesh.register(peer2, tx2, PeerRole::Peer);
         let msg = recv_from(&mut rx2).await;
         match msg {
-            Message::Clip { offer: o, .. } => assert_eq!(o, offer("current")),
+            Message::Clip { offer: o, .. } => assert_eq!(*o, offer("current")),
             other => panic!("expected resync Clip, got {other:?}"),
         }
         // the pre-existing peer must not receive a duplicate
@@ -2725,7 +2873,7 @@ mod tests {
         for (i, rx) in rxs.iter_mut().enumerate() {
             match recv_from(rx).await {
                 Message::Clip { offer: o, .. } => {
-                    assert_eq!(o, offer("current"), "peer {i} got the wrong resync")
+                    assert_eq!(*o, offer("current"), "peer {i} got the wrong resync")
                 }
                 other => panic!("peer {i}: expected resync Clip, got {other:?}"),
             }
@@ -2940,7 +3088,7 @@ mod tests {
             Message::Clip {
                 offer: o, version, ..
             } => {
-                assert_eq!(o, offer("restored"));
+                assert_eq!(*o, offer("restored"));
                 assert_eq!(version.stamp, 0, "restored content must resync at stamp 0");
             }
             other => panic!("expected resync Clip, got {other:?}"),

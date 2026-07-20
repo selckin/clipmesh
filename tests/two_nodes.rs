@@ -17,16 +17,15 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
 
     // mesh forms
     let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
-    wait_for(
-        move || ma.peer_count() == 1 && mb.peer_count() == 1,
-        "mesh to form",
-    )
+    wait_for("mesh to form", move || {
+        ma.peer_count() == 1 && mb.peer_count() == 1
+    })
     .await;
 
     // A -> B
     let o1 = offer("hello from a");
     clip_a.local_copy(SelectionKind::Clipboard, o1.clone());
-    wait_applied(&clip_b, SelectionKind::Clipboard, &o1, "A's copy on B").await;
+    wait_applied("A's copy on B", &clip_b, SelectionKind::Clipboard, &o1).await;
     assert_eq!(clip_b.write_count(), 1);
     assert_eq!(
         clip_a.write_count(),
@@ -37,7 +36,7 @@ async fn clipboard_syncs_both_ways_without_echo_storms() {
     // B -> A
     let o2 = offer("hello from b");
     clip_b.local_copy(SelectionKind::Clipboard, o2.clone());
-    wait_applied(&clip_a, SelectionKind::Clipboard, &o2, "B's copy on A").await;
+    wait_applied("B's copy on A", &clip_a, SelectionKind::Clipboard, &o2).await;
     assert_eq!(clip_a.write_count(), 1);
 
     // quiet period: no echo storm
@@ -61,10 +60,10 @@ async fn content_copied_while_peer_offline_resyncs_on_connect() {
     start(peered("resync", &[&node_a]), clip_b.clone()).await;
 
     wait_applied(
+        "offline copy to resync onto B",
         &clip_b,
         SelectionKind::Clipboard,
         &o,
-        "offline copy to resync onto B",
     )
     .await;
     // and A must not have had anything written back
@@ -88,16 +87,15 @@ async fn three_node_mesh_copy_reaches_all_without_storms() {
         node_b.mesh.clone(),
         node_c.mesh.clone(),
     );
-    wait_for(
-        move || ma.peer_count() == 2 && mb.peer_count() == 2 && mc.peer_count() == 2,
-        "full 3-node mesh",
-    )
+    wait_for("full 3-node mesh", move || {
+        ma.peer_count() == 2 && mb.peer_count() == 2 && mc.peer_count() == 2
+    })
     .await;
 
     let o = offer("from a");
     clip_a.local_copy(SelectionKind::Clipboard, o.clone());
-    wait_applied(&clip_b, SelectionKind::Clipboard, &o, "A's copy on B").await;
-    wait_applied(&clip_c, SelectionKind::Clipboard, &o, "A's copy on C").await;
+    wait_applied("A's copy on B", &clip_b, SelectionKind::Clipboard, &o).await;
+    wait_applied("A's copy on C", &clip_c, SelectionKind::Clipboard, &o).await;
     sleep(Duration::from_millis(300)).await; // no storm
     assert_eq!(clip_a.write_count(), 0, "A must not receive its own copy");
     assert_eq!(clip_b.write_count(), 1);
@@ -124,10 +122,9 @@ async fn late_starting_peer_is_eventually_connected() {
     let node_a = start(cfg_a, clip_a).await;
 
     let (ma, mb) = (node_a.mesh.clone(), node_b.mesh.clone());
-    wait_for(
-        move || ma.peer_count() == 1 && mb.peer_count() == 1,
-        "late peer to connect",
-    )
+    wait_for("late peer to connect", move || {
+        ma.peer_count() == 1 && mb.peer_count() == 1
+    })
     .await;
 }
 
@@ -196,13 +193,10 @@ async fn mime_rules_converge_on_connect() {
     start(cfg_b, clip_b.clone()).await;
 
     let pb = path_b.clone();
-    wait_for(
-        move || {
-            std::fs::read_to_string(&pb)
-                .map(|s| s.contains("\"image/webp\" = \"allow\""))
-                .unwrap_or(false)
-        },
-        "B to adopt A's newer rules file",
-    )
+    wait_for("B to adopt A's newer rules file", move || {
+        std::fs::read_to_string(&pb)
+            .map(|s| s.contains("\"image/webp\" = \"allow\""))
+            .unwrap_or(false)
+    })
     .await;
 }

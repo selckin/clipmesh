@@ -185,6 +185,50 @@ mod tests {
     const MAX: usize = 8 * 1024 * 1024;
     const PSK: [u8; 32] = [1u8; 32];
 
+    /// A live connection between two meshes over an in-memory duplex: both
+    /// sides spawned, initiator's handle first, so a test can abort or await
+    /// either end.
+    ///
+    /// Every connection test needs this same setup and differs only in what it
+    /// then does to the connection, so the wiring lives here and the parameters
+    /// that never vary (PSK, cap, role) stop being repeated at each site.
+    fn connect(
+        a: &Arc<Mesh>,
+        b: &Arc<Mesh>,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (io_a, io_b) = tokio::io::duplex(1 << 20);
+        (
+            tokio::spawn(run_connection(
+                io_a,
+                true,
+                PSK,
+                MAX,
+                a.clone(),
+                PeerRole::Peer,
+            )),
+            tokio::spawn(run_connection(
+                io_b,
+                false,
+                PSK,
+                MAX,
+                b.clone(),
+                PeerRole::Peer,
+            )),
+        )
+    }
+
+    /// Block until the hello exchange has landed on both sides.
+    async fn wait_for_mutual_peering(a: &Arc<Mesh>, b: &Arc<Mesh>) {
+        let (a, b) = (a.clone(), b.clone());
+        wait_for("both nodes to see each other as a peer", move || {
+            a.peer_count() == 1 && b.peer_count() == 1
+        })
+        .await;
+    }
+
     #[test]
     fn matching_protocol_version_is_accepted() {
         assert!(check_protocol_version(protocol::PROTOCOL_VERSION).is_ok());
@@ -204,29 +248,9 @@ mod tests {
         let (mesh_a, _in_a_rx, _crx_a) = new_mesh();
         let (mesh_b, mut in_b_rx, _crx_b) = new_mesh();
 
-        let (io_a, io_b) = tokio::io::duplex(1 << 20);
-        tokio::spawn(run_connection(
-            io_a,
-            true,
-            PSK,
-            MAX,
-            mesh_a.clone(),
-            PeerRole::Peer,
-        ));
-        tokio::spawn(run_connection(
-            io_b,
-            false,
-            PSK,
-            MAX,
-            mesh_b.clone(),
-            PeerRole::Peer,
-        ));
+        let _conn = connect(&mesh_a, &mesh_b);
 
-        let (ma, mb) = (mesh_a.clone(), mesh_b.clone());
-        wait_for("both nodes to see each other as a peer", move || {
-            ma.peer_count() == 1 && mb.peer_count() == 1
-        })
-        .await;
+        wait_for_mutual_peering(&mesh_a, &mesh_b).await;
         assert_eq!(mesh_a.peer_ids(), vec![mesh_b.own_id()]);
         assert_eq!(mesh_b.peer_ids(), vec![mesh_a.own_id()]);
 
@@ -239,23 +263,8 @@ mod tests {
     #[tokio::test]
     async fn self_connection_is_rejected() {
         let (mesh, _in_rx, _crx) = new_mesh();
-        let (io_a, io_b) = tokio::io::duplex(1 << 20);
-        let a = tokio::spawn(run_connection(
-            io_a,
-            true,
-            PSK,
-            MAX,
-            mesh.clone(),
-            PeerRole::Peer,
-        ));
-        let b = tokio::spawn(run_connection(
-            io_b,
-            false,
-            PSK,
-            MAX,
-            mesh.clone(),
-            PeerRole::Peer,
-        ));
+        // both ends of the connection are the *same* node
+        let (a, b) = connect(&mesh, &mesh);
         let (ra, rb) = tokio::join!(a, b);
         // the error must be typed so dial loops can stop retrying for good
         assert!(ra
@@ -276,29 +285,8 @@ mod tests {
         let (mesh_a, _in_a_rx, _crx_a) = new_mesh();
         let (mesh_b, _in_b_rx, _crx_b) = new_mesh();
 
-        let (io_a, io_b) = tokio::io::duplex(1 << 20);
-        tokio::spawn(run_connection(
-            io_a,
-            true,
-            PSK,
-            MAX,
-            mesh_a.clone(),
-            PeerRole::Peer,
-        ));
-        let b_task = tokio::spawn(run_connection(
-            io_b,
-            false,
-            PSK,
-            MAX,
-            mesh_b.clone(),
-            PeerRole::Peer,
-        ));
-
-        let (ma, mb) = (mesh_a.clone(), mesh_b.clone());
-        wait_for("both nodes to see each other as a peer", move || {
-            ma.peer_count() == 1 && mb.peer_count() == 1
-        })
-        .await;
+        let (_a_task, b_task) = connect(&mesh_a, &mesh_b);
+        wait_for_mutual_peering(&mesh_a, &mesh_b).await;
 
         b_task.abort(); // kill B's side; A must notice and unregister
         let ma = mesh_a.clone();
@@ -316,23 +304,7 @@ mod tests {
         let (mesh_a, _in_a_rx, _crx_a) = new_mesh();
         let (mesh_b, _in_b_rx, _crx_b) = new_mesh();
 
-        let (io_a, io_b) = tokio::io::duplex(1 << 20);
-        let a_task = tokio::spawn(run_connection(
-            io_a,
-            true,
-            PSK,
-            MAX,
-            mesh_a.clone(),
-            PeerRole::Peer,
-        ));
-        tokio::spawn(run_connection(
-            io_b,
-            false,
-            PSK,
-            MAX,
-            mesh_b.clone(),
-            PeerRole::Peer,
-        ));
+        let (a_task, _b_task) = connect(&mesh_a, &mesh_b);
 
         let ma = mesh_a.clone();
         wait_for("A to register its peer", move || ma.peer_count() == 1).await;

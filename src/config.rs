@@ -163,7 +163,12 @@ fn default_unknown_mime() -> MimePolicy {
     MimePolicy::Deny
 }
 
-#[derive(Debug, Clone)]
+/// `PartialEq` exists for `config_template`'s default check, which asserts that
+/// activating the template's commented defaults yields exactly the config a
+/// minimal file parses to. Comparing whole values keeps that test from listing
+/// the fields itself — a hand-written list there would be one more copy of the
+/// defaults, which is the drift the test is there to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub listen: String,
     /// The configured port — the default applied to any peer (or `--node`
@@ -384,30 +389,37 @@ impl Config {
     }
 
     /// Convenience constructor for tests (unit and integration).
+    ///
+    /// Built by parsing a minimal config so every production default flows in
+    /// on its own. Spelling the fields out instead made this a second, silent
+    /// copy of the defaults: the compiler catches a new *field* but says
+    /// nothing about a changed *value*, so tests kept asserting against
+    /// defaults production had already moved off.
+    ///
+    /// The four overrides below are the only intended departures, each for a
+    /// test-harness reason rather than because it is what clipmesh does.
     pub fn for_test(secret: &str) -> Config {
+        // `listen` may not carry a port, so the bind address is set below; the
+        // rest of the file is the smallest input the parser accepts.
+        let minimal = format!("listen = \"127.0.0.1\"\npsk = {secret:?}\n");
         Config {
+            // Bind an ephemeral port so parallel tests don't collide. `port`
+            // deliberately keeps its production value: it is also the port a
+            // peer address without one inherits, which tests do exercise.
             listen: "127.0.0.1:0".into(),
-            port: default_port(),
-            peers: vec![],
-            psk: *blake3::hash(secret.as_bytes()).as_bytes(),
-            max_payload_size: 32 * 1024 * 1024,
+            // No quiet period: tests step the engine copy by copy and would
+            // otherwise wait out the real debounce on every one.
             debounce_ms: 0,
-            sync_selection: false,
-            link_selections: LinkSelections::OFF,
-            direction: Direction::Both,
-            exclude_sensitive: true,
-            resync_on_connect: true,
-            // Off in tests: existing tests assert verbatim file contents and
-            // must not get a version header written. Sharing tests opt in.
+            // Off, because tests assert verbatim rules-file contents and must
+            // not find a shared-rules version header in them. Sharing tests
+            // turn it back on.
             share_mime_rules: false,
-            verbose: false,
-            log_level: "info".into(),
-            // Permissive default for tests; rule-specific tests set their own
-            // policy and a rules file path.
+            // Permissive, so an engine test can run without first writing a
+            // rules file. Note this is the opposite of production's `Deny`:
+            // deny-by-default is covered by the rules tests in `mime`, which
+            // set their own policy and rules path, not by anything built here.
             unknown_mime: MimePolicy::Allow,
-            synthesize_text_plain: false,
-            take_ownership: false,
-            mime_rules_path: None,
+            ..Config::from_toml(&minimal).expect("the minimal test config parses")
         }
     }
 }
@@ -417,12 +429,17 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Parse `extra` on top of the two keys every config must have. Most tests
+    /// here are about one option, and repeating the required pair around it
+    /// buries which line they are actually testing.
+    fn cfg_with(extra: &str) -> Result<Config> {
+        Config::from_toml(&format!("listen = \"x\"\npsk = \"s\"\n{extra}"))
+    }
+
     #[test]
     fn verbose_defaults_off_and_parses_when_set() {
-        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
-        assert!(!cfg.verbose);
-        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\nverbose = true\n").unwrap();
-        assert!(cfg.verbose);
+        assert!(!cfg_with("").unwrap().verbose);
+        assert!(cfg_with("verbose = true\n").unwrap().verbose);
     }
 
     #[test]
@@ -445,8 +462,7 @@ mod tests {
     #[test]
     fn zero_max_payload_size_is_rejected() {
         // A 0 cap would silently drop every representation; reject it loudly.
-        let toml = "listen = \"x\"\npsk = \"s\"\nmax_payload_size = \"0B\"\n";
-        assert!(Config::from_toml(toml).is_err());
+        assert!(cfg_with("max_payload_size = \"0B\"\n").is_err());
     }
 
     #[test]
@@ -521,7 +537,7 @@ selection_to_clipboard = true
 
     #[test]
     fn rejects_unknown_fields() {
-        assert!(Config::from_toml("listen = \"x\"\npsk = \"s\"\ntypo_field = 1\n").is_err());
+        assert!(cfg_with("typo_field = 1\n").is_err());
     }
 
     #[test]
@@ -542,13 +558,12 @@ selection_to_clipboard = true
 
     #[test]
     fn share_mime_rules_defaults_on_and_parses() {
-        // default on
-        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
-        assert!(cfg.share_mime_rules);
-        // explicit off
-        let cfg =
-            Config::from_toml("listen = \"x\"\npsk = \"s\"\nshare_mime_rules = false\n").unwrap();
-        assert!(!cfg.share_mime_rules);
+        assert!(cfg_with("").unwrap().share_mime_rules);
+        assert!(
+            !cfg_with("share_mime_rules = false\n")
+                .unwrap()
+                .share_mime_rules
+        );
         // tests opt out by default so existing verbatim-file tests are unaffected
         assert!(!Config::for_test("s").share_mime_rules);
     }
@@ -557,12 +572,6 @@ selection_to_clipboard = true
     fn listen_and_port_combine_into_a_bind_address() {
         let cfg = Config::from_toml("listen = \"0.0.0.0\"\nport = 51000\npsk = \"s\"\n").unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:51000");
-    }
-
-    #[test]
-    fn port_defaults_when_omitted() {
-        let cfg = Config::from_toml("listen = \"0.0.0.0\"\npsk = \"s\"\n").unwrap();
-        assert_eq!(cfg.listen, "0.0.0.0:48100");
     }
 
     #[test]
@@ -611,21 +620,14 @@ selection_to_clipboard = true
 
     #[test]
     fn sync_selection_parses_and_defaults_off() {
-        let cfg = Config::from_toml("listen = \"x\"\npsk = \"s\"\n").unwrap();
-        assert!(!cfg.sync_selection);
-        let cfg =
-            Config::from_toml("listen = \"x\"\npsk = \"s\"\nsync_selection = true\n").unwrap();
-        assert!(cfg.sync_selection);
+        assert!(!cfg_with("").unwrap().sync_selection);
+        assert!(cfg_with("sync_selection = true\n").unwrap().sync_selection);
     }
 
     #[test]
     fn link_selections_table_parses_into_directions() {
-        let base = "listen = \"x\"\npsk = \"s\"\n";
         // Omitted table -> Off.
-        assert_eq!(
-            Config::from_toml(base).unwrap().link_selections,
-            LinkSelections::OFF
-        );
+        assert_eq!(cfg_with("").unwrap().link_selections, LinkSelections::OFF);
         // Each boolean combination maps to the matching direction.
         let cases = [
             (
@@ -646,16 +648,15 @@ selection_to_clipboard = true
             ),
         ];
         for (body, expected) in cases {
-            let toml = format!("{base}[link_selections]\n{body}");
-            let cfg = Config::from_toml(&toml).unwrap();
-            assert_eq!(cfg.link_selections, expected, "parsing:\n{toml}");
+            let table = format!("[link_selections]\n{body}");
+            let parsed = cfg_with(&table).unwrap();
+            assert_eq!(parsed.link_selections, expected, "parsing:\n{table}");
         }
     }
 
     #[test]
     fn link_selections_rejects_unknown_keys() {
-        let toml = "listen = \"x\"\npsk = \"s\"\n[link_selections]\ntypo = true\n";
-        assert!(Config::from_toml(toml).is_err());
+        assert!(cfg_with("[link_selections]\ntypo = true\n").is_err());
     }
 
     #[test]
@@ -664,25 +665,8 @@ selection_to_clipboard = true
         // and the renamed `sync_primary` key must fail loudly (not silently
         // misparse), so an unmigrated config errors on load rather than running
         // with the wrong settings.
-        assert!(
-            Config::from_toml("listen = \"x\"\npsk = \"s\"\nlink_selections = \"both\"\n").is_err()
-        );
-        assert!(Config::from_toml("listen = \"x\"\npsk = \"s\"\nsync_primary = true\n").is_err());
-    }
-
-    /// Pins the four named direction constants to their intended field pairs —
-    /// easy to typo, and `link_partner` dispatches on exactly these.
-    #[test]
-    fn link_selections_named_directions_have_the_right_fields() {
-        for (link, clip_to_sel, sel_to_clip) in [
-            (LinkSelections::OFF, false, false),
-            (LinkSelections::CLIPBOARD_TO_SELECTION, true, false),
-            (LinkSelections::SELECTION_TO_CLIPBOARD, false, true),
-            (LinkSelections::BOTH, true, true),
-        ] {
-            assert_eq!(link.clipboard_to_selection, clip_to_sel, "{link:?}");
-            assert_eq!(link.selection_to_clipboard, sel_to_clip, "{link:?}");
-        }
+        assert!(cfg_with("link_selections = \"both\"\n").is_err());
+        assert!(cfg_with("sync_primary = true\n").is_err());
     }
 
     /// A `Deserializer` that answers nothing and only records the field list
