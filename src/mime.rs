@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use toml_edit::{value, Decor, DocumentMut, Item, Key, Table, Value};
 
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
 /// Lock the shared rules, tolerating a poisoned mutex.
 ///
 /// `MimeRules` has no cross-field invariant that a panic mid-update could leave
@@ -31,8 +34,6 @@ pub fn lock_rules(rules: &Mutex<MimeRules>) -> MutexGuard<'_, MimeRules> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 /// Skeleton written for a brand-new (or reset) rules file.
 const TEMPLATE: &str = "\
@@ -577,22 +578,17 @@ struct CompiledEntry<'a> {
 
 impl<'a> CompiledEntry<'a> {
     fn new((key, item): (&'a str, &Item)) -> Self {
-        let wildcards = key.bytes().filter(|&b| b == b'*' || b == b'?').count();
+        let (literals, wildcards) = key_weights(key);
         CompiledEntry {
             key,
             rule: parse_rule_item(item),
-            literals: key.chars().count() - wildcards,
+            literals,
             wildcards,
         }
     }
 
     fn specificity(&self, allow: bool) -> Specificity<'a> {
-        (
-            self.literals,
-            Reverse(self.wildcards),
-            !allow,
-            Reverse(self.key),
-        )
+        specificity_of(self.key, self.literals, self.wildcards, allow)
     }
 }
 
@@ -697,10 +693,24 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// is borrowed (`&str`), so building a `Specificity` per lookup never allocates.
 type Specificity<'a> = (usize, Reverse<usize>, bool, Reverse<&'a str>);
 
-fn specificity(key: &str, allow: bool) -> Specificity<'_> {
+/// A key's `(literals, wildcards)` counts — the two O(key length) scans that
+/// [`specificity_of`] orders by. Split out so a compiled ruleset can precompute
+/// them once per key instead of per lookup.
+fn key_weights(key: &str) -> (usize, usize) {
     let wildcards = key.bytes().filter(|&b| b == b'*' || b == b'?').count();
-    let literals = key.chars().count() - wildcards;
+    (key.chars().count() - wildcards, wildcards)
+}
+
+/// Assemble the ordering key from a key's weights. THE single definition of
+/// "most specific wins" — `rules_report` and the rule actually applied both come
+/// through here, so the report can't disagree with enforcement.
+fn specificity_of(key: &str, literals: usize, wildcards: usize, allow: bool) -> Specificity<'_> {
     (literals, Reverse(wildcards), !allow, Reverse(key))
+}
+
+fn specificity(key: &str, allow: bool) -> Specificity<'_> {
+    let (literals, wildcards) = key_weights(key);
+    specificity_of(key, literals, wildcards, allow)
 }
 
 /// A `Key` for `k` that always renders quoted, even when `k` is a valid bare key
@@ -742,7 +752,8 @@ fn describe_value(item: &Item) -> (Verdict, Option<String>) {
         None => Verdict::Invalid,
     };
     // Echo the cap as the user wrote it, but only when it's one that survives.
-    (verdict, usable_cap(max).and(max).map(str::to_string))
+    let cap = max.filter(|s| usable_cap(Some(s)).is_some());
+    (verdict, cap.map(str::to_string))
 }
 
 /// Render one `[rules]` entry as a clean, copy-pasteable `"key" = value` line

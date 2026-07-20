@@ -155,9 +155,6 @@ fn sync_config_action(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Apply a single `--allow`/`--deny` glob to the MIME-rules file and exit. Any
-/// existing entries the new glob now covers are removed and echoed back so the
-/// user can re-add the ones they want to keep as exceptions.
 /// State of the MIME rules file as found on disk by [`open_rules_file`].
 enum RulesFile {
     /// Exists and parses as TOML.
@@ -196,6 +193,9 @@ fn open_rules_file(config_path: &Path) -> Result<(Config, PathBuf, RulesFile)> {
     Ok((cfg, path, state))
 }
 
+/// Apply a single `--allow`/`--deny` glob to the MIME-rules file and exit. Any
+/// existing entries the new glob now covers are removed and echoed back so the
+/// user can re-add the ones they want to keep as exceptions.
 fn apply_rule_edit(config_path: &Path, allow: bool, pattern: &str) -> Result<()> {
     if pattern.trim().is_empty() {
         bail!("the --allow/--deny pattern must not be empty");

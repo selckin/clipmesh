@@ -9,11 +9,14 @@ const NOISE_MAX: usize = 65535;
 const TAG_LEN: usize = 16;
 /// Max plaintext per Noise record.
 const CHUNK: usize = NOISE_MAX - TAG_LEN;
-/// Reassembly capacity kept between messages. A single large clipboard payload
+/// The big-endian u32 length prefix each logical message carries.
+const HEADER: usize = 4;
+/// Reassembly capacity kept between messages — one record's worth, so a
+/// steady-state message never reallocates. A single large clipboard payload
 /// would otherwise leave its whole footprint resident for the connection's
-/// lifetime, and the mesh holds roughly two connections per peer — so one 32 MiB
+/// lifetime, and the mesh holds roughly two connections per peer, so one 32 MiB
 /// copy could pin 64 MiB per peer indefinitely, long after the copy is gone.
-const PLAIN_BUF_KEEP: usize = 64 * 1024;
+const PLAIN_BUF_KEEP: usize = NOISE_MAX;
 
 pub struct SendHalf<W> {
     io: W,
@@ -22,10 +25,6 @@ pub struct SendHalf<W> {
     /// Ciphertext scratch, sized once to the largest a Noise record can be.
     /// Reused across sends rather than reallocated (and re-zeroed) per message.
     out: Vec<u8>,
-    /// Assembly space for the first chunk only: the 4-byte length prefix plus
-    /// as much payload as fits. Every later chunk is a slice of the caller's
-    /// plaintext, written through without a copy.
-    head: Vec<u8>,
 }
 
 pub struct RecvHalf<R> {
@@ -35,6 +34,8 @@ pub struct RecvHalf<R> {
     plain_buf: Vec<u8>,
     /// Plaintext scratch for one decrypted record; see `SendHalf::out`.
     out: Vec<u8>,
+    /// Ciphertext scratch for the record currently being read.
+    record: Vec<u8>,
     max_message: usize,
 }
 
@@ -83,7 +84,6 @@ where
             st: st.clone(),
             nonce: 0,
             out: vec![0u8; NOISE_MAX],
-            head: Vec::with_capacity(CHUNK),
         },
         RecvHalf {
             io: rd,
@@ -91,6 +91,7 @@ where
             nonce: 0,
             plain_buf: Vec::new(),
             out: vec![0u8; NOISE_MAX],
+            record: Vec::new(),
             max_message,
         },
     ))
@@ -103,15 +104,27 @@ async fn write_record<W: AsyncWrite + Unpin>(io: &mut W, data: &[u8]) -> Result<
     Ok(())
 }
 
-async fn read_record<R: AsyncRead + Unpin>(io: &mut R) -> Result<Vec<u8>> {
-    let mut len = [0u8; 4];
+/// Read one length-prefixed record into `buf`, replacing its contents.
+///
+/// Takes the buffer rather than returning a fresh `Vec` so a long-lived reader
+/// reuses one allocation: a large message arrives as hundreds of records, and
+/// allocating (and zero-filling) each one is pure waste.
+async fn read_record_into<R: AsyncRead + Unpin>(io: &mut R, buf: &mut Vec<u8>) -> Result<()> {
+    let mut len = [0u8; HEADER];
     io.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
     if len > NOISE_MAX {
         bail!("record too large: {len}");
     }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
+    buf.resize(len, 0);
+    io.read_exact(buf).await?;
+    Ok(())
+}
+
+/// One-shot record read for the handshake, which has no buffer to reuse yet.
+async fn read_record<R: AsyncRead + Unpin>(io: &mut R) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    read_record_into(io, &mut buf).await?;
     Ok(buf)
 }
 
@@ -125,65 +138,57 @@ impl<W: AsyncWrite + Unpin> SendHalf<W> {
     /// `max_payload_size` — on every send, per connection.
     pub async fn send(&mut self, plaintext: &[u8]) -> Result<()> {
         let len = u32::try_from(plaintext.len()).context("message too large for framing")?;
-        const HEADER: usize = 4;
         let head_payload = plaintext.len().min(CHUNK - HEADER);
 
-        self.head.clear();
-        self.head.extend_from_slice(&len.to_be_bytes());
-        self.head.extend_from_slice(&plaintext[..head_payload]);
-        // Distinct fields, so these borrows don't overlap.
-        let (io, st, nonce, out) = (&mut self.io, &*self.st, &mut self.nonce, &mut self.out);
-        write_chunk(io, st, nonce, out, &self.head).await?;
+        // Only the first chunk needs assembling; sized to what it actually
+        // holds, so a small message allocates a small buffer.
+        let mut head = Vec::with_capacity(HEADER + head_payload);
+        head.extend_from_slice(&len.to_be_bytes());
+        head.extend_from_slice(&plaintext[..head_payload]);
+        self.write_chunk(&head).await?;
 
         for chunk in plaintext[head_payload..].chunks(CHUNK) {
-            write_chunk(io, st, nonce, out, chunk).await?;
+            self.write_chunk(chunk).await?;
         }
         Ok(())
     }
-}
 
-/// Encrypt one chunk under the next nonce and write it as a length-prefixed
-/// record. Free-standing (rather than a method) so the caller can hold a borrow
-/// of `SendHalf::head` while passing the other fields.
-async fn write_chunk<W: AsyncWrite + Unpin>(
-    io: &mut W,
-    st: &StatelessTransportState,
-    nonce: &mut u64,
-    out: &mut [u8],
-    chunk: &[u8],
-) -> Result<()> {
-    let n = st.write_message(*nonce, chunk, out)?;
-    *nonce += 1;
-    write_record(io, &out[..n]).await
+    /// Encrypt one chunk under the next nonce and write it as a length-prefixed
+    /// record.
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        let n = self.st.write_message(self.nonce, chunk, &mut self.out)?;
+        self.nonce += 1;
+        write_record(&mut self.io, &self.out[..n]).await
+    }
 }
 
 impl<R: AsyncRead + Unpin> RecvHalf<R> {
     /// Receive one logical message. Errors are terminal for the connection.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         loop {
-            if self.plain_buf.len() >= 4 {
-                let len = u32::from_be_bytes(self.plain_buf[..4].try_into().unwrap()) as usize;
+            if self.plain_buf.len() >= HEADER {
+                let len = u32::from_be_bytes(self.plain_buf[..HEADER].try_into().unwrap()) as usize;
                 if len > self.max_message {
                     bail!("message too large: {len} > {}", self.max_message);
                 }
-                if self.plain_buf.len() >= 4 + len {
-                    let msg = self.plain_buf[4..4 + len].to_vec();
-                    self.plain_buf.drain(..4 + len);
+                if self.plain_buf.len() >= HEADER + len {
+                    let msg = self.plain_buf[HEADER..HEADER + len].to_vec();
+                    self.plain_buf.drain(..HEADER + len);
                     // Release the reassembly space an outsized message grew,
                     // instead of holding its high-water mark for the life of
-                    // the connection.
-                    if self.plain_buf.capacity() > PLAIN_BUF_KEEP
-                        && self.plain_buf.len() <= PLAIN_BUF_KEEP
-                    {
+                    // the connection. `shrink_to` is a no-op when capacity is
+                    // already below the limit; the length check is what matters,
+                    // so a partially-filled buffer mid-stream isn't reallocated.
+                    if self.plain_buf.len() <= PLAIN_BUF_KEEP {
                         self.plain_buf.shrink_to(PLAIN_BUF_KEEP);
                     }
                     return Ok(msg);
                 }
             }
-            let record = read_record(&mut self.io).await?;
+            read_record_into(&mut self.io, &mut self.record).await?;
             let n = self
                 .st
-                .read_message(self.nonce, &record, &mut self.out)
+                .read_message(self.nonce, &self.record, &mut self.out)
                 .context("decrypt failed (tampering or desync)")?;
             self.nonce += 1;
             self.plain_buf.extend_from_slice(&self.out[..n]);
@@ -257,7 +262,6 @@ mod tests {
     /// break. Walk them explicitly.
     #[tokio::test]
     async fn round_trips_messages_at_every_chunk_boundary() {
-        const HEADER: usize = 4;
         let sizes = [
             0, // header only, no payload
             1,

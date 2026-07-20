@@ -610,7 +610,8 @@ impl<C: Clipboard> SyncEngine<C> {
     /// watcher (see fswatch), which shares this ruleset; the hot path only
     /// touches disk when there's actually a new type to record (and reloads
     /// first, so the append merges onto the user's latest edits rather than
-    /// clobbering them). Recovers a poisoned lock rather than cascading the
+    /// clobbering them). Takes the rules lock via `lock_rules`, which recovers a
+    /// poisoned mutex rather than cascading the
     /// panic to the watcher thread.
     fn apply_mime_rules(&self, offer: Offer, record_unseen: bool) -> Offer {
         let mut rules = lock_rules(&self.mime_rules);
@@ -767,11 +768,11 @@ impl<C: Clipboard> SyncEngine<C> {
                 continue;
             };
             // One-shot consume the echo memo; hash only when a marker exists (the
-            // common genuine-copy path does no hashing here).
-            let is_echo = match self.last_written.lock().unwrap().remove(&kind) {
-                Some(h) => h == content_hash(&raw),
-                None => false,
-            };
+            // common genuine-copy path does no hashing here). The marker comes
+            // out into a local first so the lock isn't held across the hash —
+            // `prime` runs concurrently and touches the same map.
+            let marker = self.last_written.lock().unwrap().remove(&kind);
+            let is_echo = marker.is_some_and(|h| h == content_hash(&raw));
             if cache_reads {
                 read_cache.insert(kind, raw.clone());
             }
@@ -837,7 +838,7 @@ impl<C: Clipboard> SyncEngine<C> {
             // Reconcile against the partner's ACTUAL content (handles out-of-band
             // drift; the partner may be unwatched). Reuse a read from this batch if
             // the partner fired, else read once. A failed read falls through to a
-            // best-effort, self-terminating mirror (matching the old bridge_from).
+            // best-effort, self-terminating mirror.
             let read;
             let partner_now = match read_cache.get(&kind) {
                 Some(o) => Some(o),
@@ -876,11 +877,12 @@ impl<C: Clipboard> SyncEngine<C> {
     /// user tuned it — and a peer can't make us persist a file larger than that.
     /// Warns (naming the limit) when it doesn't fit, so an oversized file is
     /// diagnosable on both the send and receive sides.
-    fn rules_body_ok(&self, len: usize, context: &str) -> bool {
+    fn rules_body_ok(&self, len: usize, context: impl FnOnce() -> String) -> bool {
         let limit = self.cfg.max_payload_size;
         if len > limit {
             warn!(
-                "MIME-rules file{context} is {} (over the {} max_payload_size limit); skipping it",
+                "MIME-rules file{} is {} (over the {} max_payload_size limit); skipping it",
+                context(),
                 human_bytes(len),
                 human_bytes(limit),
             );
@@ -916,7 +918,7 @@ impl<C: Clipboard> SyncEngine<C> {
             }
             (stamp, origin, rules.body())
         };
-        if !self.rules_body_ok(body.len(), &format!(" for peer {peer}")) {
+        if !self.rules_body_ok(body.len(), || format!(" for peer {peer}")) {
             return;
         }
         debug!("pushing shared MIME-rules to peer {peer} (stamp {stamp})");
@@ -1134,7 +1136,7 @@ impl<C: Clipboard> SyncEngine<C> {
             // make version() outrank what peers actually have, and be lost on a
             // restart).
             let body = rules.body();
-            if !self.rules_body_ok(body.len(), "") || !rules.persist() {
+            if !self.rules_body_ok(body.len(), String::new) || !rules.persist() {
                 rules.revert_to_loaded();
                 return;
             }
@@ -1160,7 +1162,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // Reject an oversized body before parsing/persisting it: a peer must not
         // be able to make us write a huge file (the send-side cap only bounds
         // what WE send).
-        if !self.rules_body_ok(body.len(), &format!(" from peer {from}")) {
+        if !self.rules_body_ok(body.len(), || format!(" from peer {from}")) {
             return;
         }
         if !self.accept_stamp(stamp, from, "MIME-rules") {
@@ -3021,10 +3023,7 @@ mod tests {
         let h = start(cfg).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         h.mesh.register(Uuid::new_v4(), tx2);
-        let _ = timeout(Duration::from_secs(1), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let _ = recv_from(&mut rx2).await;
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
             body.contains("version ="),
