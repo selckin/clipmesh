@@ -64,6 +64,25 @@ pub struct MimeRule {
     pub max_size: Option<usize>,
 }
 
+/// A rules-file version and body that are durably on disk together.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub version: Version,
+    pub body: String,
+}
+
+/// Why a snapshot could not be taken. In every case the in-memory rules have
+/// been rolled back, so nothing announces a version that isn't persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The rendered body exceeds the caller's limit.
+    TooLarge { len: usize },
+    /// Writing the file failed.
+    WriteFailed,
+}
+
+pub type SnapshotResult = Result<Snapshot, SnapshotError>;
+
 /// One entry in the `--rules` overlap report.
 /// What a rule (or an overlapping rule) decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,7 +477,7 @@ impl MimeRules {
     /// read or wrote (`loaded`). Used to roll back a stamp bump or an adoption
     /// after a failed `persist`, so the in-memory rules never silently diverge
     /// from what's on disk (which would otherwise be lost on restart).
-    pub fn revert_to_loaded(&mut self) {
+    fn revert_to_loaded(&mut self) {
         self.doc = match self.loaded.as_deref() {
             Some(text) => text.parse().unwrap_or_default(),
             None => DocumentMut::new(),
@@ -489,7 +508,7 @@ impl MimeRules {
     }
 
     /// Whether the managed version is recorded in the file.
-    pub fn has_version_header(&self) -> bool {
+    fn has_version_header(&self) -> bool {
         self.doc
             .get("clipmesh")
             .and_then(|c| c.get("version"))
@@ -498,12 +517,50 @@ impl MimeRules {
 
     /// Set (or replace) the managed version in the `[clipmesh]` table and mark
     /// dirty.
-    pub fn set_version(&mut self, v: Version) {
+    fn set_version(&mut self, v: Version) {
         let cm = table_mut(&mut self.doc, "clipmesh");
         // TOML integers are i64; HLC stamps are wall-clock-ms bounded so they fit.
         cm["version"] = value(v.stamp as i64);
         cm["origin"] = value(v.origin.to_string());
         self.dirty = true;
+    }
+
+    /// Stamp `version`, persist, and return the durable result.
+    ///
+    /// The whole point is that a version is never announced before it is on
+    /// disk: a stamp we kept but failed to write would outrank what peers
+    /// actually have, then vanish on restart, leaving the mesh converged on a
+    /// version nobody holds. Every failure path rolls the in-memory document
+    /// back to what was last loaded.
+    pub fn snapshot_at(&mut self, version: Version, max_len: usize) -> SnapshotResult {
+        self.set_version(version);
+        self.finish_snapshot(version, max_len)
+    }
+
+    /// The current version, materialised to disk if no `[clipmesh]` header had
+    /// recorded one yet. Does NOT bump — this pins an existing baseline so it
+    /// can be shared, rather than claiming a newer one.
+    pub fn snapshot_baseline(&mut self, own_id: Uuid, max_len: usize) -> SnapshotResult {
+        let version = self.version(own_id);
+        if !self.has_version_header() {
+            self.set_version(version);
+        }
+        self.finish_snapshot(version, max_len)
+    }
+
+    /// Shared tail: measure the real (post-stamp) body, reject it if oversized,
+    /// persist it, and roll back on any failure.
+    fn finish_snapshot(&mut self, version: Version, max_len: usize) -> SnapshotResult {
+        let body = self.body();
+        if body.len() > max_len {
+            self.revert_to_loaded();
+            return Err(SnapshotError::TooLarge { len: body.len() });
+        }
+        if !self.persist() {
+            self.revert_to_loaded();
+            return Err(SnapshotError::WriteFailed);
+        }
+        Ok(Snapshot { version, body })
     }
 
     /// The rules file's mtime in epoch-ms, or 0 if there is no path or it can't
@@ -1188,6 +1245,60 @@ mod tests {
     /// it impossible to hold a view across the mutation, so this pins the other
     /// half: that recompiling actually picks the change up rather than
     /// reproducing a stale decision.
+    /// The invariant the whole transaction exists for: a version is never left
+    /// in memory unless it reached disk. Announcing one that didn't would
+    /// outrank what peers actually hold, then vanish on restart.
+    #[test]
+    fn a_snapshot_that_cannot_persist_rolls_the_version_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let own = Uuid::from_u128(9);
+        let before = rules.version(own);
+
+        // Way under any sane file, so the body is rejected before the write.
+        let err = rules
+            .snapshot_at(Version::new(9_999, own), 1)
+            .expect_err("a 1-byte limit must reject the body");
+        assert!(matches!(err, SnapshotError::TooLarge { .. }), "{err:?}");
+        assert_eq!(
+            rules.version(own),
+            before,
+            "a rejected snapshot must not leave its version behind"
+        );
+
+        // With room, the same call succeeds and the version sticks.
+        let s = rules
+            .snapshot_at(Version::new(9_999, own), usize::MAX)
+            .expect("should persist");
+        assert_eq!(s.version.stamp, 9_999);
+        assert_eq!(rules.version(own), s.version);
+        assert!(
+            s.body.contains("9999"),
+            "the returned body must carry the version it announces: {}",
+            s.body
+        );
+    }
+
+    /// `snapshot_baseline` pins an existing version rather than claiming a new
+    /// one — it is used to share what we already have, not to win a race.
+    #[test]
+    fn snapshot_baseline_does_not_bump_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        let origin = Uuid::from_u128(3);
+        write(
+            &path,
+            &format!("[clipmesh]\nversion = 42\norigin = \"{origin}\"\n\n[rules]\n"),
+        );
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        let s = rules
+            .snapshot_baseline(Uuid::from_u128(99), usize::MAX)
+            .expect("should persist");
+        assert_eq!(s.version, Version::new(42, origin), "kept, not bumped");
+    }
+
     #[test]
     fn recompiling_after_a_rule_change_sees_the_new_verdict() {
         let dir = tempfile::tempdir().unwrap();

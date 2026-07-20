@@ -1,7 +1,7 @@
 use crate::clipboard::Clipboard;
 use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
-use crate::mime::{lock_rules, MimeRules};
+use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
     content_hash, describe_offer, human_bytes, Message, Offer, SelectionKind, Version,
 };
@@ -985,18 +985,33 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
-    /// Whether a rules-file body is small enough to put on (or accept off) the
-    /// wire. The limit is `max_payload_size`, so the body always fits the
-    /// transport frame (`max_message` = `max_payload_size` + slack) however the
-    /// user tuned it — and a peer can't make us persist a file larger than that.
-    /// Warns (naming the limit) when it doesn't fit, so an oversized file is
-    /// diagnosable on both the send and receive sides.
-    fn rules_body_ok(&self, len: usize, context: impl FnOnce() -> String) -> bool {
+    /// Report a failed snapshot. The transaction itself lives in `MimeRules`;
+    /// the engine only supplies the context (which peer, if any) that makes the
+    /// warning actionable.
+    fn warn_snapshot_failed(&self, e: mime::SnapshotError, context: &str) {
+        match e {
+            mime::SnapshotError::TooLarge { len } => warn!(
+                "MIME-rules file{context} is {} (over the {} max_payload_size limit); skipping it",
+                human_bytes(len),
+                human_bytes(self.cfg.max_payload_size),
+            ),
+            mime::SnapshotError::WriteFailed => warn!(
+                "couldn't write the MIME-rules file{context}; not announcing a version we didn't persist"
+            ),
+        }
+    }
+
+    /// Whether a rules body arriving from a peer is small enough to accept.
+    ///
+    /// Checked before parsing or persisting, so a peer can't make us do work —
+    /// or write a file — larger than `max_payload_size`. The send side is
+    /// bounded by the same limit inside `MimeRules::snapshot_at`, which measures
+    /// the rendered body rather than this one.
+    fn inbound_rules_body_ok(&self, len: usize, from: Uuid) -> bool {
         let limit = self.cfg.max_payload_size;
         if len > limit {
             warn!(
-                "MIME-rules file{} is {} (over the {} max_payload_size limit); skipping it",
-                context(),
+                "MIME-rules file from peer {from} is {} (over the {} max_payload_size limit); skipping it",
                 human_bytes(len),
                 human_bytes(limit),
             );
@@ -1015,38 +1030,25 @@ impl<C: Clipboard> SyncEngine<C> {
             return;
         }
         let own_id = self.mesh.own_id();
-        let (version, body) = {
-            let mut rules = lock_rules(&self.mime_rules);
-            // Read the version once; set_version below stores exactly this, so
-            // it is also what we send.
-            let version = rules.version(own_id);
-            if !rules.has_version_header() {
-                // Pin the current (baseline) version to disk; do NOT bump. If
-                // the write fails, roll back and don't push a version we didn't
-                // durably persist (consistent with on_local_rules_changed).
-                rules.set_version(version);
-                if !rules.persist() {
-                    rules.revert_to_loaded();
-                    return;
-                }
+        let snapshot =
+            lock_rules(&self.mime_rules).snapshot_baseline(own_id, self.cfg.max_payload_size);
+        match snapshot {
+            Ok(s) => {
+                debug!(
+                    "pushing shared MIME-rules to peer {peer} (stamp {})",
+                    s.version.stamp
+                );
+                self.mesh.send_to(
+                    peer,
+                    &Message::Rules {
+                        stamp: s.version.stamp,
+                        origin: s.version.origin,
+                        body: s.body,
+                    },
+                );
             }
-            (version, rules.body())
-        };
-        if !self.rules_body_ok(body.len(), || format!(" for peer {peer}")) {
-            return;
+            Err(e) => self.warn_snapshot_failed(e, &format!(" for peer {peer}")),
         }
-        debug!(
-            "pushing shared MIME-rules to peer {peer} (stamp {})",
-            version.stamp
-        );
-        self.mesh.send_to(
-            peer,
-            &Message::Rules {
-                stamp: version.stamp,
-                origin: version.origin,
-                body,
-            },
-        );
     }
 
     /// A peer just (re)connected: push our current state so it converges
@@ -1241,29 +1243,19 @@ impl<C: Clipboard> SyncEngine<C> {
         if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
             return;
         }
-        let stamp = self.tick();
-        let origin = self.mesh.own_id();
-        let body = {
-            let mut rules = lock_rules(&self.mime_rules);
-            rules.set_version(Version::new(stamp, origin));
-            // Measure the real (post-stamp) body, then persist. If it's over the
-            // wire limit or the write fails, roll the stamp back: we must not
-            // keep or announce a version that isn't durably on disk (it would
-            // make version() outrank what peers actually have, and be lost on a
-            // restart).
-            let body = rules.body();
-            if !self.rules_body_ok(body.len(), String::new) || !rules.persist() {
-                rules.revert_to_loaded();
-                return;
+        let version = Version::new(self.tick(), self.mesh.own_id());
+        let snapshot = lock_rules(&self.mime_rules).snapshot_at(version, self.cfg.max_payload_size);
+        match snapshot {
+            Ok(s) => {
+                debug!("broadcasting shared MIME-rules (stamp {})", s.version.stamp);
+                self.mesh.broadcast(&Message::Rules {
+                    stamp: s.version.stamp,
+                    origin: s.version.origin,
+                    body: s.body,
+                });
             }
-            body
-        };
-        debug!("broadcasting shared MIME-rules (stamp {stamp})");
-        self.mesh.broadcast(&Message::Rules {
-            stamp,
-            origin,
-            body,
-        });
+            Err(e) => self.warn_snapshot_failed(e, ""),
+        }
     }
 
     /// Adopt a peer's shared MIME-rules file under whole-file last-writer-wins.
@@ -1278,7 +1270,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // Reject an oversized body before parsing/persisting it: a peer must not
         // be able to make us write a huge file (the send-side cap only bounds
         // what WE send).
-        if !self.rules_body_ok(body.len(), || format!(" from peer {from}")) {
+        if !self.inbound_rules_body_ok(body.len(), from) {
             return;
         }
         let incoming = Version::new(stamp, origin);
@@ -1294,15 +1286,14 @@ impl<C: Clipboard> SyncEngine<C> {
                 current.stamp, current.origin
             );
             rules.replace_from(body);
-            // Stamp the adopted version explicitly so version() reflects
-            // (stamp, origin) even if the peer body lacked the header line —
-            // otherwise it would fall back to the new file's mtime and diverge.
-            rules.set_version(Version::new(stamp, origin));
-            if !rules.persist() {
-                // Couldn't durably write the adoption; roll back so memory
-                // matches disk rather than silently diverging (which would be
-                // lost on restart). The peer re-pushes on the next connect.
-                rules.revert_to_loaded();
+            // Stamp the adopted version explicitly so version() reflects it even
+            // if the peer's body lacked the header line — otherwise version()
+            // would fall back to the new file's mtime and diverge. On failure
+            // the snapshot rolls back, so memory matches disk rather than
+            // silently diverging (which a restart would lose); the peer
+            // re-pushes on its next connect.
+            if let Err(e) = rules.snapshot_at(incoming, self.cfg.max_payload_size) {
+                self.warn_snapshot_failed(e, &format!(" from peer {from}"));
             }
         } else {
             debug!(
