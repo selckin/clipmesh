@@ -107,6 +107,20 @@ pub fn encode(msg: &Message) -> Vec<u8> {
     bincode::serialize(msg).expect("message serialization cannot fail")
 }
 
+/// A wire-ready, already-encoded `Message`, shared by refcount.
+///
+/// `Message::Clip` owns its `Offer`, so handing connections a `Message` would
+/// deep-copy a clipboard payload (up to `max_payload_size`, 32 MiB by default)
+/// per peer and re-serialize the identical bytes in every writer task. Encoding
+/// once at the fan-out point and sharing the result costs an atomic increment
+/// per extra peer instead.
+pub type Frame = std::sync::Arc<Vec<u8>>;
+
+/// Encode `msg` once for delivery to one or more connections.
+pub fn encode_frame(msg: &Message) -> Frame {
+    std::sync::Arc::new(encode(msg))
+}
+
 pub fn decode(buf: &[u8]) -> anyhow::Result<Message> {
     Ok(bincode::deserialize(buf)?)
 }

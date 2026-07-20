@@ -128,7 +128,7 @@ where
         return Err(SelfConnection.into());
     }
 
-    let (tx, mut rx) = mpsc::channel::<crate::mesh::Frame>(16);
+    let (tx, mut rx) = mpsc::channel::<protocol::Frame>(16);
     let conn_id = mesh.register(remote_id, tx);
     // Unregister on every exit path, cancellation included.
     let _registration = Registration {
@@ -153,7 +153,7 @@ where
         result
     });
     let mut writer = tokio::spawn(async move {
-        // Frames arrive already encoded (see mesh::Frame).
+        // Frames arrive already encoded (see protocol::Frame).
         while let Some(frame) = rx.recv().await {
             send.send(&frame).await?;
         }

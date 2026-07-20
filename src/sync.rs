@@ -1516,7 +1516,7 @@ mod tests {
     struct Harness {
         clip: Arc<MockClipboard>,
         mesh: Arc<Mesh>,
-        conn_rx: mpsc::Receiver<crate::mesh::Frame>,
+        conn_rx: mpsc::Receiver<crate::protocol::Frame>,
         in_tx: mpsc::Sender<(Uuid, Message)>,
         remote_id: Uuid,
     }
@@ -1579,7 +1579,7 @@ mod tests {
 
     /// Await the next frame on a connection channel and decode it. Connections
     /// carry encoded `mesh::Frame`s, so tests decode to assert on `Message`.
-    async fn recv_from(rx: &mut mpsc::Receiver<crate::mesh::Frame>) -> Message {
+    async fn recv_from(rx: &mut mpsc::Receiver<crate::protocol::Frame>) -> Message {
         let frame = timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("timed out waiting for a frame")

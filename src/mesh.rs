@@ -1,19 +1,10 @@
-use crate::protocol::{self, Message};
+use crate::protocol::{encode_frame, Frame, Message};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-
-/// A wire-ready, already-encoded message handed to a connection's writer task.
-///
-/// Outbound messages are encoded once by the sender and shared by refcount:
-/// `Message::Clip` owns its `Offer`, so passing `Message` down these channels
-/// would deep-copy a clipboard payload (up to `max_payload_size`, 32 MiB by
-/// default) per peer, and every writer task would then bincode the same bytes
-/// again independently.
-pub type Frame = Arc<Vec<u8>>;
 
 struct ConnHandle {
     id: u64,
@@ -106,7 +97,7 @@ impl Mesh {
             return;
         }
         // Encode once; each peer gets a refcount, not a copy of the payload.
-        let frame: Frame = Arc::new(protocol::encode(msg));
+        let frame = encode_frame(msg);
         for (peer, tx) in targets {
             if tx.try_send(frame.clone()).is_err() {
                 warn!("dropped update to peer {peer}: its send queue is full or closed");
@@ -125,7 +116,7 @@ impl Mesh {
             .and_then(|conns| conns.first().map(|c| c.tx.clone()));
         match target {
             Some(tx) => {
-                if tx.try_send(Arc::new(protocol::encode(msg))).is_err() {
+                if tx.try_send(encode_frame(msg)).is_err() {
                     warn!(
                         "dropped targeted message to peer {peer}: its send queue is full or closed"
                     );
@@ -156,7 +147,8 @@ mod tests {
     /// Take the next frame off a connection channel and decode it, so tests can
     /// assert against `Message` values rather than encoded bytes.
     fn recv(rx: &mut mpsc::Receiver<Frame>) -> Message {
-        protocol::decode(&rx.try_recv().expect("no frame queued")).expect("frame did not decode")
+        crate::protocol::decode(&rx.try_recv().expect("no frame queued"))
+            .expect("frame did not decode")
     }
 
     fn new_mesh() -> (std::sync::Arc<Mesh>, mpsc::Receiver<(Uuid, Message)>) {

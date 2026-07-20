@@ -303,29 +303,43 @@ impl MimeRules {
     /// any were added (the caller then [`persist`](Self::persist)s). Returns
     /// whether anything was added.
     pub fn ensure<'a>(&mut self, mimes: impl IntoIterator<Item = &'a String>) -> bool {
+        // Two phases: decide under one compiled view, then mutate. Deciding
+        // per-type against the raw document instead would re-walk (and re-parse)
+        // the whole table once per MIME type — the `reps × rules` cost
+        // `CompiledRules` exists to remove. The view borrows the document, so
+        // the compiler forces it to be dropped before the append.
+        let unseen: Vec<String> = {
+            let compiled = self.compile();
+            mimes
+                .into_iter()
+                // Already covered by an exact key or a matching glob -> leave it.
+                .filter(|m| !compiled.any_match(m))
+                .cloned()
+                .collect()
+        };
+        if unseen.is_empty() {
+            return false;
+        }
         let action = if self.unknown == MimePolicy::Allow {
             "allow"
         } else {
             "deny"
         };
-        let mut added = false;
-        for m in mimes {
-            // Already covered by an exact key or a matching glob -> leave it.
-            if self.any_match(m) {
-                continue;
-            }
+        // A type repeated in `mimes` yields the same key twice; the second write
+        // is identical to the first, so this stays idempotent.
+        for m in &unseen {
             table_mut(&mut self.doc, "rules")[m.as_str()] = value(action);
             debug!("new MIME type {m}: defaulting to {action} (unknown_mime)");
-            added = true;
         }
-        self.dirty |= added;
-        added
+        self.dirty = true;
+        true
     }
 
-    /// Whether any of `mimes` is matched by no rule (and so would be recorded by
-    /// `ensure`). Lets the caller skip touching disk when nothing is new.
+    /// Whether any of `mimes` is matched by no rule. Test-facing shim; the engine
+    /// asks a [`CompiledRules`] directly, since it has one in hand either way.
+    #[cfg(test)]
     pub fn has_unseen<'a>(&self, mimes: impl IntoIterator<Item = &'a String>) -> bool {
-        mimes.into_iter().any(|m| !self.any_match(m))
+        self.compile().has_unseen(mimes)
     }
 
     /// Remove every `[rules]` entry whose key the glob `pattern` matches
@@ -520,18 +534,12 @@ impl MimeRules {
         }
     }
 
-    /// Whether a `size`-byte representation of `mime` may sync. Compiles the
-    /// table for this one lookup; prefer [`MimeRules::compile`] for a batch.
+    /// Whether a `size`-byte representation of `mime` may sync. Test-facing
+    /// shim that compiles the table for one lookup; production classifies a
+    /// whole offer against a single [`CompiledRules`].
+    #[cfg(test)]
     pub fn allows(&self, mime: &str, size: usize) -> bool {
         self.compile().allows(mime, size)
-    }
-
-    /// Whether any rule key matches `mime` (exact or glob, case-insensitive),
-    /// regardless of whether its value is a valid rule — so `ensure` doesn't
-    /// append a default for a type already covered by a key (even a typo'd one).
-    fn any_match(&self, mime: &str) -> bool {
-        self.rules_table()
-            .is_some_and(|t| t.iter().any(|(k, _)| glob_match(k, mime)))
     }
 
     fn rules_table(&self) -> Option<&Table> {
