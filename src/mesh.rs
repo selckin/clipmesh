@@ -1,4 +1,4 @@
-use crate::protocol::Message;
+use crate::protocol::{self, Message};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6,9 +6,18 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// A wire-ready, already-encoded message handed to a connection's writer task.
+///
+/// Outbound messages are encoded once by the sender and shared by refcount:
+/// `Message::Clip` owns its `Offer`, so passing `Message` down these channels
+/// would deep-copy a clipboard payload (up to `max_payload_size`, 32 MiB by
+/// default) per peer, and every writer task would then bincode the same bytes
+/// again independently.
+pub type Frame = Arc<Vec<u8>>;
+
 struct ConnHandle {
     id: u64,
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<Frame>,
 }
 
 /// Live peer table. Connections are grouped by remote node ID; index 0 in
@@ -44,7 +53,7 @@ impl Mesh {
     }
 
     /// Add a connection for a peer; returns its connection ID.
-    pub fn register(&self, remote: Uuid, tx: mpsc::Sender<Message>) -> u64 {
+    pub fn register(&self, remote: Uuid, tx: mpsc::Sender<Frame>) -> u64 {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let first_connection = {
             let mut peers = self.peers.lock().unwrap();
@@ -85,7 +94,7 @@ impl Mesh {
     /// a stalled peer drops the update rather than blocking the rest (the
     /// next clipboard change supersedes it anyway).
     pub fn broadcast(&self, msg: &Message) {
-        let targets: Vec<(Uuid, mpsc::Sender<Message>)> = self
+        let targets: Vec<(Uuid, mpsc::Sender<Frame>)> = self
             .peers
             .lock()
             .unwrap()
@@ -93,8 +102,13 @@ impl Mesh {
             .filter_map(|(id, conns)| conns.first().map(|c| (*id, c.tx.clone())))
             .collect();
         debug!("broadcasting clipboard update to {} peer(s)", targets.len());
+        if targets.is_empty() {
+            return;
+        }
+        // Encode once; each peer gets a refcount, not a copy of the payload.
+        let frame: Frame = Arc::new(protocol::encode(msg));
         for (peer, tx) in targets {
-            if tx.try_send(msg.clone()).is_err() {
+            if tx.try_send(frame.clone()).is_err() {
                 warn!("dropped update to peer {peer}: its send queue is full or closed");
             }
         }
@@ -111,7 +125,7 @@ impl Mesh {
             .and_then(|conns| conns.first().map(|c| c.tx.clone()));
         match target {
             Some(tx) => {
-                if tx.try_send(msg.clone()).is_err() {
+                if tx.try_send(Arc::new(protocol::encode(msg))).is_err() {
                     warn!(
                         "dropped targeted message to peer {peer}: its send queue is full or closed"
                     );
@@ -138,6 +152,12 @@ mod tests {
     use crate::protocol::Message;
     use tokio::sync::mpsc;
     use uuid::Uuid;
+
+    /// Take the next frame off a connection channel and decode it, so tests can
+    /// assert against `Message` values rather than encoded bytes.
+    fn recv(rx: &mut mpsc::Receiver<Frame>) -> Message {
+        protocol::decode(&rx.try_recv().expect("no frame queued")).expect("frame did not decode")
+    }
 
     fn new_mesh() -> (std::sync::Arc<Mesh>, mpsc::Receiver<(Uuid, Message)>) {
         let (tx, rx) = mpsc::channel(8);
@@ -178,7 +198,7 @@ mod tests {
         mesh.register(peer_a, tx_a);
         mesh.register(peer_b, tx_b);
         mesh.send_to(peer_a, &clip("targeted"));
-        assert_eq!(rx_a.try_recv().unwrap(), clip("targeted"));
+        assert_eq!(recv(&mut rx_a), clip("targeted"));
         assert!(rx_b.try_recv().is_err());
     }
 
@@ -192,7 +212,7 @@ mod tests {
         let _c2 = mesh.register(peer, tx2);
 
         mesh.broadcast(&clip("a"));
-        assert_eq!(rx1.try_recv().unwrap(), clip("a"));
+        assert_eq!(recv(&mut rx1), clip("a"));
         assert!(
             rx2.try_recv().is_err(),
             "standby connection must not receive sends"
@@ -201,7 +221,7 @@ mod tests {
         // failover: drop the designated connection, standby is promoted
         mesh.unregister(peer, c1);
         mesh.broadcast(&clip("b"));
-        assert_eq!(rx2.try_recv().unwrap(), clip("b"));
+        assert_eq!(recv(&mut rx2), clip("b"));
     }
 
     #[tokio::test]
@@ -213,8 +233,8 @@ mod tests {
         mesh.register(Uuid::new_v4(), tx_b);
 
         mesh.broadcast(&clip("x"));
-        assert_eq!(rx_a.try_recv().unwrap(), clip("x"));
-        assert_eq!(rx_b.try_recv().unwrap(), clip("x"));
+        assert_eq!(recv(&mut rx_a), clip("x"));
+        assert_eq!(recv(&mut rx_b), clip("x"));
         assert!(rx_a.try_recv().is_err());
         assert!(rx_b.try_recv().is_err());
     }

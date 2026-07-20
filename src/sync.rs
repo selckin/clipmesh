@@ -1490,7 +1490,7 @@ mod tests {
     struct Harness {
         clip: Arc<MockClipboard>,
         mesh: Arc<Mesh>,
-        conn_rx: mpsc::Receiver<Message>,
+        conn_rx: mpsc::Receiver<crate::mesh::Frame>,
         in_tx: mpsc::Sender<(Uuid, Message)>,
         remote_id: Uuid,
     }
@@ -1548,10 +1548,17 @@ mod tests {
     }
 
     async fn recv_msg(h: &mut Harness) -> Message {
-        timeout(Duration::from_secs(1), h.conn_rx.recv())
+        recv_from(&mut h.conn_rx).await
+    }
+
+    /// Await the next frame on a connection channel and decode it. Connections
+    /// carry encoded `mesh::Frame`s, so tests decode to assert on `Message`.
+    async fn recv_from(rx: &mut mpsc::Receiver<crate::mesh::Frame>) -> Message {
+        let frame = timeout(Duration::from_secs(1), rx.recv())
             .await
-            .unwrap()
-            .unwrap()
+            .expect("timed out waiting for a frame")
+            .expect("connection channel closed");
+        crate::protocol::decode(&frame).expect("frame did not decode")
     }
 
     #[tokio::test]
@@ -2308,10 +2315,7 @@ mod tests {
         let (tx2, mut rx2) = mpsc::channel(8);
         let peer2 = Uuid::new_v4();
         h.mesh.register(peer2, tx2);
-        let msg = timeout(Duration::from_secs(1), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let msg = recv_from(&mut rx2).await;
         match msg {
             Message::Clip { offer: o, .. } => assert_eq!(o, offer("current")),
             other => panic!("expected resync Clip, got {other:?}"),
@@ -2522,11 +2526,7 @@ mod tests {
         let h = start_seeded(Config::for_test("s"), Some(offer("restored"))).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         h.mesh.register(Uuid::new_v4(), tx2);
-        match timeout(Duration::from_secs(1), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
+        match recv_from(&mut rx2).await {
             Message::Clip {
                 offer: o, stamp, ..
             } => {
@@ -2957,10 +2957,7 @@ mod tests {
         // a new peer joins; it must receive our rules file
         let (tx2, mut rx2) = mpsc::channel(8);
         h.mesh.register(Uuid::new_v4(), tx2);
-        let msg = timeout(Duration::from_secs(1), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let msg = recv_from(&mut rx2).await;
         match msg {
             Message::Rules { body, .. } => {
                 assert!(body.contains("\"image/png\" = \"allow\""), "body:\n{body}")
@@ -2982,10 +2979,7 @@ mod tests {
         let h = start(cfg).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         h.mesh.register(Uuid::new_v4(), tx2);
-        let msg = timeout(Duration::from_secs(1), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let msg = recv_from(&mut rx2).await;
         assert!(
             matches!(msg, Message::Rules { .. }),
             "rules push must ignore direction/resync_on_connect"
