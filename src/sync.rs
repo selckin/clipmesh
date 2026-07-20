@@ -721,16 +721,36 @@ impl<C: Clipboard> SyncEngine<C> {
             "adopted the existing {kind:?} clipboard ({})",
             describe_offer(content.offer())
         );
-        // or_insert: an inbound apply may already have recorded newer content
-        // for this selection — don't clobber it with stamp-0 restored content.
-        self.current
-            .lock()
-            .unwrap()
-            .entry(kind)
-            .or_insert(ContentState {
-                hash: content.hash(),
-                version: Version::new(0, self.mesh.own_id()),
-            });
+        // The backend's report is authoritative about what the selection holds,
+        // so it replaces a record of content that is no longer there. Only an
+        // entry naming this *same* content is kept, because its version may have
+        // been raised above 0 by an inbound apply and re-seeding it at 0 would
+        // throw that away.
+        //
+        // Keying on absence instead — `or_insert` — silently dropped every
+        // `Initial` after the first, and the watcher is supervised: a compositor
+        // restart re-subscribes and re-reports. A copy made while it was down
+        // then left `current` naming content the clipboard no longer had, and a
+        // peer resyncing that stale content matched the recorded hash, logged
+        // "already our current content" and wrote nothing — two hosts showing
+        // different clipboards with no further event able to correct them.
+        //
+        // The remaining race is the one `or_insert` was reaching for: an inbound
+        // apply landing between the subscribe and this event makes the `Initial`
+        // snapshot stale, and it is overwritten here. That direction self-heals —
+        // the hash no longer matches, so the peer's next resync applies instead
+        // of being suppressed — which is why it is the safer way to be wrong.
+        let mut current = self.current.lock().unwrap();
+        let already_recorded = current.get(&kind).is_some_and(|s| s.hash == content.hash());
+        if !already_recorded {
+            current.insert(
+                kind,
+                ContentState {
+                    hash: content.hash(),
+                    version: Version::new(0, self.mesh.own_id()),
+                },
+            );
+        }
     }
 
     /// Whether this offer must be withheld because the user opted to exclude
@@ -808,8 +828,15 @@ impl<C: Clipboard> SyncEngine<C> {
                     // has nothing new, and building the compiled view here would
                     // be thrown away and rebuilt below anyway.
                     if rules.has_unseen(content.offer().keys()) {
-                        rules.reload_if_changed();
-                        appended = rules.ensure(content.offer().keys());
+                        // An external edit adopted here counts as a change this
+                        // node hasn't shared yet, and this is the only chance to
+                        // say so: adopting it updates `loaded`, so the fswatch
+                        // event that follows compares equal and reports nothing.
+                        // Discarding this answer left the edit applied locally
+                        // but never broadcast — the mesh-wide drift that
+                        // whole-file sharing exists to prevent.
+                        appended = rules.reload_if_changed();
+                        appended |= rules.ensure(content.offer().keys());
                     }
                     // No-op unless something is unsaved (incl. retrying a failed write).
                     rules.persist();
@@ -3620,6 +3647,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_restarted_watcher_re_adopts_what_the_clipboard_now_holds() {
+        // The clipboard watcher is supervised, so a compositor restart
+        // re-subscribes and re-reports every selection as `Initial`. If the user
+        // copied while it was down, that report is the only notice of what the
+        // clipboard actually holds — dropping it left `current` naming content
+        // that is gone, and a peer resyncing that stale content then matched the
+        // recorded hash, wrote nothing, and the two hosts stayed divergent.
+        let kind = SelectionKind::Clipboard;
+        let e = engine(MockClipboard::new(), Config::for_test("s")).engine;
+
+        e.adopt_restored(kind, Hashed::new(offer("old"))).await;
+        assert_eq!(
+            e.current.lock().unwrap()[&kind].hash,
+            content_hash(&offer("old"))
+        );
+
+        e.adopt_restored(kind, Hashed::new(offer("new"))).await;
+        assert_eq!(
+            e.current.lock().unwrap()[&kind].hash,
+            content_hash(&offer("new")),
+            "the restarted watcher's report of the live clipboard was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_adopting_the_same_content_keeps_the_version_it_already_had() {
+        // What `or_insert` was reaching for, and what replacing it must not lose:
+        // an inbound apply may have recorded this exact content above stamp 0,
+        // and re-seeding it at 0 would let a peer's older clipboard outrank it.
+        let kind = SelectionKind::Clipboard;
+        let e = engine(MockClipboard::new(), Config::for_test("s")).engine;
+        let applied = Version::new(9_000, Uuid::from_u128(7));
+        e.current.lock().unwrap().insert(
+            kind,
+            ContentState {
+                hash: content_hash(&offer("same")),
+                version: applied,
+            },
+        );
+
+        e.adopt_restored(kind, Hashed::new(offer("same"))).await;
+        assert_eq!(
+            e.current.lock().unwrap()[&kind].version,
+            applied,
+            "re-reporting unchanged content reset its version to 0"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_peers_unparseable_rules_body_does_not_take_its_version() {
         // `replace_from` refuses a body that isn't TOML and leaves our rules
@@ -3702,6 +3778,51 @@ mod tests {
         assert!(
             saw_rules,
             "capturing a new type should broadcast the rules file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_external_rules_edit_adopted_on_the_capture_path_is_shared() {
+        // The capture path reloads the rules file when it sees an unseen type,
+        // and that reload can be the first thing to notice an external edit
+        // (`--allow`, or a human with an editor). Its answer was discarded, and
+        // it is the only chance to act on it: adopting the file updates
+        // `loaded`, so the fswatch event that follows compares equal and reports
+        // nothing either. The node then used the new rule locally and never
+        // broadcast it — peers kept the old ruleset indefinitely.
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let (_dir, path) = with_rules(&mut cfg, MimePolicy::Deny, &[("text/plain", "allow")]);
+        let mut h = start(cfg).await;
+
+        // An external edit lands before the watcher thread processes it.
+        std::fs::write(
+            &path,
+            rules_toml(&[("text/plain", "allow"), ("image/webp", "allow")]),
+        )
+        .unwrap();
+        // ...and a copy of the newly-allowed type arrives first. `image/webp` is
+        // unseen in the stale in-memory table, so the capture path reloads.
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[("image/webp", b"webp")]),
+        );
+
+        let mut saw_rules = false;
+        for _ in 0..3 {
+            match recv_msg(&mut h).await {
+                Message::Rules { body, .. } => {
+                    assert!(body.contains("image/webp"), "body:\n{body}");
+                    saw_rules = true;
+                    break;
+                }
+                Message::Clip { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(
+            saw_rules,
+            "an adopted external edit was never shared with the mesh"
         );
     }
 
