@@ -86,6 +86,28 @@ fn is_content_type(mime: &str) -> bool {
     mime.contains('/') || matches!(mime, "STRING" | "UTF8_STRING" | "TEXT" | "COMPOUND_TEXT")
 }
 
+/// ICCCM selection targets that are protocol machinery rather than content, and
+/// that no source ever serves as data — reading one always fails.
+///
+/// Worth naming explicitly because a read is not cheap here: every
+/// representation costs its own Wayland connection (see `read_offer_blocking`),
+/// so attempting these spends a full connect-and-roundtrip per selection just to
+/// be told no. Skipping them is exactly equivalent — a failed read is dropped
+/// from the offer anyway — but does not pay for the answer.
+///
+/// Deliberately an exact list rather than "anything `!is_content_type`": an
+/// unrecognised slashless atom might genuinely carry data, and is still attempted
+/// (its failure is logged at debug, as before).
+const SELECTION_MACHINERY: [&str; 7] = [
+    "TARGETS",
+    "TIMESTAMP",
+    "MULTIPLE",
+    "SAVE_TARGETS",
+    "DELETE",
+    "INSERT_SELECTION",
+    "INSERT_PROPERTY",
+];
+
 /// Build an `Offer` from the advertised `types`, reading each with `read`
 /// (given the mime and remaining byte budget; it may read up to budget+1 so we
 /// can detect overflow). Returns the offer and its total byte size. A
@@ -135,6 +157,10 @@ fn assemble_offer(
         // the budget and could wrongly evict a later rep (the HashSet path used
         // to dedup for free).
         if offer.contains_key(&mime) {
+            continue;
+        }
+        if SELECTION_MACHINERY.contains(&mime.as_str()) {
+            debug!("skipping clipboard type {mime}: a selection target, never content");
             continue;
         }
         // saturating_sub: total never exceeds max here, but guard against a
@@ -296,6 +322,44 @@ mod tests {
         ] {
             assert!(!is_content_type(m), "{m} should not be content");
         }
+    }
+
+    #[test]
+    fn assemble_offer_never_spends_a_read_on_selection_machinery() {
+        // Each read costs a whole Wayland connection, and these targets always
+        // fail, so the cost buys nothing. Assert they are never attempted rather
+        // than merely absent from the result.
+        let mut attempted: Vec<String> = Vec::new();
+        let (offer, total) = assemble_offer(
+            [
+                "TARGETS".to_string(),
+                "TIMESTAMP".to_string(),
+                "MULTIPLE".to_string(),
+                "SAVE_TARGETS".to_string(),
+                "text/plain".to_string(),
+            ],
+            1024,
+            |mime, _| {
+                attempted.push(mime.to_string());
+                Ok(b"hi".to_vec())
+            },
+        );
+        assert_eq!(attempted, vec!["text/plain"], "a selection target was read");
+        assert_eq!(offer.len(), 1);
+        assert_eq!(total, "text/plain".len() + 2);
+    }
+
+    #[test]
+    fn assemble_offer_still_attempts_an_unrecognised_atom() {
+        // Only the known machinery is skipped: an app-specific slashless atom
+        // might genuinely carry data, so it is still tried.
+        let mut attempted: Vec<String> = Vec::new();
+        let (offer, _) = assemble_offer(["MY_APP_DATA".to_string()], 1024, |mime, _| {
+            attempted.push(mime.to_string());
+            Ok(b"payload".to_vec())
+        });
+        assert_eq!(attempted, vec!["MY_APP_DATA"]);
+        assert!(offer.contains_key("MY_APP_DATA"));
     }
 
     #[test]
