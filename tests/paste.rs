@@ -2,32 +2,15 @@
 //! the current clipboard from an in-process node over the real Noise handshake +
 //! resync-on-connect path, using the mock clipboard (no Wayland needed).
 
+mod common;
+
 use clipmesh::clipboard::mock::MockClipboard;
 use clipmesh::config::Config;
-use clipmesh::node::{spawn_node, NodeHandle};
 use clipmesh::paste::{fetch_from_any, fetch_offer};
 use clipmesh::protocol::{Offer, SelectionKind};
-use std::sync::Arc;
+use common::{offer, start};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
-
-fn offer(text: &str) -> Offer {
-    [("text/plain".to_string(), text.as_bytes().to_vec())]
-        .into_iter()
-        .collect()
-}
-
-async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
-    let node = spawn_node(Arc::new(cfg), clip.clone())
-        .await
-        .expect("node failed to start");
-    // don't proceed before the engine is subscribed, or an immediate local_copy
-    // can fire into the void
-    while clip.watcher_count() == 0 {
-        tokio::task::yield_now().await;
-    }
-    node
-}
 
 /// Retry `fetch_offer` until the node has recorded the copy and resyncs it.
 /// Avoids a connect-before-record race: each attempt is a fresh connect, and the

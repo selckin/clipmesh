@@ -1,44 +1,11 @@
+mod common;
+
 use clipmesh::clipboard::mock::MockClipboard;
 use clipmesh::config::Config;
-use clipmesh::node::{spawn_node, NodeHandle};
-use clipmesh::protocol::{Offer, SelectionKind};
-use std::sync::Arc;
+use clipmesh::protocol::SelectionKind;
+use common::{offer, reserve_port, start, wait_for};
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
-
-fn offer(text: &str) -> Offer {
-    [("text/plain".to_string(), text.as_bytes().to_vec())]
-        .into_iter()
-        .collect()
-}
-
-async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
-    timeout(Duration::from_secs(10), async {
-        while !cond() {
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
-}
-
-async fn start(cfg: Config, clip: Arc<MockClipboard>) -> NodeHandle {
-    let node = spawn_node(Arc::new(cfg), clip.clone())
-        .await
-        .expect("node failed to start");
-    // don't return before the engine is subscribed, or an immediate
-    // local_copy can fire into the void
-    while clip.watcher_count() == 0 {
-        tokio::task::yield_now().await;
-    }
-    node
-}
-
-/// Reserve a free port by binding and dropping (small reuse race, fine for tests).
-fn reserve_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+use tokio::time::sleep;
 
 #[tokio::test]
 async fn clipboard_syncs_both_ways_without_echo_storms() {

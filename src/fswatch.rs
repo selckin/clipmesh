@@ -502,6 +502,25 @@ mod tests {
     use crate::config::MimePolicy;
     use std::time::{Duration, Instant};
 
+    /// Poll `done` until it holds, running `poke` before each check, and panic
+    /// with `what` if it never does.
+    ///
+    /// The poke is *repeated* on purpose: registering an inotify watch races the
+    /// test thread, so a single write can land before the watch is live and be
+    /// missed forever. Re-poking each round is what makes these tests
+    /// deterministic rather than flaky. Pass a no-op poke to wait passively.
+    fn poll_until(mut poke: impl FnMut(), mut done: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            poke();
+            if done() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{what}");
+    }
+
     #[test]
     fn target_site_resolves_a_symlinked_file_to_its_real_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -582,15 +601,11 @@ mod tests {
         });
 
         // Edit the REAL file (in the dotfiles dir), not the symlink path.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-            if rx.try_recv().is_ok() {
-                return; // ping received — the symlink target dir is watched
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("editing the symlink target did not ping the engine");
+        poll_until(
+            || std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "editing the symlink target did not ping the engine",
+        );
     }
 
     #[test]
@@ -616,15 +631,11 @@ mod tests {
         });
 
         // 1. Establish the watch is live: rewrite until a ping lands, then drain.
-        let live = Instant::now() + Duration::from_secs(5);
-        loop {
-            assert!(Instant::now() < live, "watcher never went live");
-            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap();
-            if rx.try_recv().is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        poll_until(
+            || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"deny\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "watcher never went live",
+        );
         while rx.try_recv().is_ok() {}
 
         // 2. Delete, then create-and-HOLD: a bare CREATE with no close yet.
@@ -639,14 +650,11 @@ mod tests {
         // 3. Write content + close → CLOSE_WRITE must ping.
         write!(f, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
         drop(f);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if rx.try_recv().is_ok() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("the CLOSE_WRITE after writing content should have pinged");
+        poll_until(
+            || {},
+            || rx.try_recv().is_ok(),
+            "the CLOSE_WRITE after writing content should have pinged",
+        );
     }
 
     #[test]
@@ -682,15 +690,11 @@ mod tests {
         });
 
         // Let the watch go live on A (edit A until a ping lands), then drain.
-        let live = Instant::now() + Duration::from_secs(5);
-        loop {
-            assert!(Instant::now() < live, "watcher never went live on A");
-            std::fs::write(&a, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-            if rx.try_recv().is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        poll_until(
+            || std::fs::write(&a, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "watcher never went live on A",
+        );
         while rx.try_recv().is_ok() {}
 
         // Repoint the symlink to B (ln -sf = unlink + symlink → CREATE at link site).
@@ -700,15 +704,11 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Now edits to B must ping — only possible if B's dir is being watched.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            std::fs::write(&b, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-            if rx.try_recv().is_ok() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("edits to the repointed target B were not picked up");
+        poll_until(
+            || std::fs::write(&b, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "edits to the repointed target B were not picked up",
+        );
     }
 
     #[test]
@@ -741,15 +741,11 @@ mod tests {
         });
 
         // Edit the REAL config file (in the dotfiles dir), not the symlink path.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            std::fs::write(&real_config, "listen = \"y\"\npsk = \"s\"\n").unwrap();
-            if fired.load(Ordering::SeqCst) {
-                return; // on_config_change fired — the config symlink target is watched
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("editing the symlinked config target did not trigger on_config_change");
+        poll_until(
+            || std::fs::write(&real_config, "listen = \"y\"\npsk = \"s\"\n").unwrap(),
+            || fired.load(Ordering::SeqCst),
+            "editing the symlinked config target did not trigger on_config_change",
+        );
     }
 
     #[test]
@@ -786,16 +782,14 @@ mod tests {
         // reconcile_target, adding the first target entry) and reloads the rules.
         std::fs::create_dir(&dotfiles).unwrap();
         std::fs::write(&real_rules, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink(&real_rules, &link).unwrap();
-            if rx.try_recv().is_ok() {
-                return; // re-resolved + reloaded after repair — self-heal works
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("the repaired broken symlink was not picked up");
+        poll_until(
+            || {
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(&real_rules, &link).unwrap();
+            },
+            || rx.try_recv().is_ok(),
+            "the repaired broken symlink was not picked up",
+        );
     }
 
     #[test]
@@ -860,15 +854,11 @@ mod tests {
             let _ = run(&cfg_w, Some(&rules_path_w), &rules_w, &mut noop, &tx_w);
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-            if rx.try_recv().is_ok() {
-                return; // got a ping — success
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("editing the rules file did not ping the engine");
+        poll_until(
+            || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "editing the rules file did not ping the engine",
+        );
     }
 
     #[test]
@@ -898,17 +888,11 @@ mod tests {
 
         // Establish the watch and confirm a real change pings (this also makes
         // the watcher's loaded snapshot become "image/png allow\n").
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if Instant::now() >= deadline {
-                panic!("watcher never delivered the initial change ping");
-            }
-            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-            if rx.try_recv().is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        poll_until(
+            || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rx.try_recv().is_ok(),
+            "watcher never delivered the initial change ping",
+        );
         // Drain any further pings from the establishment phase.
         while rx.try_recv().is_ok() {}
 
@@ -948,14 +932,10 @@ mod tests {
         // and writing once: if the watch isn't registered yet, a later write's
         // CLOSE_WRITE is still caught once it is — no timing assumption, so the
         // test isn't flaky under load.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap();
-            if rules.lock().unwrap().allows("image/png", 1) {
-                return; // reloaded — success
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("rules file change was not picked up by the inotify watcher");
+        poll_until(
+            || std::fs::write(&rules_path, "[rules]\n\"image/png\" = \"allow\"\n").unwrap(),
+            || rules.lock().unwrap().allows("image/png", 1),
+            "rules file change was not picked up by the inotify watcher",
+        );
     }
 }

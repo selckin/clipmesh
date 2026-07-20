@@ -316,13 +316,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn offer(pairs: &[(&str, &[u8])]) -> Offer {
-        pairs
-            .iter()
-            .map(|(m, d)| (m.to_string(), d.to_vec()))
-            .collect()
-    }
+    use crate::protocol::test_support::offer;
 
     // ---- select_type ----
 

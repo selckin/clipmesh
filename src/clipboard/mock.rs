@@ -103,13 +103,8 @@ impl Clipboard for MockClipboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::test_support::text_offer as offer;
     use crate::protocol::SelectionKind;
-
-    fn offer(text: &str) -> crate::protocol::Offer {
-        [("text/plain".to_string(), text.as_bytes().to_vec())]
-            .into_iter()
-            .collect()
-    }
 
     #[tokio::test]
     async fn local_copy_notifies_watchers_and_updates_state() {

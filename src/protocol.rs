@@ -111,17 +111,48 @@ pub fn decode(buf: &[u8]) -> anyhow::Result<Message> {
     Ok(bincode::deserialize(buf)?)
 }
 
+/// Offer/message builders shared by the unit tests across the crate.
+///
+/// Not reachable from `tests/*.rs` — those compile the library without
+/// `cfg(test)` and have their own `tests/common`. Keeping these `cfg(test)`
+/// keeps them out of the public API.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::{content_hash, Message, Offer, SelectionKind};
     use uuid::Uuid;
 
-    fn offer(pairs: &[(&str, &[u8])]) -> Offer {
+    /// An offer with the given MIME/bytes pairs, in the order given.
+    pub(crate) fn offer(pairs: &[(&str, &[u8])]) -> Offer {
         pairs
             .iter()
             .map(|(m, d)| (m.to_string(), d.to_vec()))
             .collect()
     }
+
+    /// A single-representation `text/plain` offer.
+    pub(crate) fn text_offer(text: &str) -> Offer {
+        offer(&[("text/plain", text.as_bytes())])
+    }
+
+    /// A `Clip` carrying `text`, stamped at the bottom of the clock so tests
+    /// that care about ordering must set it explicitly.
+    pub(crate) fn clip(text: &str) -> Message {
+        let offer = text_offer(text);
+        Message::Clip {
+            kind: SelectionKind::Clipboard,
+            hash: content_hash(&offer),
+            offer,
+            stamp: 0,
+            origin: Uuid::nil(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::offer;
+    use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn content_hash_is_deterministic_and_order_independent() {

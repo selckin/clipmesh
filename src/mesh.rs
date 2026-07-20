@@ -134,22 +134,10 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{content_hash, Message, Offer, SelectionKind};
+    use crate::protocol::test_support::clip;
+    use crate::protocol::Message;
     use tokio::sync::mpsc;
     use uuid::Uuid;
-
-    fn clip(text: &str) -> Message {
-        let offer: Offer = [("text/plain".to_string(), text.as_bytes().to_vec())]
-            .into_iter()
-            .collect();
-        Message::Clip {
-            kind: SelectionKind::Clipboard,
-            hash: content_hash(&offer),
-            offer,
-            stamp: 0,
-            origin: Uuid::nil(),
-        }
-    }
 
     fn new_mesh() -> (std::sync::Arc<Mesh>, mpsc::Receiver<(Uuid, Message)>) {
         let (tx, rx) = mpsc::channel(8);

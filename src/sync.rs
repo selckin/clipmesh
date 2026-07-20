@@ -1179,11 +1179,7 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    fn offer(text: &str) -> Offer {
-        [("text/plain".to_string(), text.as_bytes().to_vec())]
-            .into_iter()
-            .collect()
-    }
+    use crate::protocol::test_support::text_offer as offer;
 
     fn pairs(offer: &Offer) -> Vec<(&str, &[u8])> {
         offer

@@ -173,7 +173,7 @@ where
 mod tests {
     use super::*;
     use crate::mesh::Mesh;
-    use crate::protocol::{content_hash, Message, Offer, SelectionKind};
+    use crate::protocol::test_support::clip;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -203,19 +203,6 @@ mod tests {
         })
         .await
         .expect("condition not met within 5s");
-    }
-
-    fn clip(text: &str) -> Message {
-        let offer: Offer = [("text/plain".to_string(), text.as_bytes().to_vec())]
-            .into_iter()
-            .collect();
-        Message::Clip {
-            kind: SelectionKind::Clipboard,
-            hash: content_hash(&offer),
-            offer,
-            stamp: 0,
-            origin: Uuid::nil(),
-        }
     }
 
     #[tokio::test]
