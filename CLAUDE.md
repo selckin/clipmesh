@@ -50,7 +50,7 @@ The stack, bottom to top:
 ### Cross-cutting invariants
 
 - **bincode is not self-describing.** Any change to `Message` or its fields must bump `protocol::PROTOCOL_VERSION`; mismatched nodes are refused at handshake rather than failing to decode later. A bump means every node in the mesh must be upgraded — an old node and a new one simply refuse each other, so a partial rollout stops syncing rather than corrupting anything.
-- **tokio async** carries networking and the engine; **blocking work runs on dedicated `std::thread`s** (inotify in `fswatch`, Wayland dispatch in `clipboard::watch`) and reports back over mpsc channels.
+- **tokio async** carries networking and the engine; **blocking work runs on dedicated `std::thread`s** (inotify in `fswatch`, Wayland dispatch in `clipboard::watch`) and reports back over mpsc channels. Rules-file I/O goes through `SyncEngine::with_rules`, which runs the closure on the blocking pool — the engine is one task driving `run`'s select loop, so `std::fs` there stalls inbound messages and peer connects too. The one deliberate exception is the startup version read, which runs before the loop and must not yield (see the comment there: an await between `Clipboard::watch` and `prime`'s spawn lets a just-made copy be mistaken for restored content).
 - Shared state crosses the async/thread boundary as `Arc<Mutex<...>>` (e.g. `MimeRules` is shared between `SyncEngine` and `fswatch`).
 
 ## Conventions

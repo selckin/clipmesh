@@ -603,6 +603,12 @@ impl<C: Clipboard> SyncEngine<C> {
         // local edit outranks it after a restart.
         {
             let own_id = self.mesh.own_id();
+            // Read inline, deliberately: `with_rules` exists to keep file I/O out
+            // of the select loop, and the loop has not started yet, so there is
+            // nothing here to stall. It also must not yield — an await between
+            // `watch()` above and `prime`'s spawn below lets a copy made right
+            // after startup land before prime reads, and prime would then record
+            // that copy as engine-written and suppress it.
             let stamp = lock_rules(&self.mime_rules).version(own_id).stamp;
             self.observe(stamp);
         }
@@ -689,7 +695,7 @@ impl<C: Clipboard> SyncEngine<C> {
                     }
                 },
                 res = rules_changed.recv() => match res {
-                    Some(()) => self.on_local_rules_changed(),
+                    Some(()) => self.on_local_rules_changed().await,
                     // The engine itself holds a sender clone, so this channel
                     // can't actually close while run() is alive; the break is a
                     // safety net against a busy-loop if it somehow did.
@@ -745,7 +751,7 @@ impl<C: Clipboard> SyncEngine<C> {
             if !synced.contains(&kind) {
                 continue;
             }
-            if let Some(content) = self.apply_stages(raw, Stages::BROADCAST) {
+            if let Some(content) = self.apply_stages(raw, Stages::BROADCAST).await {
                 let hash = content.hash();
                 debug!(
                     "primed existing {kind:?} clipboard ({})",
@@ -778,7 +784,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// pipeline unconditionally, and checking it before synthesis skips needless
     /// work on secret content (synthesis never changes the verdict — it adds no
     /// password-manager hint).
-    fn apply_stages(&self, content: Hashed, stages: Stages) -> Option<Hashed> {
+    async fn apply_stages(&self, content: Hashed, stages: Stages) -> Option<Hashed> {
         if content.is_empty() {
             debug!("nothing to sync: the clipboard is empty");
             return None;
@@ -795,7 +801,9 @@ impl<C: Clipboard> SyncEngine<C> {
         let content = match stages.rules {
             RulesStage::Skip => content,
             rules => {
-                let content = self.apply_mime_rules(content, rules == RulesStage::Record);
+                let content = self
+                    .apply_mime_rules(content, rules == RulesStage::Record)
+                    .await;
                 if content.is_empty() {
                     debug!("nothing to sync: every MIME type was blocked by the rules");
                     return None;
@@ -815,52 +823,58 @@ impl<C: Clipboard> SyncEngine<C> {
         Some(content)
     }
 
-    fn apply_mime_rules(&self, content: Hashed, record_unseen: bool) -> Hashed {
-        let mut rules = lock_rules(&self.mime_rules);
-        if record_unseen {
-            let mut appended = false;
-            if rules.compile().has_unseen(content.offer().keys()) {
-                rules.reload_if_changed();
-                appended = rules.ensure(content.offer().keys());
-            }
-            // No-op unless something is unsaved (incl. retrying a failed write).
-            rules.persist();
-            // A newly-recorded type changes the file; share it (try_send only —
-            // we still hold the rules lock here, so we must not re-lock).
-            if appended && self.cfg.share_mime_rules {
-                self.note_rules_changed();
-            }
+    async fn apply_mime_rules(&self, content: Hashed, record_unseen: bool) -> Hashed {
+        let share = self.cfg.share_mime_rules;
+        let (content, appended) = self
+            .with_rules(move |rules| {
+                let mut appended = false;
+                if record_unseen {
+                    if rules.compile().has_unseen(content.offer().keys()) {
+                        rules.reload_if_changed();
+                        appended = rules.ensure(content.offer().keys());
+                    }
+                    // No-op unless something is unsaved (incl. retrying a failed write).
+                    rules.persist();
+                }
+                // Compile once for the whole offer rather than re-walking the TOML per
+                // representation. Deliberately after the block above: that may rewrite
+                // the table, and the borrow checker enforces the recompile.
+                let compiled = rules.compile();
+                // Decide before rebuilding: when the rules deny nothing — the ordinary
+                // case — the content is unchanged, so return it as-is and its hash stays
+                // valid. Only a genuine drop rebuilds the map (and rehashes).
+                let denied: Vec<String> = content
+                    .offer()
+                    .iter()
+                    .filter(|(mime, data)| !compiled.allows(mime, data.len()))
+                    .map(|(mime, _)| mime.clone())
+                    .collect();
+                if denied.is_empty() {
+                    return (content, appended);
+                }
+                for mime in &denied {
+                    debug!(
+                        "dropping {mime} ({}): blocked by the MIME rules",
+                        human_bytes(content.offer()[mime].len())
+                    );
+                }
+                let denied: std::collections::HashSet<String> = denied.into_iter().collect();
+                let kept = Hashed::new(
+                    content
+                        .into_offer()
+                        .into_iter()
+                        .filter(|(mime, _)| !denied.contains(mime))
+                        .collect(),
+                );
+                (kept, appended)
+            })
+            .await;
+        // A newly-recorded type changes the file; share it. Outside the closure
+        // because the rules lock is gone by here — no re-lock hazard.
+        if appended && share {
+            self.note_rules_changed();
         }
-        // Compile once for the whole offer rather than re-walking the TOML per
-        // representation. Deliberately after the block above: that may rewrite
-        // the table, and the borrow checker enforces the recompile.
-        let compiled = rules.compile();
-        // Decide before rebuilding: when the rules deny nothing — the ordinary
-        // case — the content is unchanged, so return it as-is and its hash stays
-        // valid. Only a genuine drop rebuilds the map (and rehashes).
-        let denied: Vec<&String> = content
-            .offer()
-            .iter()
-            .filter(|(mime, data)| !compiled.allows(mime, data.len()))
-            .map(|(mime, _)| mime)
-            .collect();
-        if denied.is_empty() {
-            return content;
-        }
-        for mime in &denied {
-            debug!(
-                "dropping {mime} ({}): blocked by the MIME rules",
-                human_bytes(content.offer()[*mime].len())
-            );
-        }
-        let denied: std::collections::HashSet<String> = denied.into_iter().cloned().collect();
-        Hashed::new(
-            content
-                .into_offer()
-                .into_iter()
-                .filter(|(mime, _)| !denied.contains(mime))
-                .collect(),
-        )
+        content
     }
 
     /// Read the selection with a bounded timeout (no filtering). Split out of
@@ -888,7 +902,7 @@ impl<C: Clipboard> SyncEngine<C> {
     async fn capture_offer(&self, kind: SelectionKind) -> Option<Hashed> {
         let content = self.read_selection(kind).await?;
         // Local content: record brand-new types so the user can curate them.
-        self.apply_stages(content, Stages::BROADCAST)
+        self.apply_stages(content, Stages::BROADCAST).await
     }
 
     /// Broadcast `raw` (the freshly-read content of `kind`) to the mesh after
@@ -905,7 +919,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // The bracketed list means "what was copied" in every outcome below
         // (consistent with the received-update summary).
         let copied = self.cfg.verbose.then(|| describe_offer(raw.offer()));
-        let Some(content) = self.apply_stages(raw, Stages::BROADCAST) else {
+        let Some(content) = self.apply_stages(raw, Stages::BROADCAST).await else {
             if let Some(copied) = &copied {
                 info!("copied {kind:?} [{copied}]: not sent (nothing passed the content filters)");
             }
@@ -1034,7 +1048,7 @@ impl<C: Clipboard> SyncEngine<C> {
         prov: Provenance,
         read: &IndexMap<SelectionKind, Hashed>,
     ) {
-        let Some(final_content) = self.apply_stages(content, prov.stages()) else {
+        let Some(final_content) = self.apply_stages(content, prov.stages()).await else {
             if prov == Provenance::Own {
                 debug!("not taking ownership of {kind:?}: nothing left after its stages");
             }
@@ -1066,6 +1080,28 @@ impl<C: Clipboard> SyncEngine<C> {
                 info!("mirrored into {kind:?} [{copied}]");
             }
         }
+    }
+
+    /// Run `f` over the shared MIME rules on the blocking pool.
+    ///
+    /// THE single way the engine touches the rules, because every interesting
+    /// thing it does to them — reload, append, persist, snapshot — ends in
+    /// `std::fs`. The engine is one task inside `run`'s select loop, so blocking
+    /// file I/O there stalls inbound mesh messages, peer connects and clipboard
+    /// batches for as long as the filesystem takes, which on a network mount is
+    /// unbounded. The lock is taken *inside* the closure, so it is never held
+    /// across the await.
+    async fn with_rules<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce(&mut MimeRules) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let rules = Arc::clone(&self.mime_rules);
+        tokio::task::spawn_blocking(move || f(&mut lock_rules(&rules)))
+            .await
+            // `lock_rules` recovers a poisoned mutex, so the only way here is a
+            // panic inside `f` — which is a bug, not a runtime condition.
+            .expect("MIME-rules task panicked")
     }
 
     /// Report a failed snapshot. The transaction itself lives in `MimeRules`;
@@ -1108,13 +1144,15 @@ impl<C: Clipboard> SyncEngine<C> {
     /// gate clipboard content); gated only by `share_mime_rules` and having a
     /// file. Materialises the version header on first send so the version is
     /// pinned to disk and survives restarts.
-    fn resync_rules_to(&self, peers: &[Uuid]) {
+    async fn resync_rules_to(&self, peers: &[Uuid]) {
         if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
             return;
         }
         let own_id = self.mesh.own_id();
-        let snapshot =
-            lock_rules(&self.mime_rules).snapshot_baseline(own_id, self.cfg.max_payload_size);
+        let max = self.cfg.max_payload_size;
+        let snapshot = self
+            .with_rules(move |rules| rules.snapshot_baseline(own_id, max))
+            .await;
         match snapshot {
             Ok(s) => {
                 debug!(
@@ -1141,7 +1179,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// each other settle on the same content instead of swapping.
     async fn on_peers_connected(&self, peers: &[Uuid]) {
         // Rules sharing is independent of clipboard direction/resync settings.
-        self.resync_rules_to(peers);
+        self.resync_rules_to(peers).await;
         if !self.cfg.resync_on_connect || self.cfg.direction == Direction::ReceiveOnly {
             return;
         }
@@ -1183,7 +1221,7 @@ impl<C: Clipboard> SyncEngine<C> {
                 offer,
                 version,
             } => self.on_inbound_clip(from, kind, hash, offer, version).await,
-            Message::Rules { version, body } => self.on_inbound_rules(from, version, body),
+            Message::Rules { version, body } => self.on_inbound_rules(from, version, body).await,
             Message::Hello { .. } => {
                 warn!("ignoring an unexpected Hello from peer {from} after handshake")
             }
@@ -1241,7 +1279,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // between peers, and a node must not write contents it would never
         // have sent (e.g. password-manager secrets, or denied MIME types). Do
         // NOT record unseen types here — a peer must not write to our rules file.
-        let Some(content) = self.apply_stages(content, Stages::INBOUND) else {
+        let Some(content) = self.apply_stages(content, Stages::INBOUND).await else {
             debug!("dropping inbound {kind:?} from peer {from}: our content filters removed everything");
             return "dropped (content filters removed everything)";
         };
@@ -1314,12 +1352,15 @@ impl<C: Clipboard> SyncEngine<C> {
     /// A local change to the rules file (a captured new type, or a human edit
     /// the watcher picked up) bumps the file version and broadcasts the whole
     /// file. No-op when sharing is off or there is no rules file.
-    fn on_local_rules_changed(&self) {
+    async fn on_local_rules_changed(&self) {
         if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
             return;
         }
         let version = Version::new(self.tick(), self.mesh.own_id());
-        let snapshot = lock_rules(&self.mime_rules).snapshot_at(version, self.cfg.max_payload_size);
+        let max = self.cfg.max_payload_size;
+        let snapshot = self
+            .with_rules(move |rules| rules.snapshot_at(version, max))
+            .await;
         match snapshot {
             Ok(s) => {
                 debug!("broadcasting shared MIME-rules (stamp {})", s.version.stamp);
@@ -1337,7 +1378,7 @@ impl<C: Clipboard> SyncEngine<C> {
     /// implausibly-future stamps and `observe()`s the stamp so a later local
     /// edit outranks the adopted version (otherwise a local edit stamped below
     /// it would revert to the version it just replaced).
-    fn on_inbound_rules(&self, from: Uuid, incoming: Version, body: String) {
+    async fn on_inbound_rules(&self, from: Uuid, incoming: Version, body: String) {
         if !self.cfg.share_mime_rules || self.cfg.mime_rules_path.is_none() {
             return;
         }
@@ -1351,28 +1392,35 @@ impl<C: Clipboard> SyncEngine<C> {
             return;
         }
         let own_id = self.mesh.own_id();
-        let mut rules = lock_rules(&self.mime_rules);
-        let current = rules.version(own_id);
-        if incoming > current {
-            debug!(
-                "adopting shared MIME-rules from peer {from} (stamp {}); replaces our (stamp {}, origin {})",
-                incoming.stamp, current.stamp, current.origin
-            );
-            rules.replace_from(body);
-            // Stamp the adopted version explicitly so version() reflects it even
-            // if the peer's body lacked the header line — otherwise version()
-            // would fall back to the new file's mtime and diverge. On failure
-            // the snapshot rolls back, so memory matches disk rather than
-            // silently diverging (which a restart would lose); the peer
-            // re-pushes on its next connect.
-            if let Err(e) = rules.snapshot_at(incoming, self.cfg.max_payload_size) {
-                self.warn_snapshot_failed(e, &format!(" from peer {from}"));
-            }
-        } else {
-            debug!(
-                "ignoring shared MIME-rules from peer {from} (stamp {}); we hold a newer-or-equal version (stamp {})",
-                incoming.stamp, current.stamp
-            );
+        let max = self.cfg.max_payload_size;
+        // Compare-and-adopt under one lock: reading our version and replacing the
+        // file must not interleave with another adoption.
+        let failed = self
+            .with_rules(move |rules| {
+                let current = rules.version(own_id);
+                if incoming <= current {
+                    debug!(
+                        "ignoring shared MIME-rules from peer {from} (stamp {}); we hold a newer-or-equal version (stamp {})",
+                        incoming.stamp, current.stamp
+                    );
+                    return None;
+                }
+                debug!(
+                    "adopting shared MIME-rules from peer {from} (stamp {}); replaces our (stamp {}, origin {})",
+                    incoming.stamp, current.stamp, current.origin
+                );
+                rules.replace_from(body);
+                // Stamp the adopted version explicitly so version() reflects it even
+                // if the peer's body lacked the header line — otherwise version()
+                // would fall back to the new file's mtime and diverge. On failure
+                // the snapshot rolls back, so memory matches disk rather than
+                // silently diverging (which a restart would lose); the peer
+                // re-pushes on its next connect.
+                rules.snapshot_at(incoming, max).err()
+            })
+            .await;
+        if let Some(e) = failed {
+            self.warn_snapshot_failed(e, &format!(" from peer {from}"));
         }
     }
 }
@@ -1803,10 +1851,25 @@ mod tests {
         let _ = w.connect_rx.try_recv();
         let mesh = w.mesh.clone();
         let in_tx = w.in_tx.clone();
+        let engine = w.engine.clone();
+        let synced = engine.synced_kinds();
         tokio::spawn(w.engine.run(w.in_rx, w.connect_rx, w.rules_rx));
         // wait until the engine has subscribed to the watcher
         while clip.watcher_count() == 0 {
             tokio::task::yield_now().await;
+        }
+        // ...and, when the clipboard was seeded, until priming has recorded it.
+        // The engine deliberately does NOT gate connect/inbound handling on
+        // priming (a slow selection owner must not make the node unreachable),
+        // so without this a test racing a peer connect against prime would pass
+        // or fail on scheduling luck rather than on behaviour.
+        for (kind, _) in seeds.iter().filter(|(k, _)| synced.contains(k)) {
+            let engine = engine.clone();
+            let kind = *kind;
+            wait_for("prime to record the seeded clipboard", move || {
+                engine.current.lock().unwrap().contains_key(&kind)
+            })
+            .await;
         }
         Harness {
             clip,
