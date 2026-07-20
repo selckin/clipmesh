@@ -5,6 +5,8 @@
 //! copies cannot occur). Reading and writing still go through
 //! `wl-clipboard-rs` in `wayland.rs`; this is the last subprocess removed.
 
+use crate::clipboard::wayland::read_offer_blocking;
+use crate::clipboard::ClipboardEvent;
 use crate::protocol::SelectionKind;
 use anyhow::{bail, Context, Result};
 use std::thread;
@@ -34,18 +36,22 @@ use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1:
 /// changes to a selection in `watched` are forwarded to `tx`. Taking the set
 /// (rather than a per-selection flag) keeps the backend free of any assumption
 /// about which selections the engine cares about.
-pub fn spawn_watcher(tx: mpsc::UnboundedSender<SelectionKind>, watched: Vec<SelectionKind>) {
-    thread::spawn(move || run(tx, watched));
+pub fn spawn_watcher(
+    tx: mpsc::UnboundedSender<ClipboardEvent>,
+    watched: Vec<SelectionKind>,
+    max_payload: usize,
+) {
+    thread::spawn(move || run(tx, watched, max_payload));
 }
 
 /// Reconnect loop: the same backoff the old subprocess watcher used, so a
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
-fn run(tx: mpsc::UnboundedSender<SelectionKind>, watched: Vec<SelectionKind>) {
+fn run(tx: mpsc::UnboundedSender<ClipboardEvent>, watched: Vec<SelectionKind>, max_payload: usize) {
     let mut backoff = crate::backoff::watcher_restart();
     loop {
         let started = Instant::now();
-        match watch_once(&tx, &watched) {
+        match watch_once(&tx, &watched, max_payload) {
             Ok(StopReason::ReceiverGone) => return, // engine gone; stop watching
             Ok(StopReason::Finished) => {
                 warn!("compositor closed the clipboard watcher; reconnecting")
@@ -70,8 +76,9 @@ enum StopReason {
 }
 
 fn watch_once(
-    tx: &mpsc::UnboundedSender<SelectionKind>,
+    tx: &mpsc::UnboundedSender<ClipboardEvent>,
     watched: &[SelectionKind],
+    max_payload: usize,
 ) -> Result<StopReason> {
     let conn = Connection::connect_to_env().context("connecting to the Wayland display")?;
     let (globals, mut queue) =
@@ -117,6 +124,8 @@ fn watch_once(
         watched: watched.to_vec(),
         dead: false,
         finished: false,
+        draining_initial: true,
+        initial: Vec::new(),
     };
 
     // Flush the device request and drain the compositor's initial burst
@@ -125,6 +134,33 @@ fn watch_once(
     queue
         .roundtrip(&mut state)
         .context("initial Wayland roundtrip")?;
+
+    // Report the pre-existing selections as `Initial`, with content, before any
+    // `Changed` can follow — the contract on `Clipboard::watch`. Reported from
+    // here rather than left for the engine to read back, because a read the
+    // engine does later cannot be told apart from a copy the user makes a moment
+    // after startup.
+    //
+    // KNOWN GAP: `read_offer_blocking` opens its own connection, so a copy
+    // landing between the roundtrip above and this read is still reported as
+    // `Initial`. The window is two immediate operations on this thread rather
+    // than the engine's whole scheduling path, but it is not zero. Closing it
+    // needs the content read to come off *this* connection's live offer, which
+    // is the same in-tree data-control read the per-MIME-type connection storm
+    // in `wayland.rs` needs — worth doing once, for both.
+    state.draining_initial = false;
+    for kind in std::mem::take(&mut state.initial) {
+        match read_offer_blocking(kind, max_payload) {
+            Ok(offer) if !offer.is_empty() => {
+                if tx.send(ClipboardEvent::Initial { kind, offer }).is_err() {
+                    return Ok(StopReason::ReceiverGone);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("couldn't read the existing {kind:?} selection at startup: {e:#}"),
+        }
+    }
+
     loop {
         if state.dead {
             return Ok(StopReason::ReceiverGone);
@@ -150,10 +186,15 @@ enum Device {
 }
 
 struct State {
-    tx: mpsc::UnboundedSender<SelectionKind>,
+    tx: mpsc::UnboundedSender<ClipboardEvent>,
     watched: Vec<SelectionKind>,
     dead: bool,
     finished: bool,
+    /// True while the compositor's initial burst is being drained. Selections
+    /// reported during it are the *existing* clipboard, not a change, so they
+    /// are collected here and reported as `Initial` instead of `Changed`.
+    draining_initial: bool,
+    initial: Vec<SelectionKind>,
 }
 
 impl State {
@@ -161,7 +202,13 @@ impl State {
         if !self.watched.contains(&kind) {
             return;
         }
-        if self.tx.send(kind).is_err() {
+        if self.draining_initial {
+            if !self.initial.contains(&kind) {
+                self.initial.push(kind);
+            }
+            return;
+        }
+        if self.tx.send(ClipboardEvent::Changed(kind)).is_err() {
             self.dead = true;
         }
     }

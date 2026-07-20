@@ -1,5 +1,5 @@
 use crate::clipboard::watch::spawn_watcher;
-use crate::clipboard::Clipboard;
+use crate::clipboard::{Clipboard, ClipboardEvent};
 use crate::protocol::{describe_offer, human_bytes, Offer, SelectionKind};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,7 +38,7 @@ fn copy_type(kind: SelectionKind) -> copy::ClipboardType {
     }
 }
 
-fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
+pub(crate) fn read_offer_blocking(kind: SelectionKind, max: usize) -> Result<Offer> {
     let ct = paste_type(kind);
     // get_mime_types_ordered (not get_mime_types) preserves the compositor's
     // advertise order — preference order, richest first — so the offer we build
@@ -206,11 +206,11 @@ fn write_offer_blocking(kind: SelectionKind, offer: Offer) -> Result<()> {
 
 #[async_trait]
 impl Clipboard for WaylandClipboard {
-    fn watch(&self, kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<SelectionKind> {
+    fn watch(&self, kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<ClipboardEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         // One in-process data-control listener covers both selections; see
         // clipboard::watch. (Was a wl-paste --watch subprocess per kind.)
-        spawn_watcher(tx, kinds.to_vec());
+        spawn_watcher(tx, kinds.to_vec(), self.max_payload);
         rx
     }
 

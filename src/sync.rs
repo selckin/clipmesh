@@ -1,4 +1,4 @@
-use crate::clipboard::Clipboard;
+use crate::clipboard::{Clipboard, ClipboardEvent};
 use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
@@ -597,39 +597,17 @@ impl<C: Clipboard> SyncEngine<C> {
         mut connects: mpsc::Receiver<Uuid>,
         mut rules_changed: mpsc::Receiver<()>,
     ) {
+        // The backend reports the pre-existing clipboard as `Initial` events on
+        // this stream, ahead of any `Changed`. Startup content therefore arrives
+        // *in order* with local changes rather than being read back separately,
+        // which is what makes "restored" and "the user just copied this"
+        // distinguishable at all — see `Clipboard::watch`.
         let mut watch = self.clipboard.watch(&self.watched_kinds());
-
-        // Prime concurrently: reading the existing clipboard can block on a slow
-        // selection owner, and must NOT stall inbound/connect handling (a node
-        // would otherwise be unreachable on the mesh until the local selection
-        // changed). Local changes are buffered (not broadcast) until priming has
-        // recorded the restored clipboard, so it isn't re-sent as fresh content.
-        //
-        // Spawned FIRST, immediately after `watch()`, and nothing may be inserted
-        // between the two. `prime` attributes whatever it reads to "what was on
-        // the clipboard at startup", so every moment between the watcher going
-        // live and prime's read is a window in which a real user copy is mistaken
-        // for restored content — suppressed as an echo, and seeded into `current`
-        // at stamp 0 where a peer's older clipboard outranks it. The window
-        // cannot be closed without reading before `watch()` (which would stall
-        // the loop for a slow selection owner) so it is kept as short as
-        // possible instead. `a_copy_made_right_after_startup_is_still_broadcast`
-        // fails if anything yieldable creeps in here.
-        let (primed_tx, mut primed_rx) = tokio::sync::oneshot::channel();
-        {
-            let me = Arc::clone(&self);
-            tokio::spawn(async move {
-                me.prime().await;
-                let _ = primed_tx.send(());
-            });
-        }
-        let mut primed = false;
 
         // Adopt the rules file's persisted version into the clock so the next
         // local edit outranks it after a restart. Inline rather than through
         // `with_rules`: the select loop has not started, so there is nothing to
-        // stall — and it sits *below* the prime spawn so it cannot lengthen the
-        // window described above.
+        // stall.
         {
             let own_id = self.mesh.own_id();
             let stamp = lock_rules(&self.mime_rules).version(own_id).stamp;
@@ -646,24 +624,21 @@ impl<C: Clipboard> SyncEngine<C> {
         let mut armed = false;
 
         loop {
-            // Set by the two arms that observe a local change, so the debounce
+            // Set by the arm that observes a local change, so the debounce
             // policy below is stated once rather than per arm.
             let mut local_change = false;
             tokio::select! {
-                // Priming finished (or its task died); broadcast anything that
-                // changed locally while we were priming.
-                _ = &mut primed_rx, if !primed => {
-                    primed = true;
-                    local_change = !pending.is_empty();
-                },
-                kind = watch.recv() => match kind {
-                    Some(kind) => {
+                event = watch.recv() => match event {
+                    // Pre-existing content, captured by the backend at subscribe
+                    // time. Recorded, never propagated: it is not a user action.
+                    Some(ClipboardEvent::Initial { kind, offer }) => {
+                        self.adopt_restored(kind, Hashed::new(offer)).await;
+                    }
+                    Some(ClipboardEvent::Changed(kind)) => {
                         if !pending.contains(&kind) {
                             pending.push(kind);
                         }
-                        // Until priming records the restored clipboard, just
-                        // buffer — broadcasting now would re-send it as fresh.
-                        local_change = primed;
+                        local_change = true;
                     }
                     None => {
                         warn!("clipboard watcher stopped; shutting down the sync engine");
@@ -729,52 +704,42 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
-    /// Capture the existing clipboard at startup with stamp 0, so a
-    /// restarted node neither re-broadcasts its restored clipboard as
-    /// fresh content nor wins a resync against a peer's genuinely newer
-    /// content (it can't know how old its restored clipboard is). The
-    /// first real local copy stamps a real clock value and propagates
-    /// normally.
-    async fn prime(&self) {
-        let synced = self.synced_kinds();
-        for kind in self.watched_kinds() {
-            let Some(raw) = self.read_selection(kind).await else {
-                continue;
-            };
-            if raw.is_empty() {
-                continue;
-            }
-            // Record the restored content as engine-written so the watcher's
-            // startup re-report isn't mistaken for a fresh local change and
-            // spontaneously bridged. or_insert: prime races the run loop, so an
-            // inbound apply may already have recorded newer content here — don't
-            // clobber it.
-            self.last_written
-                .lock()
-                .unwrap()
-                .entry(kind)
-                .or_insert(raw.hash());
-            // Synced kinds also seed `current` (filtered, stamp 0) and record
-            // any brand-new types — exactly as before.
-            if !synced.contains(&kind) {
-                continue;
-            }
-            if let Some(content) = self.apply_stages(raw, Stages::BROADCAST).await {
-                let hash = content.hash();
-                debug!(
-                    "primed existing {kind:?} clipboard ({})",
-                    describe_offer(content.offer())
-                );
-                self.current
-                    .lock()
-                    .unwrap()
-                    .entry(kind)
-                    .or_insert(ContentState {
-                        hash,
-                        version: Version::new(0, self.mesh.own_id()),
-                    });
-            }
+    /// Record the clipboard that already existed when this node started (or when
+    /// the watcher reconnected), as reported by the backend's `Initial` event.
+    ///
+    /// Restored content is deliberately inert: not broadcast, not bridged, not
+    /// re-owned. It is seeded into `current` at **stamp 0** so a peer holding
+    /// genuinely newer content wins a resync — this node cannot know how old its
+    /// restored clipboard is, so it must not outrank anyone.
+    ///
+    /// Unlike the read-it-back-later approach this replaces, the content here is
+    /// what the backend captured at subscribe time, so a copy the user makes a
+    /// moment after startup arrives as `Changed` and propagates normally instead
+    /// of being mistaken for restored content and suppressed.
+    ///
+    /// No `last_written` marker is needed: this event *is* the startup
+    /// notification, so there is no separate echo of it to suppress.
+    async fn adopt_restored(&self, kind: SelectionKind, raw: Hashed) {
+        if raw.is_empty() || !self.synced_kinds().contains(&kind) {
+            return;
         }
+        let Some(content) = self.apply_stages(raw, Stages::BROADCAST).await else {
+            return;
+        };
+        debug!(
+            "adopted the existing {kind:?} clipboard ({})",
+            describe_offer(content.offer())
+        );
+        // or_insert: an inbound apply may already have recorded newer content
+        // for this selection — don't clobber it with stamp-0 restored content.
+        self.current
+            .lock()
+            .unwrap()
+            .entry(kind)
+            .or_insert(ContentState {
+                hash: content.hash(),
+                version: Version::new(0, self.mesh.own_id()),
+            });
     }
 
     /// Whether this offer must be withheld because the user opted to exclude
@@ -1747,13 +1712,13 @@ mod tests {
     /// must not gate the engine's inbound/connect handling.
     struct GatedClipboard {
         gate: tokio::sync::Notify,
-        watchers: Mutex<Vec<mpsc::UnboundedSender<SelectionKind>>>,
+        watchers: Mutex<Vec<mpsc::UnboundedSender<ClipboardEvent>>>,
         applied: Mutex<Option<Offer>>,
     }
 
     #[async_trait::async_trait]
     impl Clipboard for GatedClipboard {
-        fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<SelectionKind> {
+        fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<ClipboardEvent> {
             let (tx, rx) = mpsc::unbounded_channel();
             self.watchers.lock().unwrap().push(tx);
             rx
@@ -2057,6 +2022,110 @@ mod tests {
             h.clip.get(kind).as_ref() == Some(o)
         })
         .await;
+    }
+
+    /// A clipboard whose reads block until released, and whose `watch` honours
+    /// the `Initial` contract. Models a slow selection owner — precisely the
+    /// case where reading startup content back later loses the race against a
+    /// copy, because the read completes long after the watcher went live.
+    struct SlowReadClipboard {
+        state: Mutex<HashMap<SelectionKind, Offer>>,
+        watchers: Mutex<Vec<mpsc::UnboundedSender<ClipboardEvent>>>,
+        reads: tokio::sync::Semaphore,
+    }
+
+    impl SlowReadClipboard {
+        fn new(seed: Offer) -> Arc<SlowReadClipboard> {
+            let mut state = HashMap::new();
+            state.insert(SelectionKind::Clipboard, seed);
+            Arc::new(SlowReadClipboard {
+                state: Mutex::new(state),
+                watchers: Mutex::new(Vec::new()),
+                reads: tokio::sync::Semaphore::new(0),
+            })
+        }
+        fn copy(&self, kind: SelectionKind, offer: Offer) {
+            let mut state = self.state.lock().unwrap();
+            let mut watchers = self.watchers.lock().unwrap();
+            state.insert(kind, offer);
+            watchers.retain(|tx| tx.send(ClipboardEvent::Changed(kind)).is_ok());
+        }
+        fn allow_reads(&self) {
+            self.reads.add_permits(1024);
+        }
+        fn watchers_ready(&self) -> bool {
+            !self.watchers.lock().unwrap().is_empty()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Clipboard for SlowReadClipboard {
+        fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<ClipboardEvent> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let state = self.state.lock().unwrap();
+            let mut watchers = self.watchers.lock().unwrap();
+            for (kind, offer) in state.iter() {
+                let _ = tx.send(ClipboardEvent::Initial {
+                    kind: *kind,
+                    offer: offer.clone(),
+                });
+            }
+            watchers.push(tx);
+            rx
+        }
+        async fn read_offer(&self, kind: SelectionKind) -> anyhow::Result<Offer> {
+            let _permit = self.reads.acquire().await.unwrap();
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .get(&kind)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn write_offer(&self, _kind: SelectionKind, _offer: Offer) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copy_racing_startup_is_not_mistaken_for_restored_content() {
+        // The race this design exists to close, forced rather than hoped for:
+        // the clipboard already had content, reads are slow, and a user copy
+        // lands while the engine is still dealing with startup.
+        //
+        // Reading startup content back later loses here — by the time the read
+        // returns it sees "fresh", attributes it to startup, and the copy is
+        // suppressed as an echo and recorded at stamp 0 where a peer's older
+        // clipboard outranks it. Taking the content from the backend's `Initial`
+        // event instead makes the two unambiguous no matter how slow reads are.
+        let clip = SlowReadClipboard::new(offer("restored"));
+        let mut w = engine(clip.clone(), Config::for_test("s"));
+        let (conn_tx, mut conn_rx) = mpsc::channel(64);
+        w.mesh.register(Uuid::new_v4(), conn_tx);
+        let _ = w.connect_rx.try_recv();
+        tokio::spawn(w.engine.run(w.in_rx, w.connect_rx, w.rules_rx));
+
+        while !clip.watchers_ready() {
+            tokio::task::yield_now().await;
+        }
+        // The copy lands while any startup read would still be blocked.
+        clip.copy(SelectionKind::Clipboard, offer("fresh"));
+        clip.allow_reads();
+
+        match recv_from(&mut conn_rx).await {
+            Message::Clip {
+                offer: o, version, ..
+            } => {
+                assert_eq!(o, offer("fresh"), "the racing copy must reach the mesh");
+                assert!(
+                    version.stamp > 0,
+                    "a user copy must carry a real stamp; stamp 0 would let a \
+                     peer's older clipboard outrank it"
+                );
+            }
+            other => panic!("expected the copy to be broadcast, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3593,35 +3662,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn priming_does_not_spontaneously_bridge_restored_content() {
+    async fn restored_content_is_not_spontaneously_bridged() {
         let mut cfg = Config::for_test("s");
         cfg.link_selections = LinkSelections::CLIPBOARD_TO_SELECTION;
-        // restart over an existing clipboard
+        // Restart over an existing clipboard: the backend reports it as
+        // `Initial`, which is restored content and not a user action — so it
+        // must not reach the mesh, and the bridge must not mirror it into the
+        // partner selection.
         let mut h = start_seeded(cfg, offer("restored")).await;
-        // the watcher re-reports the restored clipboard (as a subscribe-time
-        // event would); priming recorded it in last_written, so it must NOT bridge.
-        h.clip
-            .local_copy(SelectionKind::Clipboard, offer("restored"));
         assert_no_broadcast(&mut h).await;
-        assert_eq!(h.clip.write_count(), 0);
+        assert_eq!(h.clip.write_count(), 0, "restored content was written");
         assert_eq!(h.clip.get(SelectionKind::Selection), None);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn priming_does_not_spontaneously_bridge_restored_selection() {
+    async fn restored_selection_is_not_spontaneously_bridged() {
         // The selection→clipboard symmetric case: this is the only test that
         // exercises watched_kinds()'s selection_to_clip branch (SELECTION watched
         // for the bridge while sync_selection is off).
         let mut cfg = Config::for_test("s");
         cfg.link_selections = LinkSelections::SELECTION_TO_CLIPBOARD;
-        // restart over an existing selection
+        // restart over an existing selection; restored, so it must not mirror
+        // into the clipboard
         let mut h = start_seeded_with(cfg, &[(SelectionKind::Selection, offer("restored"))]).await;
-        // the watcher re-reports the restored selection; priming recorded it in
-        // last_written[Selection], so it must NOT mirror into the clipboard.
-        h.clip
-            .local_copy(SelectionKind::Selection, offer("restored"));
         assert_no_broadcast(&mut h).await;
-        assert_eq!(h.clip.write_count(), 0);
+        assert_eq!(h.clip.write_count(), 0, "restored content was written");
         assert_eq!(h.clip.get(SelectionKind::Clipboard), None);
     }
 

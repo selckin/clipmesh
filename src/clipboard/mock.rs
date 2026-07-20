@@ -1,4 +1,4 @@
-use crate::clipboard::Clipboard;
+use crate::clipboard::{Clipboard, ClipboardEvent};
 use crate::protocol::{Offer, SelectionKind};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 /// programmatic writes re-fire the watcher (exercising echo suppression).
 pub struct MockClipboard {
     state: Mutex<HashMap<SelectionKind, Offer>>,
-    watchers: Mutex<Vec<mpsc::UnboundedSender<SelectionKind>>>,
+    watchers: Mutex<Vec<mpsc::UnboundedSender<ClipboardEvent>>>,
     writes: AtomicUsize,
     fail_writes: std::sync::atomic::AtomicBool,
     fail_reads: std::sync::atomic::AtomicBool,
@@ -49,8 +49,23 @@ impl MockClipboard {
 
     /// Simulate a user copying something locally.
     pub fn local_copy(&self, kind: SelectionKind, offer: Offer) {
-        self.state.lock().unwrap().insert(kind, offer);
-        self.notify(kind);
+        self.set_and_notify(kind, offer);
+    }
+
+    /// Store `offer` and fire `Changed`, holding both locks across the pair in
+    /// the same order `watch` takes them.
+    ///
+    /// That ordering is the whole point: a copy must land entirely before a
+    /// subscribe (so `watch` reports it as `Initial` and no `Changed` follows)
+    /// or entirely after it (so it arrives as `Changed`). Setting the state and
+    /// notifying as two separate critical sections would let a subscribe slip
+    /// between them and report the same copy as *both*, which is exactly the
+    /// startup misattribution the `Initial` contract exists to rule out.
+    fn set_and_notify(&self, kind: SelectionKind, offer: Offer) {
+        let mut state = self.state.lock().unwrap();
+        let mut watchers = self.watchers.lock().unwrap();
+        state.insert(kind, offer);
+        watchers.retain(|tx| tx.send(ClipboardEvent::Changed(kind)).is_ok());
     }
 
     pub fn get(&self, kind: SelectionKind) -> Option<Offer> {
@@ -65,22 +80,33 @@ impl MockClipboard {
     pub fn watcher_count(&self) -> usize {
         self.watchers.lock().unwrap().len()
     }
-
-    fn notify(&self, kind: SelectionKind) {
-        self.watchers
-            .lock()
-            .unwrap()
-            .retain(|tx| tx.send(kind).is_ok());
-    }
 }
 
 #[async_trait]
 impl Clipboard for MockClipboard {
-    fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<SelectionKind> {
+    fn watch(&self, _kinds: &[SelectionKind]) -> mpsc::UnboundedReceiver<ClipboardEvent> {
         // The mock delivers whatever a test seeds; the engine filters. Honouring
         // `kinds` here would hide engine-side gating bugs from the tests.
         let (tx, rx) = mpsc::unbounded_channel();
-        self.watchers.lock().unwrap().push(tx);
+        // Snapshot the seeded content and register the sender under BOTH locks,
+        // in the order `local_copy` takes them. That makes the `Initial`
+        // contract exact rather than probable: a copy racing this call either
+        // lands before the snapshot (and is what `Initial` reports) or after the
+        // sender is registered (and arrives as `Changed`) — never both, never
+        // neither. The real backend can only approximate this; the mock is what
+        // lets the engine's half be tested deterministically.
+        let state = self.state.lock().unwrap();
+        let mut watchers = self.watchers.lock().unwrap();
+        for (kind, offer) in state.iter() {
+            if offer.is_empty() {
+                continue;
+            }
+            let _ = tx.send(ClipboardEvent::Initial {
+                kind: *kind,
+                offer: offer.clone(),
+            });
+        }
+        watchers.push(tx);
         rx
     }
 
@@ -96,8 +122,7 @@ impl Clipboard for MockClipboard {
             anyhow::bail!("simulated clipboard write failure");
         }
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.state.lock().unwrap().insert(kind, offer);
-        self.notify(kind);
+        self.set_and_notify(kind, offer);
         Ok(())
     }
 }
@@ -113,7 +138,10 @@ mod tests {
         let clip = MockClipboard::new();
         let mut watch = clip.watch(&[SelectionKind::Clipboard, SelectionKind::Selection]);
         clip.local_copy(SelectionKind::Clipboard, offer("hello"));
-        assert_eq!(watch.recv().await, Some(SelectionKind::Clipboard));
+        assert_eq!(
+            watch.recv().await,
+            Some(ClipboardEvent::Changed(SelectionKind::Clipboard))
+        );
         assert_eq!(
             clip.read_offer(SelectionKind::Clipboard).await.unwrap(),
             offer("hello")
@@ -131,7 +159,10 @@ mod tests {
         assert_eq!(clip.write_count(), 1);
         assert_eq!(clip.get(SelectionKind::Clipboard), Some(offer("net")));
         // real clipboards re-fire the watcher on programmatic set
-        assert_eq!(watch.recv().await, Some(SelectionKind::Clipboard));
+        assert_eq!(
+            watch.recv().await,
+            Some(ClipboardEvent::Changed(SelectionKind::Clipboard))
+        );
     }
 
     #[tokio::test]
