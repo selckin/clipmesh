@@ -1,4 +1,4 @@
-# Example clipmesh MIME rules file (lives at ~/.config/clipmesh/mimetypes).
+# clipmesh MIME rules — managed, but safe to hand-edit.
 #
 # Each entry under [rules] decides whether a clipboard MIME type syncs:
 #   "<mime>" = "allow"                          # sync this type
@@ -14,33 +14,40 @@
 # wins (an exact key beats a glob; among globs, more literal characters win, ties
 # break to deny).
 #
-# clipmesh manages this file: it creates it, appends any new type it sees (using
-# the config's unknown_mime default, unless a glob already covers it), and
-# reloads it when it changes (so edits apply right away). It keeps the [rules]
-# entries sorted and drops notes placed among them; comments up here above
-# [rules] are kept. The [clipmesh] table is added and managed automatically —
-# leave it alone. You can also manage rules without opening the file:
+# clipmesh manages this file: it creates it with the defaults below, appends any
+# new type it sees (using the config's unknown_mime default, unless a glob
+# already covers it), and reloads it when it changes (so edits apply right away).
+# It keeps the [rules] entries sorted and drops notes placed among them; comments
+# up here above [rules] are kept. The [clipmesh] table is added and managed
+# automatically — leave it alone. You can also manage rules without opening the
+# file:
 #   clipmesh --allow "*/svg+xml"   clipmesh --deny "JAVA_DATATRANSFER*"
 #   clipmesh --rules   # list the rules and flag overlapping globs
 #
-# This is just an illustrative example — yours is generated from what you
-# actually copy. Flip the allow/deny values to taste.
+# The defaults allow the common text and image types, and deny a few that are
+# useless or actively unhelpful to move between machines:
+#   JAVA_DATATRANSFER*   Java/Swing mints one of these per transfer, so recording
+#                        each would grow this file without bound.
+#   *;charset=utf-16*    redundant with the UTF-8 representation of the same text.
+#   text/uri-list        file copies put local filesystem paths on the clipboard;
+#   x-special/*          those paths don't resolve on another machine.
+#   image/bmp            uncompressed, so it burns the payload budget for nothing.
+# Flip any of them to taste — this file is yours once created.
+
+[clipmesh]
 
 [rules]
-"image/png" = "allow"
+"*;charset=utf-16*" = "deny"
+"JAVA_DATATRANSFER*" = "deny"
+"STRING" = "allow"
+"TEXT" = "allow"
+"UTF8_STRING" = "allow"
+"image/bmp" = "deny"
 "image/jpeg" = "allow"
+"image/png" = "allow"
+"image/tiff" = { rule = "allow", max = "16MiB" }
 "text/html" = "allow"
 "text/plain" = "allow"
 "text/plain;charset=utf-8" = "allow"
-"STRING" = "allow"
-"UTF8_STRING" = "allow"
-"TEXT" = "allow"
-"image/bmp" = "deny"
-"image/tiff" = { rule = "allow", max = "16MiB" }
-"JAVA_DATATRANSFER*" = "deny"
-"*;charset=utf-16*" = "deny"
-# File copies put local filesystem paths on the clipboard (text/uri-list, and
-# x-special/gnome-copied-files from the file manager); those paths don't resolve
-# on another machine, so syncing them is pointless and misleading.
 "text/uri-list" = "deny"
 "x-special/*" = "deny"

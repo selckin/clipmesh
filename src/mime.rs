@@ -36,7 +36,14 @@ pub fn lock_rules(rules: &Mutex<MimeRules>) -> MutexGuard<'_, MimeRules> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Skeleton written for a brand-new (or reset) rules file.
+/// Skeleton written for a brand-new (or reset) rules file, and the source
+/// `examples/mimetypes` is generated from — see `render_example`.
+///
+/// The `[rules]` defaults matter: with the deny-by-default `unknown_mime`
+/// policy, an empty table means clipmesh syncs *nothing* until the user curates
+/// it, and the deny globs below are what keep per-transfer atom names from
+/// accumulating in this file forever. Shipping them here rather than only in the
+/// example means every install gets them, not just the ones that ran install.sh.
 const TEMPLATE: &str = "\
 # clipmesh MIME rules — managed, but safe to hand-edit.
 #
@@ -44,17 +51,67 @@ const TEMPLATE: &str = "\
 #   \"<mime>\" = \"allow\"                          # sync this type
 #   \"<mime>\" = \"deny\"                           # never sync it
 #   \"<mime>\" = { rule = \"allow\", max = \"4MiB\" } # allow, with a per-type cap
+#                                               # (on top of max_payload_size)
 #
-# Keys are quoted, so MIME types with spaces or punctuation are fine. clipmesh
-# appends any new type it sees (using the unknown_mime default), keeps the
-# entries sorted, and reloads this file when it changes. Comments up here above
-# [rules] are kept; notes placed among the rules are dropped on save. The
-# [clipmesh] table below is managed automatically — leave it alone.
+# Keys are quoted TOML strings, so MIME types with spaces, ';', '=' or other
+# punctuation (e.g. Java dataflavors) are fine. A key may also be a glob: '*'
+# matches any run of characters, '?' matches exactly one (always wildcards, no
+# escape) — e.g. \"JAVA_DATATRANSFER*\" or \"*;charset=utf-16*\". Matching is
+# case-insensitive (ASCII), and when several keys match a type the most specific
+# wins (an exact key beats a glob; among globs, more literal characters win, ties
+# break to deny).
+#
+# clipmesh manages this file: it creates it with the defaults below, appends any
+# new type it sees (using the config's unknown_mime default, unless a glob
+# already covers it), and reloads it when it changes (so edits apply right away).
+# It keeps the [rules] entries sorted and drops notes placed among them; comments
+# up here above [rules] are kept. The [clipmesh] table is added and managed
+# automatically — leave it alone. You can also manage rules without opening the
+# file:
+#   clipmesh --allow \"*/svg+xml\"   clipmesh --deny \"JAVA_DATATRANSFER*\"
+#   clipmesh --rules   # list the rules and flag overlapping globs
+#
+# The defaults allow the common text and image types, and deny a few that are
+# useless or actively unhelpful to move between machines:
+#   JAVA_DATATRANSFER*   Java/Swing mints one of these per transfer, so recording
+#                        each would grow this file without bound.
+#   *;charset=utf-16*    redundant with the UTF-8 representation of the same text.
+#   text/uri-list        file copies put local filesystem paths on the clipboard;
+#   x-special/*          those paths don't resolve on another machine.
+#   image/bmp            uncompressed, so it burns the payload budget for nothing.
+# Flip any of them to taste — this file is yours once created.
 
 [clipmesh]
 
 [rules]
+\"text/plain\" = \"allow\"
+\"text/plain;charset=utf-8\" = \"allow\"
+\"text/html\" = \"allow\"
+\"STRING\" = \"allow\"
+\"UTF8_STRING\" = \"allow\"
+\"TEXT\" = \"allow\"
+\"image/png\" = \"allow\"
+\"image/jpeg\" = \"allow\"
+\"image/tiff\" = { rule = \"allow\", max = \"16MiB\" }
+\"image/bmp\" = \"deny\"
+\"JAVA_DATATRANSFER*\" = \"deny\"
+\"*;charset=utf-16*\" = \"deny\"
+\"text/uri-list\" = \"deny\"
+\"x-special/*\" = \"deny\"
 ";
+
+/// The built-in skeleton in its canonical on-disk form — byte-for-byte what
+/// clipmesh writes when it creates a fresh rules file (`materialize_fresh` →
+/// `write_file` → `body`, which sorts and strips interleaved comments).
+///
+/// `examples/mimetypes` is generated from this and pinned by a golden test, so
+/// the shipped example and the file clipmesh creates itself cannot drift — the
+/// same arrangement `config_template` uses for `examples/config.toml`.
+pub fn render_example() -> String {
+    let mut doc: DocumentMut = TEMPLATE.parse().expect("built-in TOML template must parse");
+    normalize(&mut doc);
+    doc.to_string()
+}
 
 /// One rule: whether the type may sync, and an optional per-type size cap
 /// (applied to that representation's bytes, on top of `max_payload_size`).
@@ -950,20 +1007,23 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_rules_symlink_loads_empty_and_materializes_at_the_target() {
+    fn a_broken_rules_symlink_materializes_the_skeleton_at_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real-mimetypes"); // does not exist yet
         let link = dir.path().join("mimetypes");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let rules = MimeRules::load(Some(link.clone()), MimePolicy::Deny);
-        // Deny-by-default empty ruleset, and the fresh skeleton is written
-        // through the (previously broken) symlink, creating the target.
-        assert!(!rules.allows("image/png", 1));
+        // A type the skeleton says nothing about still falls to the
+        // deny-by-default policy...
+        assert!(!rules.allows("application/x-never-seen", 1));
+        // ...and the fresh skeleton is written through the (previously broken)
+        // symlink, creating the target.
         assert!(
             target.exists(),
             "a fresh skeleton should be materialized at the symlink target"
         );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), render_example());
     }
 
     fn write(path: &Path, contents: &str) {
@@ -1193,6 +1253,56 @@ mod tests {
         write(&path, "[rules]\n\"image/png\" = \"deny\"\n");
         assert!(rules.reload_if_changed(), "valid fix must be applied");
         assert!(!rules.allows("image/png", 1));
+    }
+
+    #[test]
+    fn example_mimetypes_matches_template() {
+        let expected = render_example();
+        let path = "examples/mimetypes"; // cargo runs tests with CWD = crate root
+        if std::env::var("CLIPMESH_REGEN_EXAMPLE").is_ok() {
+            std::fs::write(path, &expected).unwrap();
+            return;
+        }
+        let actual = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            actual, expected,
+            "examples/mimetypes is stale; regenerate with \
+             CLIPMESH_REGEN_EXAMPLE=1 cargo test --lib example_mimetypes_matches_template"
+        );
+    }
+
+    #[test]
+    fn a_fresh_rules_file_is_written_exactly_as_the_example() {
+        // The example is only meaningful as a default if it is what clipmesh
+        // actually creates. Materialize a fresh file and compare the bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        let _rules = MimeRules::load(Some(path.clone()), MimePolicy::Deny);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_example());
+    }
+
+    #[test]
+    fn the_shipped_defaults_cover_the_unbounded_growth_cases() {
+        // These globs are the reason the defaults live in the skeleton rather
+        // than only in the example: without them a per-transfer atom name is
+        // recorded on every copy and the file grows without bound.
+        let (_dir, mut rules) = loaded(&render_example(), MimePolicy::Deny);
+        for mime in [
+            "JAVA_DATATRANSFER_COOKIE_f9e96042",
+            "JAVA_DATATRANSFER_COOKIE_0000abcd",
+            "text/plain;charset=utf-16le",
+            "x-special/gnome-copied-files",
+        ] {
+            assert!(!rules.allows(mime, 1), "{mime} should be denied by default");
+            assert!(
+                !rules.ensure([&mime.to_string()]),
+                "{mime} is covered by a glob, so it must not be appended"
+            );
+        }
+        // and the everyday types do sync out of the box
+        for mime in ["text/plain", "text/plain;charset=utf-8", "image/png"] {
+            assert!(rules.allows(mime, 1), "{mime} should be allowed by default");
+        }
     }
 
     #[test]

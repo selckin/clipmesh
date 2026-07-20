@@ -37,10 +37,11 @@ else
     echo "==> Keeping existing $CONFIG"
 fi
 
-# Seed the MIME-rules file from the example so common text/image types sync out
-# of the box (clipmesh otherwise creates a header-only file and, with the
-# deny-by-default policy, syncs nothing until you curate it). Never overwrite an
-# existing file -- it's yours to edit and clipmesh appends to it.
+# Put the MIME-rules file in place up front so it's there to edit before the
+# first run. clipmesh creates the identical file itself if this is skipped --
+# examples/mimetypes is generated from the same built-in skeleton -- so this is
+# a convenience, not a requirement. Never overwrite an existing file: it's yours
+# to edit and clipmesh appends to it.
 if [[ ! -f "$MIMETYPES" ]]; then
     cp examples/mimetypes "$MIMETYPES"
     echo "==> Created $MIMETYPES from example -- edit to allow/deny types"

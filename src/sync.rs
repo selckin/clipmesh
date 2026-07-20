@@ -2965,12 +2965,17 @@ mod tests {
         cfg.unknown_mime = MimePolicy::Deny;
         cfg.mime_rules_path = Some(path.clone());
         let mut h = start(cfg).await;
-        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        // A type the shipped defaults say nothing about, so it is genuinely
+        // unseen (text/plain and friends now ship allowed in the skeleton).
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[("application/x-custom", b"hi")]),
+        );
         // deny-by-default: nothing syncs, but the new type is written out
         assert_no_broadcast(&mut h).await;
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
-            written.contains("\"text/plain\" = \"deny\""),
+            written.contains("\"application/x-custom\" = \"deny\""),
             "got:\n{written}"
         );
     }
@@ -3216,14 +3221,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         cfg.mime_rules_path = Some(dir.path().join("mimetypes"));
         let mut h = start(cfg).await;
-        // text/plain is a brand-new type
-        h.clip.local_copy(SelectionKind::Clipboard, offer("hello"));
+        // a type the shipped defaults don't cover, so capturing it is new
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[("application/x-custom", b"hi")]),
+        );
         // we should see a Clip (content) and, separately, a Rules broadcast
         let mut saw_rules = false;
         for _ in 0..3 {
             match recv_msg(&mut h).await {
                 Message::Rules { body, .. } => {
-                    assert!(body.contains("text/plain"), "body:\n{body}");
+                    assert!(body.contains("application/x-custom"), "body:\n{body}");
                     assert!(body.contains("version ="), "body:\n{body}");
                     saw_rules = true;
                     break;

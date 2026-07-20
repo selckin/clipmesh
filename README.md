@@ -141,7 +141,11 @@ foreground) and a config change just stops the daemon. Live MIME-rule reloads
 
 Which clipboard types sync is decided per-type by a TOML rules file kept next to
 the config (default `~/.config/clipmesh/mimetypes`; see `examples/mimetypes`).
-Each entry under `[rules]` is:
+clipmesh creates it for you with working defaults — the common text and image
+types allowed, plus deny globs for things that are useless between machines
+(`text/uri-list`, `x-special/*`) or that churn (`JAVA_DATATRANSFER*`) — so
+copying works out of the box and you only edit to taste. Each entry under
+`[rules]` is:
 
     "<mime>" = "allow" | "deny"           # or, with a per-type size cap:
     "<mime>" = { rule = "allow", max = "4MiB" }
@@ -167,14 +171,16 @@ of the file.
 clipmesh manages the file for you:
 
 - The `unknown_mime` config option decides what happens to a type with no rule
-  yet — **`deny` by default**, so nothing syncs until you allow it. Set it to
-  `allow` to sync everything you haven't explicitly denied.
+  yet — **`deny` by default**, so a type the shipped defaults don't already
+  cover is recorded as `deny` the first time you copy it, and syncs once you
+  flip it. Set it to `allow` to sync everything you haven't explicitly denied.
 - `synthesize_text_plain` (off by default) back-fills `text/plain;charset=utf-8`
   and `text/plain` from a legacy `UTF8_STRING`/`STRING`/`TEXT` atom when a copied
   selection offers no `text/plain*` rep, so Wayland-native apps can paste content
   copied from X11/legacy apps (`STRING` is re-encoded from latin-1, `TEXT` is
-  sniffed). The synthesized types pass through these rules, so with
-  `unknown_mime = "deny"` you must allow `text/plain*` or they're stripped.
+  sniffed). The synthesized types pass through these rules — the shipped
+  defaults already allow `text/plain*`, so this only bites if you have denied
+  them.
   Synthesis applies to what's broadcast to peers; to make it paste on the
   *origin* host too, also enable `take_ownership`.
 - `take_ownership` (off by default) makes clipmesh re-offer each selection after
@@ -225,5 +231,5 @@ clipmesh manages the file for you:
   `text/plain` from it — re-encoded to UTF-8 (`STRING` is latin-1; `TEXT` is
   sniffed) and trimmed of a trailing NUL/newline — so Wayland-native apps that
   only understand `text/plain` can paste it. The synthesized types pass through
-  the rules above, so under deny-by-default you must allow `text/plain*` or they
-  are stripped.
+  the rules above; the shipped defaults allow `text/plain*`, so they survive
+  unless you have denied them.
