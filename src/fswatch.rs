@@ -187,8 +187,7 @@ fn add_file_watches(
 ) -> Result<()> {
     // CREATE is needed at the link site to notice a symlink created by
     // symlink(2) (e.g. stow's `ln -sf`), which emits no CLOSE_WRITE/MOVED_TO.
-    let link_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE;
-    let target_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
+    let link_mask = target_mask() | WatchMask::CREATE;
 
     let link_dir = watch_dir(path);
     let wd = ensure_watch(inotify, masks, &link_dir, link_mask)?;
@@ -202,7 +201,7 @@ fn add_file_watches(
     match target_site(path) {
         TargetSite::Watch(target_path) => {
             let dir = watch_dir(&target_path);
-            let wd = ensure_watch(inotify, masks, &dir, target_mask)?;
+            let wd = ensure_watch(inotify, masks, &dir, target_mask())?;
             info!(
                 "{} {} is a symlink; also watching its target directory {}",
                 target.label(),
@@ -226,6 +225,14 @@ fn add_file_watches(
         ),
     }
     Ok(())
+}
+
+/// Events on a watched file's real directory that mean its contents settled: a
+/// completed write, or an atomic replace via rename. Both registration sites
+/// (initial and re-resolve) share this, so the two can't drift apart and start
+/// watching for different events.
+fn target_mask() -> WatchMask {
+    WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO
 }
 
 /// Re-resolve a file's target site after its link fired (the symlink may have
@@ -264,8 +271,7 @@ fn reconcile_target(
     let old = pos.map(|i| entries.remove(i));
     if let Some(target_path) = desired {
         let dir = watch_dir(&target_path);
-        let target_mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO;
-        match ensure_watch(inotify, masks, &dir, target_mask) {
+        match ensure_watch(inotify, masks, &dir, target_mask()) {
             Ok(wd) => {
                 info!(
                     "{} {} symlink target changed; now watching {}",

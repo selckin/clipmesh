@@ -379,18 +379,40 @@ const TEMPLATE: &[Block] = &[
     },
 ];
 
+/// The value this file already shows for `key`: a `Required` block's sample, an
+/// `Optional` block's default, or a psk source's sample.
+fn template_value(key: &str) -> Option<&'static str> {
+    let from_blocks = TEMPLATE.iter().find_map(|block| match block {
+        Block::Required { key: k, sample, .. } if *k == key => Some(*sample),
+        Block::Optional {
+            key: k, default, ..
+        } if *k == key => Some(*default),
+        _ => None,
+    });
+    from_blocks.or_else(|| {
+        PSK_SAMPLES
+            .iter()
+            .find_map(|(k, sample)| (*k == key).then_some(*sample))
+    })
+}
+
 /// The illustrative values used to generate `examples/config.toml`: the example
 /// shows `listen`/`port`/`peers`/`psk_file` active, everything else commented.
+///
+/// Only the *keys* are listed here — the values come from the template itself,
+/// so an active line in the example can't disagree with the commented default
+/// shown beside it. Spelling them out again would make a changed default fail
+/// the golden test while regenerating silently shipped the stale value.
 fn example_values() -> Values {
-    let scalars = [
-        ("listen", "\"0.0.0.0\""),
-        ("port", "48100"),
-        ("peers", "[\"host-b\", \"host-c\"]"),
-        ("psk_file", "\"~/.config/clipmesh/psk\""),
-    ]
-    .iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
+    const ACTIVE: [&str; 4] = ["listen", "port", "peers", "psk_file"];
+    let scalars = ACTIVE
+        .iter()
+        .map(|key| {
+            let value = template_value(key)
+                .unwrap_or_else(|| panic!("example key {key:?} is not in the template"));
+            (key.to_string(), value.to_string())
+        })
+        .collect();
     Values {
         scalars,
         link: None,
