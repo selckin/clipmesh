@@ -19,7 +19,7 @@ use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use toml_edit::{value, Decor, DocumentMut, Item, Key, Table, Value};
+use toml_edit::{value, Decor, DocumentMut, Item, Key, Table, TomlError, Value};
 
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -328,7 +328,7 @@ impl MimeRules {
         };
         match fs::read_to_string(&path) {
             Ok(text) if text.trim().is_empty() => Err(RulesFileState::Empty),
-            Ok(text) => match text.parse::<DocumentMut>() {
+            Ok(text) => match parse_body(&text) {
                 Ok(doc) => {
                     self.ingest(doc, text, &path);
                     Ok(())
@@ -342,7 +342,7 @@ impl MimeRules {
 
     /// Write the built-in skeleton (comments + empty `[clipmesh]`/`[rules]`).
     fn materialize_fresh(&mut self) {
-        self.doc = TEMPLATE.parse().expect("built-in TOML template must parse");
+        self.doc = parse_body(TEMPLATE).expect("built-in TOML template must parse");
         self.loaded = None;
         self.dirty = true;
         self.persist_body(None);
@@ -389,7 +389,7 @@ impl MimeRules {
     /// so this reports rather than only logging.
     #[must_use]
     pub fn replace_from(&mut self, text: String) -> bool {
-        match text.parse::<DocumentMut>() {
+        match parse_body(&text) {
             Ok(doc) => {
                 let label = self.path.clone().unwrap_or_else(|| PathBuf::from("<peer>"));
                 warn_invalid_rules(&doc, &label);
@@ -424,7 +424,7 @@ impl MimeRules {
                 false
             }
             Ok(text) => {
-                match text.parse::<DocumentMut>() {
+                match parse_body(&text) {
                     Ok(doc) => {
                         debug!("MIME rules file changed on disk; reloading");
                         self.ingest(doc, text, &path);
@@ -533,7 +533,20 @@ impl MimeRules {
     /// Add or replace a single `allow`/`deny` rule for `key` (which may be a
     /// glob). The other half of [`apply_glob`](Self::apply_glob).
     fn set_rule(&mut self, key: &str, allow: bool) {
-        table_mut(&mut self.doc, "rules")[key] = value(rule_word(allow));
+        let rules = table_mut(&mut self.doc, "rules");
+        // Write to the key that is already there, whatever its case.
+        // `remove_matching` spares an entry equal to the pattern — comparing
+        // case-insensitively, as all MIME matching here does — so that
+        // `apply_glob` can flip it in place. Inserting the pattern verbatim
+        // instead left that entry untouched beside a new one: two rules for one
+        // type, scoring identically, resolved by the deny tie-break. `--allow
+        // utf8_string` against the template's `UTF8_STRING` therefore did
+        // nothing at all, and shipped the duplicate to every peer.
+        let existing = rules
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .find(|k| k.eq_ignore_ascii_case(key));
+        rules[existing.as_deref().unwrap_or(key)] = value(rule_word(allow));
         self.dirty = true;
     }
 
@@ -685,7 +698,7 @@ impl MimeRules {
     /// until restart. What we hold is at worst the built-in template plus a stamp
     /// we failed to write, which beats nothing.
     fn revert_to_loaded(&mut self) {
-        let restored = match self.loaded.as_deref().map(str::parse::<DocumentMut>) {
+        let restored = match self.loaded.as_deref().map(parse_body) {
             Some(Ok(doc)) => Some(doc),
             Some(Err(e)) => {
                 warn!("couldn't restore the last-good MIME rules ({e}); keeping the current ones");
@@ -940,8 +953,48 @@ impl CompiledRules<'_> {
     }
 }
 
+/// The top-level tables this module reads and rewrites. Both are accepted in
+/// either TOML flavour — see [`parse_body`].
+const MANAGED_TABLES: [&str; 2] = ["clipmesh", "rules"];
+
+/// Parse a rules-file body into the document shape the rest of this module
+/// assumes: [`MANAGED_TABLES`] as header tables, never inline ones.
+///
+/// `rules = { "text/plain" = "allow" }` is valid TOML and means exactly what the
+/// `[rules]` header form means, but `toml_edit` stores it as an inline *value*,
+/// which `Item::as_table` does not see. Collapsing the two flavours here — the
+/// module's only door from text to document — is what keeps every read and write
+/// site from having to remember the distinction. They didn't: lookups silently
+/// missed the whole table (so the node fell through to `unknown_mime` and
+/// stopped syncing anything), and `table_mut`'s `is_table()` guard is blind the
+/// same way, so the first unseen type replaced the user's ruleset with an empty
+/// table and `share_mime_rules` pushed it to every peer.
+///
+/// Canonicalizing costs the user nothing they were not already going to see:
+/// this file is program-managed, and `normalize` rewrites `[rules]` sorted on
+/// every unseen type anyway.
+fn parse_body(text: &str) -> Result<DocumentMut, TomlError> {
+    let mut doc = text.parse::<DocumentMut>()?;
+    for key in MANAGED_TABLES {
+        let Some(item) = doc.get_mut(key) else {
+            continue;
+        };
+        // `into_table` promotes an inline table and returns a header table
+        // unchanged; anything else comes back untouched in the `Err` arm, so the
+        // sites that report an unusable value still see exactly what was written.
+        let taken = std::mem::take(item);
+        *item = match taken.into_table() {
+            Ok(t) => Item::Table(t),
+            Err(original) => original,
+        };
+    }
+    Ok(doc)
+}
+
 /// Get a mutable handle to a top-level table, creating it (as an explicit table)
-/// if absent or if the key currently holds something else.
+/// if absent or if the key currently holds something else. Inline tables reach
+/// this already promoted by [`parse_body`], so "something else" really is
+/// something else — not a table this would silently discard.
 fn table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
     let item = &mut doc[name];
     if !item.is_table() {
@@ -1654,6 +1707,37 @@ mod tests {
         }
     }
 
+    /// A hand-written `rules = { ... }` is an ordinary TOML table — it parses,
+    /// so `read_file` accepts it — but it is stored as an inline *value*, which
+    /// `Item::as_table` does not see. Reading the table that way made every
+    /// lookup miss, so the node silently fell through to `unknown_mime` (deny)
+    /// and stopped syncing anything; then the first unseen type reached
+    /// `table_mut`, whose `is_table()` guard is also inline-blind, and replaced
+    /// the user's whole ruleset with an empty table — which `share_mime_rules`
+    /// then broadcast to every peer.
+    #[test]
+    fn an_inline_rules_table_is_honoured_and_survives_recording_a_new_type() {
+        let (_dir, mut rules) = loaded(
+            "rules = { \"text/plain\" = \"allow\", \"image/png\" = \"allow\" }\n",
+            MimePolicy::Deny,
+        );
+        assert!(
+            rules.allows("text/plain", 10),
+            "an inline [rules] table must decide lookups like a regular one"
+        );
+        assert!(rules.allows("image/png", 10));
+
+        assert!(
+            rules.ensure([&s("text/html")]),
+            "an unseen type should still be recorded"
+        );
+        assert!(
+            rules.allows("text/plain", 10),
+            "recording a new type destroyed the existing rules"
+        );
+        assert!(rules.allows("image/png", 10));
+    }
+
     #[test]
     fn ensure_does_not_duplicate_a_type_already_present_as_an_invalid_value() {
         let (_dir, mut rules) = loaded("[rules]\n\"image/png\" = \"allwo\"\n", MimePolicy::Deny);
@@ -2095,6 +2179,38 @@ mod tests {
         );
         assert!(!body.contains("JAVA_X"), "covered exact entry removed");
         assert!(!rules.allows("JAVA_DATATRANSFER_COOKIE_x", 1));
+    }
+
+    /// `remove_matching` spares an entry equal to the pattern so `apply_glob`
+    /// flips it in place — and compares case-insensitively, because MIME
+    /// matching is case-insensitive throughout. `set_rule` then wrote the
+    /// pattern *verbatim*, so a differently-cased existing key was neither
+    /// removed nor overwritten: the file grew a second entry for one type, and
+    /// since the two score identically on literals and wildcards the deny
+    /// tie-break decided — making `--allow` on any type the built-in template
+    /// spells in uppercase (`UTF8_STRING`, `TARGETS`, …) a silent no-op that
+    /// also shipped a confusing duplicate to every peer.
+    #[test]
+    fn allowing_a_type_spelled_in_another_case_flips_it_rather_than_duplicating_it() {
+        let (_dir, mut rules) = loaded("[rules]\n\"UTF8_STRING\" = \"deny\"\n", MimePolicy::Deny);
+
+        let removed = rules.apply_glob(true, "utf8_string");
+
+        assert!(
+            removed.is_empty(),
+            "the existing entry is flipped in place, not removed: {removed:?}"
+        );
+        assert!(
+            rules.allows("UTF8_STRING", 10),
+            "--allow left the type denied"
+        );
+        rules.persist();
+        let body = rules.body();
+        assert_eq!(
+            body.matches("utf8_string").count() + body.matches("UTF8_STRING").count(),
+            1,
+            "one type must have one rule:\n{body}"
+        );
     }
 
     #[test]

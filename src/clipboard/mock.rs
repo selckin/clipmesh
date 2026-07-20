@@ -15,6 +15,9 @@ pub struct MockClipboard {
     writes: AtomicUsize,
     fail_writes: std::sync::atomic::AtomicBool,
     fail_reads: std::sync::atomic::AtomicBool,
+    /// Advertise types but read back nothing — see
+    /// [`drop_all_representations`](MockClipboard::drop_all_representations).
+    drop_reads: std::sync::atomic::AtomicBool,
     /// `Some` while reads are gated by `block_reads`; `None` (the default) lets
     /// them through immediately.
     read_gate: Mutex<Option<Arc<Semaphore>>>,
@@ -29,6 +32,7 @@ impl MockClipboard {
             writes: AtomicUsize::new(0),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
             fail_reads: std::sync::atomic::AtomicBool::new(false),
+            drop_reads: std::sync::atomic::AtomicBool::new(false),
             read_gate: Mutex::new(None),
         })
     }
@@ -42,6 +46,18 @@ impl MockClipboard {
     /// Make subsequent read_offer calls fail (simulates a transient read error).
     pub fn set_fail_reads(&self, fail: bool) {
         self.fail_reads.store(fail, Ordering::SeqCst);
+    }
+
+    /// Keep advertising types from `list_types` but read back nothing, modelling
+    /// the real backend's own `max_payload_size` enforcement: `assemble_offer`
+    /// skips an over-budget representation *while reading*, so a clipboard full
+    /// of oversized content reaches the engine as an empty offer.
+    ///
+    /// Without this the mock cannot express the case at all — it ignores
+    /// `max_payload` and hands back whatever it holds — which is why the engine
+    /// reported such a clipboard as `Empty` with every test passing.
+    pub fn drop_all_representations(&self) {
+        self.drop_reads.store(true, Ordering::SeqCst);
     }
 
     /// Stall every subsequent `read_offer` until [`allow_reads`], modelling a
@@ -156,6 +172,9 @@ impl Clipboard for MockClipboard {
         let gate = self.read_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             let _permit = gate.acquire().await;
+        }
+        if self.drop_reads.load(Ordering::SeqCst) {
+            return Ok(Offer::new());
         }
         let mut offer = self.get(kind).unwrap_or_default();
         if let Some(want) = only {

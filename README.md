@@ -49,11 +49,19 @@ skeleton, a starter MIME-rules file, and generates a secret on first run
 (existing config/rules/psk are never touched). Re-run it after every update; it
 restarts the service for you.
 
+**Upgrade every host together.** The wire format is not self-describing, so
+nodes running different protocol versions refuse each other at the handshake
+(logged on both sides) rather than misreading each other. A partial rollout
+stops syncing until it is finished; it never corrupts anything.
+
 Then, first time only:
 
     $EDITOR ~/.config/clipmesh/config.toml   # set listen + peers
     # copy ~/.config/clipmesh/psk to every other host
     systemctl --user enable --now clipmesh
+
+Paths below are written as `~/.config` for readability; clipmesh and the
+installer both honour `$XDG_CONFIG_HOME` when it is set to an absolute path.
 
 <details>
 <summary>Manual setup (what the script does)</summary>
@@ -87,9 +95,12 @@ asks it for the clipboard, and writes the answer out:
     clipmesh --paste --node desktop:48100   # one specific node
 
 Flags mirror `wl-paste`: `-t/--type`, `-l/--list-types`, `-n/--no-newline`,
-`-p/--primary`. The PSK comes from the usual config (`--config <path>` to
-override), so the host still needs a `config.toml` with the psk and at least one
-peer — but no compositor.
+`-p/--primary`. Both `getopt` spellings of an attached value work
+(`--type=text/plain`, `-ttext/plain`), and `-t` accepts the generic names
+`wl-paste` documents — `-t text` or `-t image` picks any offered type of that
+kind. The PSK comes from the usual config (`--config <path>` to override), so the
+host still needs a `config.toml` with the psk and at least one peer — but no
+compositor.
 
 By default (no `--node`) it tries **every** configured peer concurrently and
 uses the first that responds, so a headless host needn't know which of its

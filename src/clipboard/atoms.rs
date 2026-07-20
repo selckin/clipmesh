@@ -83,8 +83,19 @@ pub fn is_machinery(mime: &str) -> bool {
 /// knowing what ICCCM is.
 pub fn text_value(offer: &Offer) -> Option<(&'static str, Vec<u8>)> {
     let atom = text_source(offer.keys().map(String::as_str))?;
-    let bytes = offer.get(atom)?;
-    Some((atom, clean(reencode(atom, bytes))))
+    Some((atom, value_of(offer, atom)?))
+}
+
+/// The UTF-8 text value of one *named* legacy atom in `offer`.
+///
+/// [`text_value`] picks the atom and decodes it in one step, which suits a
+/// caller holding only an offer. A caller that already decided which atom
+/// applies — from the type names, before the read — needs the decoding half on
+/// its own, and must get it from here rather than re-deriving the encoding
+/// rules: which atom declares which encoding is exactly what this module exists
+/// to keep in one place.
+pub fn value_of(offer: &Offer, atom: &str) -> Option<Vec<u8>> {
+    Some(clean(reencode(atom, offer.get(atom)?)))
 }
 
 /// The atom [`text_value`] would derive from, chosen from type *names* alone.

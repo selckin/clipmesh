@@ -70,14 +70,26 @@ impl PasteArgs {
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
-            // Real wl-paste parses with getopt_long, so `--type=text/plain` is
-            // as valid as `--type text/plain`. Splitting here means each flag is
-            // still written once, in one form — impersonation that rejected a
-            // spelling the real tool accepts would break existing scripts with
-            // an error naming a flag they know works.
-            let (flag, mut inline) = match arg.split_once('=') {
-                Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
-                _ => (arg.as_str(), None),
+            // Real wl-paste parses with getopt_long, which accepts a value
+            // attached to its flag in two spellings: `--type=text/plain` for a
+            // long option and `-ttext/plain` for a short one. Splitting both
+            // here means each flag is still written once, in one form —
+            // impersonation that rejected a spelling the real tool accepts
+            // breaks existing scripts with an error naming a flag they know
+            // works.
+            //
+            // The short split is by *position*, not by a separator: a short
+            // option is exactly two characters, and everything after them is the
+            // value. Looking for an `=` there instead would mangle
+            // `-ttext/plain;charset=utf-8`, whose value legitimately contains
+            // one.
+            let (flag, mut inline) = match arg.as_str() {
+                a if a.starts_with("--") => match a.split_once('=') {
+                    Some((f, v)) => (f, Some(v.to_string())),
+                    None => (a, None),
+                },
+                a if a.starts_with('-') && a.len() > 2 => (&a[..2], Some(a[2..].to_string())),
+                a => (a, None),
             };
             let mut value = || {
                 inline
@@ -111,9 +123,13 @@ impl PasteArgs {
     }
 }
 
-/// Pick the MIME type to print. With an explicit request, require an exact
-/// (case-insensitive) match. Otherwise prefer the `text/plain` representations
-/// richest-first, then the first `text/*`, then the first offered type.
+/// Pick the MIME type to print. With an explicit request, take the first type
+/// satisfying it by [`type_matches`] — an exact case-insensitive match, or any
+/// member of the family for a generic `-t text` / `-t image`. Otherwise prefer
+/// the `text/plain` representations richest-first, then the first `text/*`, then
+/// the first offered type.
+///
+/// [`type_matches`]: protocol::type_matches
 fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str> {
     let find = |want: &str| {
         offer
@@ -315,6 +331,12 @@ fn explain(reason: Unavailable, addr: &str, want: SelectionKind) -> String {
         Unavailable::TooLarge => format!(
             "the {want:?} clipboard on {addr} exceeds that node's \
              max_payload_size"
+        ),
+        Unavailable::Unservable => format!(
+            "{addr} has content on its {want:?} clipboard but could not hand any \
+             of it over — most likely every representation exceeds that node's \
+             max_payload_size (raise it on {addr}; its log names the types it \
+             skipped)"
         ),
         Unavailable::Unreadable => format!(
             "{addr} could not read its own {want:?} clipboard — the application \
@@ -590,6 +612,39 @@ mod tests {
         assert_eq!(
             PasteArgs::parse(&args(&["--type="])).unwrap().type_,
             Some(String::new())
+        );
+    }
+
+    /// getopt's other attached-value spelling: a short option carrying its value
+    /// with no separator. `wl-paste -ttext/plain` works against the real tool,
+    /// so a script using it broke here with "unknown paste flag: -ttext/plain" —
+    /// the same class of impersonation failure the `--type=value` split exists
+    /// to prevent, left unhandled for the short forms.
+    #[test]
+    fn parse_accepts_a_short_option_with_an_attached_value() {
+        let a = PasteArgs::parse(&args(&["-ttext/plain"])).unwrap();
+        assert_eq!(a.type_.as_deref(), Some("text/plain"));
+
+        // Bundling is not getopt's only short form, but it is the one that
+        // matters here: flags that take no value must not swallow trailing text
+        // and silently paste something else.
+        assert!(PasteArgs::parse(&args(&["-lyes"])).is_err());
+
+        // The separated spelling still works, and so does a value that itself
+        // contains an `=`.
+        assert_eq!(
+            PasteArgs::parse(&args(&["-t", "text/plain;charset=utf-8"]))
+                .unwrap()
+                .type_
+                .as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            PasteArgs::parse(&args(&["-ttext/plain;charset=utf-8"]))
+                .unwrap()
+                .type_
+                .as_deref(),
+            Some("text/plain;charset=utf-8")
         );
     }
 

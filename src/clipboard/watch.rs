@@ -48,8 +48,13 @@ pub fn spawn_watcher(
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
 fn run(tx: mpsc::UnboundedSender<ClipboardEvent>, watched: Vec<SelectionKind>, max_payload: usize) {
+    // Only the first connection is the subscribe; `supervise` reruns this
+    // closure for every reconnect. See [`Connect`].
+    let mut connect = Connect::Subscribe;
     crate::backoff::supervise("clipboard watcher", || {
-        match watch_once(&tx, &watched, max_payload) {
+        let result = watch_once(&tx, &watched, max_payload, connect);
+        connect = Connect::Reconnect;
+        match result {
             // engine gone; stop watching
             Ok(StopReason::ReceiverGone) => return ControlFlow::Break(()),
             Ok(StopReason::Finished) => {
@@ -64,6 +69,31 @@ fn run(tx: mpsc::UnboundedSender<ClipboardEvent>, watched: Vec<SelectionKind>, m
     });
 }
 
+/// Why this connection to the compositor is being made — which decides how its
+/// startup burst is reported.
+///
+/// The distinction is load-bearing. `Clipboard::watch` promises `Initial`
+/// "as of the subscribe", and the engine acts on that promise: `adopt_restored`
+/// records the content at **stamp 0** and deliberately never broadcasts it,
+/// because a node cannot know how old its restored clipboard is. That is right
+/// for content that was already there when the daemon started, and wrong for
+/// everything else — this watcher is supervised, so it reconnects after any
+/// compositor restart or transient error, and reporting a reconnect's burst as
+/// `Initial` demoted whatever the user had copied in the meantime to stamp 0,
+/// where any peer's older clipboard outranked it and overwrote it on the next
+/// resync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connect {
+    /// The first connection: this *is* the `watch` call, so what it finds is
+    /// pre-existing content.
+    Subscribe,
+    /// A later connection. The watcher was blind while it was down, so what it
+    /// finds now is reported as an ordinary local change: the engine reads it,
+    /// stamps it now, and propagates it.
+    Reconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopReason {
     /// The notification receiver was dropped (the sync engine exited).
     ReceiverGone,
@@ -75,6 +105,7 @@ fn watch_once(
     tx: &mpsc::UnboundedSender<ClipboardEvent>,
     watched: &[SelectionKind],
     max_payload: usize,
+    connect: Connect,
 ) -> Result<StopReason> {
     let conn = Connection::connect_to_env().context("connecting to the Wayland display")?;
     let (globals, mut queue) =
@@ -131,11 +162,11 @@ fn watch_once(
         .roundtrip(&mut state)
         .context("initial Wayland roundtrip")?;
 
-    // Report the pre-existing selections as `Initial`, with content, before any
-    // `Changed` can follow — the contract on `Clipboard::watch`. Reported from
-    // here rather than left for the engine to read back, because a read the
-    // engine does later cannot be told apart from a copy the user makes a moment
-    // after startup.
+    // Report the selections the compositor's burst named, before any `Changed`
+    // can follow — the contract on `Clipboard::watch`. Reported from here rather
+    // than left for the engine to read back, because a read the engine does
+    // later cannot be told apart from a copy the user makes a moment after
+    // startup.
     //
     // KNOWN GAP: `read_offer_blocking` opens its own connection, so a copy
     // landing between the roundtrip above and this read is still reported as
@@ -145,16 +176,12 @@ fn watch_once(
     // is the same in-tree data-control read the per-MIME-type connection storm
     // in `wayland.rs` needs — worth doing once, for both.
     state.draining_initial = false;
-    for kind in std::mem::take(&mut state.initial) {
-        match read_offer_blocking(kind, max_payload, None) {
-            Ok(offer) if !offer.is_empty() => {
-                if tx.send(ClipboardEvent::Initial { kind, offer }).is_err() {
-                    return Ok(StopReason::ReceiverGone);
-                }
-            }
-            Ok(_) => {}
-            Err(e) => warn!("couldn't read the existing {kind:?} selection at startup: {e:#}"),
-        }
+    if let ControlFlow::Break(stop) =
+        report_startup(connect, std::mem::take(&mut state.initial), tx, |kind| {
+            read_offer_bounded(kind, max_payload)
+        })
+    {
+        return Ok(stop);
     }
 
     loop {
@@ -169,6 +196,81 @@ fn watch_once(
             .context("Wayland event dispatch")?;
     }
 }
+
+/// Report the selections the compositor named in its startup burst, as
+/// [`Connect`] dictates: content-carrying `Initial` on the subscribe, a plain
+/// `Changed` on a reconnect.
+///
+/// Takes the read as a closure so the rule can be tested without a compositor —
+/// which is the only way any of this file is covered, and the reconnect arm's
+/// whole point is that it does *not* call the reader.
+fn report_startup(
+    connect: Connect,
+    initial: Vec<SelectionKind>,
+    tx: &mpsc::UnboundedSender<ClipboardEvent>,
+    read: impl Fn(SelectionKind) -> Result<crate::protocol::Offer>,
+) -> ControlFlow<StopReason> {
+    for kind in initial {
+        let event = match connect {
+            // A reconnect's find is an ordinary local change. `Changed` carries
+            // no content, so this arm reads nothing at all — the engine reads
+            // lazily, which is also what stamps it *now* rather than at 0.
+            Connect::Reconnect => ClipboardEvent::Changed(kind),
+            Connect::Subscribe => match read(kind) {
+                // An empty selection has nothing to restore, so it is omitted
+                // entirely — the `Initial` contract.
+                Ok(offer) if offer.is_empty() => continue,
+                Ok(offer) => ClipboardEvent::Initial { kind, offer },
+                // One unreadable selection must not cost the host change
+                // detection on the others.
+                Err(e) => {
+                    warn!("couldn't read the existing {kind:?} selection at startup: {e:#}");
+                    continue;
+                }
+            },
+        };
+        if tx.send(event).is_err() {
+            return ControlFlow::Break(StopReason::ReceiverGone);
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+/// [`read_offer_blocking`] with a hard bound, performed on a thread of its own.
+///
+/// The read blocks in `read_to_end` on a pipe the *selection owner* is
+/// responsible for writing, so a frozen source (or one whose process is stopped)
+/// never returns. It runs on the watcher thread, ahead of the dispatch loop that
+/// detects every clipboard change on this host — so leaving it unbounded did not
+/// make one copy slow, it made the daemon permanently deaf, with `watch_once`
+/// never returning for `supervise` to restart and nothing logged. Every read the
+/// engine performs is bounded for exactly this reason
+/// (`ClipboardIo::READ_TIMEOUT`); this one, on the path everything else depends
+/// on, was not.
+///
+/// The reader thread is detached, not joined: if it is stuck it stays stuck, and
+/// waiting on it is the thing being avoided. It holds only its own connection,
+/// and the compositor tears that down when the process exits.
+fn read_offer_bounded(kind: SelectionKind, max_payload: usize) -> Result<crate::protocol::Offer> {
+    let (done, wait) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        // The receiver is gone on timeout; the send simply fails, which is the
+        // detachment.
+        let _ = done.send(read_offer_blocking(kind, max_payload, None));
+    });
+    match wait.recv_timeout(STARTUP_READ_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "the {kind:?} selection's owner did not serve its content within \
+             {STARTUP_READ_TIMEOUT:?}; skipping it so change detection can start"
+        ),
+    }
+}
+
+/// Bound for the startup content read — see [`read_offer_bounded`]. Matches
+/// `ClipboardIo::READ_TIMEOUT`: a real read of the size-capped clipboard takes
+/// milliseconds, so exceeding this means the source is not serving its pipe.
+const STARTUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[allow(dead_code)] // held only to keep the device proxy alive
 enum Device {
@@ -281,3 +383,129 @@ impl_device_dispatch!(
     ExtDataControlOfferV1,
     ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Offer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn offer(body: &str) -> Offer {
+        let mut o = Offer::new();
+        o.insert("text/plain".to_string(), body.as_bytes().to_vec());
+        o
+    }
+
+    /// The first connection to the compositor *is* the subscribe, so what its
+    /// startup burst finds is pre-existing content: `Initial`, carrying the
+    /// content the backend captured.
+    #[test]
+    fn the_first_connection_reports_pre_existing_content_as_initial() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let flow = report_startup(
+            Connect::Subscribe,
+            vec![SelectionKind::Clipboard],
+            &tx,
+            |_| Ok(offer("existing")),
+        );
+
+        assert!(flow.is_continue());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClipboardEvent::Initial {
+                kind: SelectionKind::Clipboard,
+                offer: offer("existing"),
+            }
+        );
+    }
+
+    /// A reconnect is not a subscribe. The watcher was blind for as long as the
+    /// compositor was away, so whatever the selection holds now may be a copy
+    /// the user made during the outage — a live change. Reporting it as
+    /// `Initial` had the engine record it at stamp 0 and never broadcast it, so
+    /// any peer's older clipboard outranked it and overwrote it on the next
+    /// resync; the copy was lost mesh-wide.
+    #[test]
+    fn a_reconnect_reports_what_it_finds_as_a_live_change() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reads = AtomicUsize::new(0);
+        let flow = report_startup(
+            Connect::Reconnect,
+            vec![SelectionKind::Clipboard],
+            &tx,
+            |_| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(offer("copied while the compositor was away"))
+            },
+        );
+
+        assert!(flow.is_continue());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClipboardEvent::Changed(SelectionKind::Clipboard),
+            "a reconnect must report a live change, not restored content"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "`Changed` carries no content, so the reconnect path must not read one"
+        );
+    }
+
+    /// An empty selection has nothing to restore, so it is omitted entirely —
+    /// the `Initial` contract on `ClipboardEvent`.
+    #[test]
+    fn an_empty_selection_is_not_reported_at_all() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let flow = report_startup(
+            Connect::Subscribe,
+            vec![SelectionKind::Clipboard],
+            &tx,
+            |_| Ok(Offer::new()),
+        );
+
+        assert!(flow.is_continue());
+        assert!(rx.try_recv().is_err(), "an empty selection was reported");
+    }
+
+    /// A read that fails is logged and skipped; it must not take the watcher
+    /// down, or one unreadable selection would cost the host change detection.
+    #[test]
+    fn an_unreadable_selection_is_skipped_not_fatal() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let flow = report_startup(
+            Connect::Subscribe,
+            vec![SelectionKind::Clipboard, SelectionKind::Selection],
+            &tx,
+            |kind| match kind {
+                SelectionKind::Clipboard => bail!("the owner never served its pipe"),
+                _ => Ok(offer("fine")),
+            },
+        );
+
+        assert!(flow.is_continue());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClipboardEvent::Initial {
+                kind: SelectionKind::Selection,
+                offer: offer("fine"),
+            }
+        );
+    }
+
+    /// The engine going away is the one reason to stop: `supervise` retires the
+    /// watcher rather than reconnecting into a closed channel forever.
+    #[test]
+    fn a_dropped_receiver_stops_the_watcher() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let flow = report_startup(
+            Connect::Subscribe,
+            vec![SelectionKind::Clipboard],
+            &tx,
+            |_| Ok(offer("existing")),
+        );
+
+        assert_eq!(flow, ControlFlow::Break(StopReason::ReceiverGone));
+    }
+}

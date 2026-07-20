@@ -4,8 +4,8 @@ use crate::config::{Config, Direction, LinkSelections};
 use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
-    describe_offer, encode_frame, human_bytes, is_text_plain, type_matches, GetResult, GetWant,
-    Hashed, Message, Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
+    describe_offer, encode_frame, human_bytes, is_text_plain, type_matches, wants_text_plain,
+    GetResult, GetWant, Hashed, Message, Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -49,11 +49,12 @@ fn offer_size(offer: &Offer) -> usize {
 /// [`atoms`]: crate::clipboard::atoms
 fn synthesize_text_plain(content: Hashed) -> Hashed {
     let offer = content.offer();
-    if offer.keys().any(|k| is_text_plain(k)) {
+    let names: Vec<&str> = offer.keys().map(String::as_str).collect();
+    let Some(src) = text_plain_source(&names) else {
+        return content; // already has one, or no legacy atom to derive from
+    };
+    let Some(value) = crate::clipboard::atoms::value_of(offer, src) else {
         return content;
-    }
-    let Some((src, value)) = crate::clipboard::atoms::text_value(offer) else {
-        return content; // no legacy atom to derive from
     };
     let mut out = Offer::with_capacity(offer.len() + TEXT_PLAIN.len());
     for (k, v) in content.into_offer() {
@@ -66,6 +67,30 @@ fn synthesize_text_plain(content: Hashed) -> Hashed {
         out.insert(k, v);
     }
     Hashed::new(out)
+}
+
+/// The legacy atom [`synthesize_text_plain`] would derive `text/plain` from,
+/// given the type names an offer advertises — or `None` when it would derive
+/// nothing, either because a `text/plain*` variant is already there or because
+/// no legacy atom is.
+///
+/// **Names-only, deliberately.** Every question this engine asks about synthesis
+/// is asked before the content exists: what will `--paste -l` list, would a
+/// narrowed `-t text/plain` be synthesized rather than offered, and which atom
+/// has to be read to answer it. Each site used to answer with its own condition,
+/// and they disagreed about one clipboard — `-l` and `narrowed_failure` skipped
+/// synthesis entirely and called a type this node serves "not offered", while
+/// `serve_source` tested whether the *requested* type is advertised where the
+/// stage tests for *any* `text/plain*`, so `-t text/plain;charset=utf-8` served
+/// bytes derived from an atom that a full pull does not offer at all.
+///
+/// Defined here rather than in `atoms` because the gate is engine policy (the
+/// synthesis stage's rule); the atom priority order it defers to is not.
+fn text_plain_source(names: &[&str]) -> Option<&'static str> {
+    if names.iter().any(|n| is_text_plain(n)) {
+        return None;
+    }
+    crate::clipboard::atoms::text_source(names.iter().copied())
 }
 
 /// A rough human duration for a log line — days once there are enough of them,
@@ -255,6 +280,8 @@ enum Pipeline {
     Mirror,
     /// Answering a remote `--paste` query.
     Serve,
+    /// Adopting the clipboard that already existed at startup.
+    Restore,
 }
 
 impl Pipeline {
@@ -307,6 +334,19 @@ impl Pipeline {
             // `wl-paste` must not make this node rewrite its rules and push them
             // to every peer.
             Pipeline::Serve => Stages {
+                synthesize: true,
+                rules: RulesStage::Apply,
+                cap: true,
+            },
+            // The same transforms as `Broadcast`, so the hash recorded in
+            // `current` is the one a later local read of this same clipboard
+            // would produce — otherwise echo suppression compares against a
+            // value nothing else can generate. But `Apply`, not `Record`:
+            // restored content is inert, and `Record` is not. It appends unseen
+            // types, persists the rules file and broadcasts the whole ruleset
+            // mesh-wide, so a node restarting with an unusual type on its
+            // clipboard reverted a rules edit another host had just made.
+            Pipeline::Restore => Stages {
                 synthesize: true,
                 rules: RulesStage::Apply,
                 cap: true,
@@ -638,9 +678,23 @@ impl<C: Clipboard> SyncEngine<C> {
     /// reports once rather than on every one; a peer whose stamp is later
     /// accepted drops out of the set and can make it complete again.
     fn local_clock_is_the_outlier(&self, from: Uuid) -> bool {
-        let peers = self.mesh.peer_count();
+        let connected = self.mesh.peer_ids();
         let mut rejected = self.skew_rejected.lock().unwrap();
-        rejected.insert(from) && peers > 0 && rejected.len() >= peers
+        let fresh = rejected.insert(from);
+        // Drop refusals from peers that have since gone. A refusal is evidence
+        // about *our* clock only while the peer that disagreed is still there,
+        // and this set was otherwise pruned in one place only — when a peer's
+        // stamp is later accepted. A departed peer therefore stayed in it
+        // forever and `len() >= peer_count` went true for reasons that are not
+        // unanimity; because every restart mints a fresh node UUID, a
+        // long-running daemon accumulated them until any single refusal tripped
+        // the alarm.
+        //
+        // Comparing against the live *set* rather than a count is also what
+        // makes "unanimous" mean it: a stale entry could previously stand in for
+        // a connected peer that had never been refused at all.
+        rejected.retain(|p| connected.contains(p));
+        fresh && !connected.is_empty() && connected.iter().all(|p| rejected.contains(p))
     }
 
     /// Main loop. Debounce lives in the select as a deadline arm so that a
@@ -759,8 +813,8 @@ impl<C: Clipboard> SyncEngine<C> {
         }
     }
 
-    /// Record the clipboard that already existed when this node started (or when
-    /// the watcher reconnected), as reported by the backend's `Initial` event.
+    /// Record the clipboard that already existed when this node started, as
+    /// reported by the backend's `Initial` event.
     ///
     /// Restored content is deliberately inert: not broadcast, not bridged, not
     /// re-owned. It is seeded into `current` at **stamp 0** so a peer holding
@@ -779,7 +833,7 @@ impl<C: Clipboard> SyncEngine<C> {
         if raw.is_empty() || !(p.send || p.recv) {
             return;
         }
-        let Ok(content) = self.apply_stages(raw, Pipeline::Broadcast).await else {
+        let Ok(content) = self.apply_stages(raw, Pipeline::Restore).await else {
             return;
         };
         debug!(
@@ -792,13 +846,18 @@ impl<C: Clipboard> SyncEngine<C> {
         // been raised above 0 by an inbound apply and re-seeding it at 0 would
         // throw that away.
         //
-        // Keying on absence instead — `or_insert` — silently dropped every
-        // `Initial` after the first, and the watcher is supervised: a compositor
-        // restart re-subscribes and re-reports. A copy made while it was down
-        // then left `current` naming content the clipboard no longer had, and a
-        // peer resyncing that stale content matched the recorded hash, logged
-        // "already our current content" and wrote nothing — two hosts showing
-        // different clipboards with no further event able to correct them.
+        // Keying on absence instead — `or_insert` — would drop a second
+        // `Initial` for a selection, leaving `current` naming content the
+        // clipboard no longer has: a peer resyncing that stale content then
+        // matches the recorded hash, logs "already our current content" and
+        // writes nothing, and the two hosts stay divergent with no further event
+        // able to correct them.
+        //
+        // A supervised reconnect is *not* what produces a second `Initial` —
+        // `Connect::Reconnect` reports what it finds as `Changed`, precisely so
+        // a copy made while the compositor was away propagates under a fresh
+        // stamp instead of being recorded here at 0. This replace-don't-insert
+        // rule is what keeps the record honest if a backend reports one anyway.
         //
         // The remaining race is the one `or_insert` was reaching for: an inbound
         // apply landing between the subscribe and this event makes the `Initial`
@@ -1317,7 +1376,9 @@ impl<C: Clipboard> SyncEngine<C> {
             return GetResult::Unavailable(Unavailable::Empty);
         }
         // Gated for every shape of request, and before any content is read — so
-        // a secret's bytes are never pulled off the compositor at all.
+        // a secret already on the clipboard has its bytes left on the compositor
+        // rather than read and then discarded. One copied *after* this point is
+        // the KNOWN GAP on `serving_is_sensitive`.
         if self.serving_is_sensitive(kind, &types).await {
             debug!("not serving: clipboard is flagged sensitive (password-manager contents)");
             return GetResult::Unavailable(Unavailable::Sensitive);
@@ -1326,7 +1387,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // still govern what leaves this host, so the list is filtered to the
         // types this node would actually serve.
         if want == GetWant::TypesOnly {
-            let allowed = self.filter_names(types).await;
+            let allowed = self.filter_names(self.served_names(types)).await;
             return match allowed.is_empty() {
                 false => GetResult::Types(allowed),
                 // Types were offered (checked above) and every one is denied —
@@ -1366,6 +1427,20 @@ impl<C: Clipboard> SyncEngine<C> {
     /// content therefore pays nothing for this, which is what makes it
     /// affordable to check before deciding what else to read — the position that
     /// lets a narrowed or names-only request be gated at all.
+    ///
+    /// KNOWN GAP: this clears the selection as it was when the hint was read,
+    /// not as it is when the content is. A copy landing in between is served
+    /// against a stale verdict, and a narrowed read cannot catch it the way an
+    /// un-narrowed one does — `read_one` filters the hint out at the backend, so
+    /// `apply_stages` has nothing left to refuse on. Re-checking afterwards does
+    /// not close it either (the secret can be read and then replaced before the
+    /// re-check), because the gap is not in the ordering: `paste::get_contents`
+    /// opens a **fresh connection per representation**, so the hint and the
+    /// content are never read from one snapshot of the selection. This is the
+    /// same root cause as the `Initial` window marked KNOWN GAP in
+    /// `clipboard/watch.rs`, and it closes the same way — when content reads move
+    /// onto a single in-tree data-control connection, where the hint and the
+    /// content come off one offer.
     async fn serving_is_sensitive(&self, kind: SelectionKind, types: &[String]) -> bool {
         if !self.cfg.exclude_sensitive || !types.iter().any(|t| t == SENSITIVE_MIME) {
             return false;
@@ -1386,13 +1461,45 @@ impl<C: Clipboard> SyncEngine<C> {
     /// `text/plain` over the mesh and "not offered" to `--paste -t text/plain`.
     /// The atom is what has to be read; the pipeline derives the request from it.
     fn serve_source<'a>(&self, wanted: &'a str, types: &[String]) -> &'a str {
-        let synthesizable = self.cfg.synthesize_text_plain
-            && is_text_plain(wanted)
-            && !types.iter().any(|t| type_matches(t, wanted));
-        if !synthesizable {
+        // `wants_text_plain`, not `is_text_plain`: the generic `-t text` is also
+        // a request a synthesized `text/plain` answers, and asking the narrower
+        // question sent it looking for a literal "text" no clipboard advertises.
+        if !self.cfg.synthesize_text_plain || !wants_text_plain(wanted) {
             return wanted;
         }
-        crate::clipboard::atoms::text_source(types.iter().map(String::as_str)).unwrap_or(wanted)
+        // Asked of the same predicate the stage itself uses, so the read cannot
+        // be narrowed to an atom the stage will then decline to derive from —
+        // which served bytes a full pull does not offer.
+        self.synthesized_source(types).unwrap_or(wanted)
+    }
+
+    /// [`text_plain_source`] for this node's config: `None` when synthesis is
+    /// off, so a caller never has to pair the two conditions itself.
+    fn synthesized_source(&self, types: &[String]) -> Option<&'static str> {
+        if !self.cfg.synthesize_text_plain {
+            return None;
+        }
+        let names: Vec<&str> = types.iter().map(String::as_str).collect();
+        text_plain_source(&names)
+    }
+
+    /// The type names this node would serve for a selection advertising
+    /// `types` — the advertised names plus anything the synthesis stage would
+    /// back-fill, before the MIME rules narrow it.
+    ///
+    /// Both questions that need this used to ask the *advertised* names, which
+    /// by construction never contain a synthesized type: `--paste -l` omitted a
+    /// `text/plain` the same node happily served, and `narrowed_failure` decided
+    /// from them that a synthesized type was "not offered" — discarding the real
+    /// reason it exists to report.
+    fn served_names(&self, types: Vec<String>) -> Vec<String> {
+        let Some(_) = self.synthesized_source(&types) else {
+            return types;
+        };
+        // Richest first, matching the order the stage inserts them in.
+        let mut out: Vec<String> = TEXT_PLAIN.iter().map(|t| t.to_string()).collect();
+        out.extend(types);
+        out
     }
 
     /// The answer to a narrowed request that produced nothing.
@@ -1408,7 +1515,7 @@ impl<C: Clipboard> SyncEngine<C> {
         types: Vec<String>,
         reason: Unavailable,
     ) -> GetResult {
-        let available = self.filter_names(types).await;
+        let available = self.filter_names(self.served_names(types)).await;
         if available.iter().any(|t| type_matches(t, wanted)) {
             // We would serve that type; something else stopped us. Say what.
             return GetResult::Unavailable(reason);
@@ -1423,9 +1530,19 @@ impl<C: Clipboard> SyncEngine<C> {
 
     /// Read for a `Get`, narrowed to `only` when one type was asked for.
     ///
-    /// A narrowed read that comes back empty means that type isn't offered,
-    /// which is `Empty` *for this request* — the caller turns it into the
-    /// "here's what I do have" answer.
+    /// A read that comes back empty is **not** an empty clipboard: `serve_get`
+    /// has already established that the selection advertises types, so an empty
+    /// result means the backend produced no representation for them. On Wayland
+    /// that is its own `max_payload_size` enforcement — `assemble_offer` skips
+    /// an over-budget representation while reading, so an oversized image
+    /// arrives here as an empty offer, having never reached
+    /// `cap_to_payload_size`. Reporting `Empty` sent the user looking for a
+    /// clipboard that was in fact full, and made `TooLarge` unreachable on the
+    /// real backend.
+    ///
+    /// For a *narrowed* read the caller has the better answer — that type may
+    /// simply not be among the ones offered — so it takes the reason to
+    /// `narrowed_failure`, which checks before repeating it.
     async fn read_for_serve(
         &self,
         kind: SelectionKind,
@@ -1436,10 +1553,10 @@ impl<C: Clipboard> SyncEngine<C> {
             None => self.io.read(kind).await,
         };
         // `None` here is a failed or timed-out read, already logged — distinct
-        // from a successful read of an empty selection.
+        // from a successful read that yielded nothing.
         let raw = raw.ok_or(Unavailable::Unreadable)?;
         if raw.is_empty() {
-            return Err(Unavailable::Empty);
+            return Err(Unavailable::Unservable);
         }
         Ok(raw)
     }
@@ -2280,6 +2397,184 @@ mod tests {
             "a narrowed pull must carry only what it asked for"
         );
         assert_eq!(served["text/plain"], b"hello");
+    }
+
+    /// One clipboard must give one answer about what it holds. These three
+    /// questions — what does `-l` list, what does `-t` serve, and what does a
+    /// failure say is available — were each answered from the *advertised*
+    /// names, which by construction never contain a synthesized type. So a node
+    /// with `synthesize_text_plain` on and only `UTF8_STRING` on the clipboard
+    /// served `text/plain` happily to `-t` and to the mesh, while telling `-l`
+    /// it did not have it and telling a failed pull it was "not offered".
+    #[tokio::test]
+    async fn every_answer_about_a_synthesized_text_plain_agrees() {
+        let kind = SelectionKind::Clipboard;
+        let seeded = |body: &'static [u8], max: usize| {
+            let clip = MockClipboard::new();
+            clip.seed(
+                kind,
+                crate::protocol::test_support::offer(&[("UTF8_STRING", body)]),
+            );
+            let mut cfg = Config::for_test("s");
+            cfg.synthesize_text_plain = true;
+            cfg.max_payload_size = max;
+            engine(clip, cfg)
+        };
+
+        // `-l` lists what this node would serve, synthesis included.
+        let w = seeded(b"hello", 1024);
+        let GetResult::Types(listed) = w.engine.serve_get(kind, GetWant::TypesOnly).await else {
+            panic!("listing refused a clipboard it will serve");
+        };
+        assert!(
+            listed.iter().any(|t| t == "text/plain"),
+            "-l omitted the text/plain that -t serves: {listed:?}"
+        );
+
+        // ...and the same node does serve it, so the list was not a promise it
+        // breaks.
+        let w = seeded(b"hello", 1024);
+        assert!(
+            matches!(
+                w.engine
+                    .serve_get(kind, GetWant::One("text/plain".to_string()))
+                    .await,
+                GetResult::Offer(_)
+            ),
+            "-l listed a type -t then refused"
+        );
+
+        // A narrowed pull that fails for an unrelated reason must name that
+        // reason. Deriving "would we serve this?" from the advertised names
+        // reported `NotOffered` here and threw the real reason away.
+        let w = seeded(b"a payload past the budget", 4);
+        assert_eq!(
+            w.engine
+                .serve_get(kind, GetWant::One("text/plain".to_string()))
+                .await,
+            GetResult::Unavailable(Unavailable::TooLarge),
+        );
+    }
+
+    /// A clipboard whose every representation the backend dropped is not an
+    /// empty clipboard, and saying so sends the user looking for the wrong
+    /// thing. The real backend enforces `max_payload_size` while reading
+    /// (`assemble_offer` skips an over-budget representation and warns), so a
+    /// 40 MB image arrives at the engine as an empty offer — reported as "the
+    /// clipboard on desktop is empty" while the serving host's own log says it
+    /// skipped a type for size. `cap_to_payload_size` can never fire on content
+    /// the backend already fit inside the same budget, so `TooLarge` was
+    /// unreachable and this case had no reason of its own at all.
+    #[tokio::test]
+    async fn a_clipboard_whose_representations_all_dropped_is_not_reported_empty() {
+        let kind = SelectionKind::Clipboard;
+        let clip = MockClipboard::new();
+        // Advertises a type, reads back nothing — exactly what the Wayland
+        // backend hands over when every representation is over budget.
+        clip.seed(
+            kind,
+            crate::protocol::test_support::offer(&[("image/png", b"a giant png")]),
+        );
+        clip.drop_all_representations();
+        let w = engine(clip, Config::for_test("s"));
+
+        assert_eq!(
+            w.engine.serve_get(kind, GetWant::All).await,
+            GetResult::Unavailable(Unavailable::Unservable),
+            "an unservable clipboard was reported as an empty one"
+        );
+    }
+
+    /// `wl-paste -t text` must reach a `text/plain` this node would synthesize.
+    /// The synthesis gate asked `is_text_plain`, which the generic name does not
+    /// satisfy, so the narrowed read went looking for a literal "text" the
+    /// clipboard does not advertise and the node reported nothing.
+    #[tokio::test]
+    async fn a_generic_text_request_reaches_a_synthesized_text_plain() {
+        let kind = SelectionKind::Clipboard;
+        let clip = MockClipboard::new();
+        clip.seed(
+            kind,
+            crate::protocol::test_support::offer(&[("UTF8_STRING", b"hello")]),
+        );
+        let mut cfg = Config::for_test("s");
+        cfg.synthesize_text_plain = true;
+        let w = engine(clip, cfg);
+
+        let GetResult::Offer(served) = w
+            .engine
+            .serve_get(kind, GetWant::One("text".to_string()))
+            .await
+        else {
+            panic!("-t text found nothing on a clipboard holding text");
+        };
+        assert_eq!(served["text/plain"], b"hello");
+    }
+
+    /// Narrowing a pull is an **optimization**, not a change of answer: reading
+    /// one representation instead of all of them exists to save Wayland
+    /// roundtrips, so `-t X` must serve exactly what a full pull trimmed to `X`
+    /// would. Every defect in this path is a violation of that one invariant, so
+    /// it is asserted directly, against both shapes of clipboard.
+    ///
+    /// `serve_source` predicts the synthesis stage in order to decide whether to
+    /// read a legacy atom instead of the requested type — and predicted it with
+    /// a different rule than the stage uses: it asked whether the *requested*
+    /// type is advertised, where the stage gates on whether *any* `text/plain*`
+    /// variant is. So a request for one variant, on a clipboard offering the
+    /// other, read the atom and served bytes derived from it while a full pull
+    /// served the app's own representation.
+    #[tokio::test]
+    async fn a_narrowed_pull_serves_what_a_full_pull_trimmed_would() {
+        let kind = SelectionKind::Clipboard;
+        let seeded = |reps: &[(&str, &[u8])]| {
+            let clip = MockClipboard::new();
+            clip.seed(kind, crate::protocol::test_support::offer(reps));
+            let mut cfg = Config::for_test("s");
+            cfg.synthesize_text_plain = true;
+            engine(clip, cfg)
+        };
+
+        for (label, reps) in [
+            // Only a legacy atom: `text/plain` has to be derived, and a narrowed
+            // read must still find the atom to derive it from.
+            ("atom only", &[("UTF8_STRING", &b"hello\n\0"[..])][..]),
+            // A real `text/plain` is present, so the stage derives nothing — and
+            // neither may the narrowed read, even for the variant that is absent.
+            (
+                "a real text/plain beside the atom",
+                &[
+                    ("text/plain", &b"hello\n"[..]),
+                    ("UTF8_STRING", &b"hello\n\0"[..]),
+                ][..],
+            ),
+        ] {
+            for wanted in ["text/plain", "text/plain;charset=utf-8"] {
+                let full = match seeded(reps).engine.serve_get(kind, GetWant::All).await {
+                    GetResult::Offer(o) => narrow_to(o, wanted),
+                    other => panic!("{label}: a full pull failed: {other:?}"),
+                };
+                let narrowed = seeded(reps)
+                    .engine
+                    .serve_get(kind, GetWant::One(wanted.to_string()))
+                    .await;
+
+                match (full, narrowed) {
+                    (Some(expected), GetResult::Offer(got)) => assert_eq!(
+                        got, expected,
+                        "{label}: -t {wanted} served different bytes than a full pull trimmed to it"
+                    ),
+                    (None, GetResult::Offer(got)) => panic!(
+                        "{label}: -t {wanted} served {got:?}, which a full pull does not offer"
+                    ),
+                    (Some(expected), other) => panic!(
+                        "{label}: -t {wanted} refused ({other:?}) content a full pull serves: {expected:?}"
+                    ),
+                    // Neither offers it: agreeing to refuse is agreement.
+                    (None, _) => {}
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3759,6 +4054,45 @@ mod tests {
         assert!(w.engine.local_clock_is_the_outlier(a));
     }
 
+    /// A refusal is evidence about *this* host's clock only for as long as the
+    /// peer it came from is connected. The set was pruned in exactly one place —
+    /// when a peer's stamp is later accepted — so a departed peer stayed in it
+    /// forever, and `rejected.len() >= peers` then went true for reasons that
+    /// are not unanimity. Since every restart mints a fresh node UUID, a
+    /// long-running daemon accumulates them until the very first skew rejection
+    /// from anybody sends an operator to check the RTC on a host whose clock is
+    /// fine.
+    #[tokio::test]
+    async fn a_departed_peers_refusal_is_not_evidence_against_this_clock() {
+        let w = engine(MockClipboard::new(), Config::for_test("s"));
+        let peer = |id, w: &Wiring<MockClipboard>| {
+            let (tx, rx) = mpsc::channel(8);
+            let conn = w.mesh.register(id, tx, PeerRole::Peer);
+            (conn, rx)
+        };
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (conn_a, _rx_a) = peer(a, &w);
+        let (_conn_b, _rx_b) = peer(b, &w);
+
+        // A's clock is broken: one refusal out of two peers, correctly quiet.
+        assert!(!w.engine.local_clock_is_the_outlier(a));
+
+        // A leaves and a different node joins — every restart mints a fresh
+        // UUID, so this is what an ordinary day looks like. C has never been
+        // refused, so the mesh is not unanimous about anything.
+        w.mesh.unregister(a, conn_a);
+        let (_conn_c, _rx_c) = peer(c, &w);
+
+        assert!(
+            !w.engine.local_clock_is_the_outlier(b),
+            "a departed peer's stale refusal stood in for a connected peer that \
+             was never refused, reporting a local clock fault that isn't there"
+        );
+
+        // ...and once C really is refused too, it still reports.
+        assert!(w.engine.local_clock_is_the_outlier(c));
+    }
+
     #[test]
     fn approx_duration_reads_as_hours_then_days() {
         assert_eq!(approx_duration_ms(0), "less than an hour");
@@ -3797,13 +4131,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_restarted_watcher_re_adopts_what_the_clipboard_now_holds() {
-        // The clipboard watcher is supervised, so a compositor restart
-        // re-subscribes and re-reports every selection as `Initial`. If the user
-        // copied while it was down, that report is the only notice of what the
-        // clipboard actually holds — dropping it left `current` naming content
-        // that is gone, and a peer resyncing that stale content then matched the
-        // recorded hash, wrote nothing, and the two hosts stayed divergent.
+    async fn a_second_initial_re_adopts_what_the_clipboard_now_holds() {
+        // A backend should report `Initial` once per subscribe — the Wayland
+        // watcher's reconnect reports `Changed` (see `Connect`) for exactly that
+        // reason. If one arrives anyway, it is still the only notice of what the
+        // clipboard holds: dropping it leaves `current` naming content that is
+        // gone, and a peer resyncing that stale content then matches the
+        // recorded hash, writes nothing, and the two hosts stay divergent.
         let kind = SelectionKind::Clipboard;
         let e = engine(MockClipboard::new(), Config::for_test("s")).engine;
 
@@ -3818,6 +4152,31 @@ mod tests {
             e.current.lock().unwrap()[&kind].hash,
             content_hash(&offer("new")),
             "the restarted watcher's report of the live clipboard was dropped"
+        );
+    }
+
+    /// Restored content is documented as inert — "not broadcast, not bridged,
+    /// not re-owned" — but it ran through `Pipeline::Broadcast`, whose
+    /// `RulesStage::Record` is anything but: it appends unseen types, persists
+    /// the rules file, and (with `share_mime_rules` on) broadcasts this node's
+    /// whole ruleset mesh-wide under a fresh stamp. A node restarting with an
+    /// unusual type on its clipboard therefore reverted a rules edit another
+    /// host had just made, under whole-file last-writer-wins.
+    #[tokio::test]
+    async fn adopting_restored_content_does_not_record_or_broadcast_rules() {
+        let kind = SelectionKind::Clipboard;
+        let mut cfg = Config::for_test("s");
+        let (_dir, path) = with_rules(&mut cfg, MimePolicy::Allow, &[("text/plain", "allow")]);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let w = engine(MockClipboard::new(), cfg);
+
+        let unseen = crate::protocol::test_support::offer(&[("application/x-never-seen", b"hi")]);
+        w.engine.adopt_restored(kind, Hashed::new(unseen)).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "restored content rewrote the shared MIME-rules file"
         );
     }
 

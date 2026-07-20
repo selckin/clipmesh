@@ -254,10 +254,28 @@ fn port_of(addr: &str) -> Option<&str> {
     }
 }
 
-/// The default config path (`~/.config/clipmesh/config.toml`, tilde-expanded),
-/// used by `main` (daemon + CLI actions) and the paste mode alike.
+/// The default config path (`$XDG_CONFIG_HOME/clipmesh/config.toml`, falling
+/// back to `~/.config/clipmesh/config.toml`), used by `main` (daemon + CLI
+/// actions) and the paste mode alike.
 pub fn default_config_path() -> PathBuf {
-    PathBuf::from(shellexpand::tilde("~/.config/clipmesh/config.toml").into_owned())
+    config_root(std::env::var("XDG_CONFIG_HOME").ok())
+        .join("clipmesh")
+        .join("config.toml")
+}
+
+/// The XDG config root for a given `$XDG_CONFIG_HOME` value.
+///
+/// Taking the value as an argument rather than reading the environment keeps
+/// the rule — including the two ways the spec says to ignore a value —
+/// testable without mutating the process environment out from under every
+/// other test in the binary.
+fn config_root(xdg_config_home: Option<String>) -> PathBuf {
+    // Per the XDG basedir spec: unset *or empty* means the default, and a
+    // relative path is invalid and must be ignored.
+    match xdg_config_home {
+        Some(dir) if Path::new(&dir).is_absolute() => PathBuf::from(dir),
+        _ => PathBuf::from(shellexpand::tilde("~/.config").into_owned()),
+    }
 }
 
 /// Append `default_port` to an address that lacks one (bracketing a bare IPv6
@@ -547,6 +565,26 @@ selection_to_clipboard = true
         let toml = format!("listen = \"x\"\npsk_file = \"{}\"\n", f.path().display());
         let cfg = Config::from_toml(&toml).unwrap();
         assert_eq!(cfg.psk, *blake3::hash(b"filesecret").as_bytes());
+    }
+
+    /// `install.sh` writes the config, the psk and the systemd unit under
+    /// `${XDG_CONFIG_HOME:-$HOME/.config}`. A daemon that looked only at
+    /// `~/.config` could not find what its own installer had just placed, so on
+    /// a host that sets the variable the install reported success and the unit
+    /// restart-looped on "reading config …: No such file or directory".
+    #[test]
+    fn the_default_config_root_follows_xdg_config_home() {
+        assert_eq!(
+            config_root(Some("/home/u/.dotconfig".to_string())),
+            PathBuf::from("/home/u/.dotconfig")
+        );
+
+        // Per the XDG basedir spec an unset or empty value means the default,
+        // and a relative path is invalid and must be ignored.
+        let fallback = PathBuf::from(shellexpand::tilde("~/.config").into_owned());
+        assert_eq!(config_root(None), fallback);
+        assert_eq!(config_root(Some(String::new())), fallback);
+        assert_eq!(config_root(Some("relative/dir".to_string())), fallback);
     }
 
     #[test]

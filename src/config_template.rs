@@ -179,9 +179,14 @@ fn extract_values(text: &str) -> Result<Values> {
             scalars.insert(key.to_string(), canonical(value));
         }
     }
+    // `as_table_like`, not `as_table`: `link_selections = { ... }` is stored as
+    // an inline value, and serde accepts it — so `Config::load` honours a
+    // setting that `as_table` cannot see. Reading it that way made
+    // `--sync-config` re-emit the commented defaults and silently turn the
+    // user's mirroring off in a file it had just claimed to normalize.
     let link = doc
         .get("link_selections")
-        .and_then(Item::as_table)
+        .and_then(Item::as_table_like)
         .map(|t| {
             let b = |k: &str| t.get(k).and_then(Item::as_bool).unwrap_or(false);
             (b("clipboard_to_selection"), b("selection_to_clipboard"))
@@ -808,5 +813,34 @@ clipboard_to_selection = true
         assert!(!v.scalars.contains_key("link_selections"));
         // absent table key defaults to false
         assert_eq!(v.link, Some((true, false)));
+    }
+
+    /// `link_selections = { ... }` is valid TOML and serde accepts it, so
+    /// `Config::load` honours it and mirroring works — but `toml_edit` stores it
+    /// as an inline *value*, which `Item::as_table` does not see. Reading it
+    /// that way made `--sync-config` collect no table at all and re-emit the
+    /// commented defaults, silently turning the user's mirroring off in a file
+    /// it had just claimed to normalize.
+    #[test]
+    fn sync_config_keeps_an_inline_link_selections_table() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "listen = \"x\"\npsk = \"s\"\nlink_selections = {{ clipboard_to_selection = true }}\n"
+        )
+        .unwrap();
+        drop(f);
+
+        sync_config(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg = crate::config::Config::from_toml(&text).unwrap();
+        assert!(
+            cfg.link_selections.clipboard_to_selection,
+            "--sync-config dropped an inline [link_selections]:\n{text}"
+        );
     }
 }

@@ -189,7 +189,12 @@ impl Mesh {
         self.peers.lock().unwrap().len()
     }
 
-    #[cfg(test)]
+    /// Which mesh members are connected. Same membership as
+    /// [`peer_count`](Mesh::peer_count) — paste clients are excluded by
+    /// construction — for a caller that must know *which* peers rather than how
+    /// many. The clock-skew guard needs the identities: deciding "every peer
+    /// refused us" from a count lets a stale entry stand in for a connected peer
+    /// that was never refused at all.
     pub fn peer_ids(&self) -> Vec<Uuid> {
         self.peers.lock().unwrap().keys().copied().collect()
     }

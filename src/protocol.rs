@@ -12,7 +12,9 @@ use uuid::Uuid;
 /// instead of scraping the connect-time resync push.
 /// v7: `GetReply` answers "nothing to give" with a reason (`Unavailable`)
 /// instead of a bare `Empty` that covered six distinct causes.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8: `Unavailable::Unservable` splits "the read produced nothing" out of
+/// `Empty`, which was reporting a clipboard too large to read as an empty one.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// All MIME representations of one clipboard state, in the source compositor's
 /// advertise order (preference order — richest first), which `IndexMap`
@@ -28,8 +30,44 @@ pub type Offer = IndexMap<String, Vec<u8>>;
 /// separately, a normalization added to one side (stripping `;charset=…`,
 /// trimming, Unicode folding) silently returns a representation the user didn't
 /// ask for, or an offer whose only key the client then rejects as absent.
+/// `wl-paste` additionally documents *generic* names: "in addition to specific
+/// MIME types such as `image/png`, `wl-paste` also accepts generic type names
+/// such as `text` and `image` which make it automatically pick some offered MIME
+/// type that matches the given generic name". The drop-in symlink has to honour
+/// them, or `wl-paste -t text` — an idiom that works against the very tool
+/// clipmesh tells users to replace — fails with "that type is not offered" on a
+/// clipboard plainly holding text.
 pub fn type_matches(offered: &str, requested: &str) -> bool {
-    offered.eq_ignore_ascii_case(requested)
+    if offered.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    // Directional on purpose: a generic name means something as a *request*
+    // only. An offer literally named `text` must not become a wildcard that
+    // answers every request for a `text/*` type.
+    GENERIC_TYPES
+        .iter()
+        .any(|g| requested.eq_ignore_ascii_case(g) && in_family(offered, g))
+}
+
+/// The generic names [`type_matches`] accepts in a request, each naming the MIME
+/// top-level type it stands for.
+const GENERIC_TYPES: [&str; 2] = ["text", "image"];
+
+/// Whether `mime`'s top-level type is `family` (`text/plain` is in `text`).
+fn in_family(mime: &str, family: &str) -> bool {
+    mime.split_once('/')
+        .is_some_and(|(top, _)| top.eq_ignore_ascii_case(family))
+}
+
+/// Whether a `text/plain` representation would satisfy a request for
+/// `requested` — a `text/plain*` variant, or the generic `text` name.
+///
+/// Asked where the engine decides whether synthesis can answer a narrowed pull.
+/// `is_text_plain` alone would have said no to `-t text`, so a clipboard holding
+/// only a legacy atom refused a request that the same node answers over the mesh
+/// and that real `wl-paste` answers locally.
+pub fn wants_text_plain(requested: &str) -> bool {
+    is_text_plain(requested) || requested.eq_ignore_ascii_case("text")
 }
 
 /// The `text/plain` representations, richest first.
@@ -157,7 +195,22 @@ pub enum Unavailable {
     /// rules.
     Denied,
     /// Content exists, but everything exceeds that node's `max_payload_size`.
+    ///
+    /// Reported when the *engine's* cap drops everything. The Wayland backend
+    /// enforces the same budget earlier, while reading, and what it drops never
+    /// reaches the cap at all — that is [`Unservable`](Unavailable::Unservable).
     TooLarge,
+    /// The selection advertised types, but the node's read of it produced no
+    /// representation at all.
+    ///
+    /// Distinct from [`Empty`](Unavailable::Empty), which is a selection holding
+    /// nothing: here there is content the node simply could not hand over. In
+    /// practice this is the backend's own `max_payload_size` enforcement —
+    /// `assemble_offer` skips an over-budget representation while reading, so a
+    /// 40 MB image arrives as an empty offer — which is why the message points
+    /// at that setting first. Reporting it as `Empty` sent users looking for a
+    /// clipboard that was in fact full.
+    Unservable,
     /// The node could not read its own clipboard — an error, or a selection
     /// owner that never answered.
     Unreadable,
@@ -445,6 +498,34 @@ mod tests {
         assert_eq!(h.into_offer(), o, "the content round-trips unchanged");
 
         assert!(Hashed::new(Offer::new()).is_empty());
+    }
+
+    /// `wl-paste` documents generic type names — "`wl-paste` also accepts
+    /// generic type names such as `text` and `image` which make it automatically
+    /// pick some offered MIME type that matches the given generic name". A
+    /// drop-in symlink has to honour them, or `wl-paste -t text` (an idiom that
+    /// works against the tool clipmesh replaces) fails with "that type is not
+    /// offered" on a clipboard plainly holding text.
+    #[test]
+    fn type_matches_honours_the_generic_names_wl_paste_accepts() {
+        // Exact matching is unchanged, case-insensitively.
+        assert!(type_matches("text/plain", "TEXT/PLAIN"));
+        assert!(!type_matches("text/plain", "text/html"));
+        // A charset variant is still a distinct type — `text/plain` alone must
+        // not answer a request naming one.
+        assert!(!type_matches("text/plain", "text/plain;charset=utf-8"));
+
+        // Generic names match their whole family...
+        assert!(type_matches("text/plain", "text"));
+        assert!(type_matches("text/plain;charset=utf-8", "text"));
+        assert!(type_matches("text/html", "TEXT"));
+        assert!(type_matches("image/png", "image"));
+        // ...and nothing outside it.
+        assert!(!type_matches("image/png", "text"));
+        assert!(!type_matches("text/plain", "image"));
+        // The generic name is a *request*; an offer literally named "text"
+        // is not a wildcard that swallows every request.
+        assert!(!type_matches("text", "text/plain"));
     }
 
     #[test]

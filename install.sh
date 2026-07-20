@@ -32,6 +32,15 @@ chmod 700 "$CONFIG_DIR" || die "cannot restrict $CONFIG_DIR (it holds the psk)"
 fresh_config=0
 if [[ ! -f "$CONFIG" ]]; then
     cp examples/config.toml "$CONFIG" || die "cannot write $CONFIG"
+    # The example names the default location literally (psk_file =
+    # "~/.config/clipmesh/psk"), so on a host that sets XDG_CONFIG_HOME the
+    # copy would point at a psk this script never created -- the daemon then
+    # fails to start with "reading psk_file ...: No such file or directory".
+    # Point the copy at the directory we actually installed into.
+    if [[ "$CONFIG_DIR" != "$HOME/.config/clipmesh" ]]; then
+        sed -i "s|~/.config/clipmesh/|$CONFIG_DIR/|g" "$CONFIG" \
+            || die "cannot point $CONFIG at $CONFIG_DIR"
+    fi
     fresh_config=1
     echo "==> Created $CONFIG from example -- edit listen/peers before starting"
 else
