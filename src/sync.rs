@@ -613,7 +613,7 @@ impl<C: Clipboard> SyncEngine<C> {
         let mut rules = lock_rules(&self.mime_rules);
         if record_unseen {
             let mut appended = false;
-            if rules.has_unseen(offer.keys()) {
+            if rules.compile().has_unseen(offer.keys()) {
                 rules.reload_if_changed();
                 appended = rules.ensure(offer.keys());
             }
@@ -625,10 +625,14 @@ impl<C: Clipboard> SyncEngine<C> {
                 self.note_rules_changed();
             }
         }
+        // Compile once for the whole offer rather than re-walking the TOML per
+        // representation. Deliberately after the block above: that may rewrite
+        // the table, and the borrow checker enforces the recompile.
+        let compiled = rules.compile();
         offer
             .into_iter()
             .filter(|(mime, data)| {
-                let allowed = rules.allows(mime, data.len());
+                let allowed = compiled.allows(mime, data.len());
                 if !allowed {
                     debug!(
                         "dropping {mime} ({}): blocked by the MIME rules",

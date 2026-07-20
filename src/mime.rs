@@ -504,33 +504,25 @@ impl MimeRules {
             .unwrap_or(0)
     }
 
-    /// Whether a `size`-byte representation of `mime` may sync.
-    pub fn allows(&self, mime: &str, size: usize) -> bool {
-        match self.find_rule(mime) {
-            Some(r) => r.allow && r.max_size.map_or(true, |max| size <= max),
-            None => self.unknown == MimePolicy::Allow,
+    /// Compile the `[rules]` table for repeated lookups: one pass over the TOML
+    /// document instead of one per lookup. Use this whenever more than a couple
+    /// of types are classified against the same ruleset (see
+    /// [`CompiledRules`]).
+    pub fn compile(&self) -> CompiledRules<'_> {
+        let entries = self
+            .rules_table()
+            .map(|t| t.iter().map(CompiledEntry::new).collect())
+            .unwrap_or_default();
+        CompiledRules {
+            entries,
+            unknown: self.unknown,
         }
     }
 
-    /// The rule that decides `mime`: among all keys that match it (exact or glob,
-    /// case-insensitive), the most specific one wins — see [`specificity`]. An
-    /// exact key, having the most literal characters and no wildcards, always
-    /// beats a glob.
-    fn find_rule(&self, mime: &str) -> Option<MimeRule> {
-        let mut best: Option<(Specificity<'_>, MimeRule)> = None;
-        for (key, item) in self.rules_table()?.iter() {
-            if !glob_match(key, mime) {
-                continue;
-            }
-            let Some(rule) = parse_rule_item(item) else {
-                continue;
-            };
-            let spec = specificity(key, rule.allow);
-            if best.as_ref().map_or(true, |(b, _)| spec > *b) {
-                best = Some((spec, rule));
-            }
-        }
-        best.map(|(_, r)| r)
+    /// Whether a `size`-byte representation of `mime` may sync. Compiles the
+    /// table for this one lookup; prefer [`MimeRules::compile`] for a batch.
+    pub fn allows(&self, mime: &str, size: usize) -> bool {
+        self.compile().allows(mime, size)
     }
 
     /// Whether any rule key matches `mime` (exact or glob, case-insensitive),
@@ -547,6 +539,101 @@ impl MimeRules {
 
     fn rule_count(&self) -> usize {
         self.rules_table().map_or(0, Table::len)
+    }
+}
+
+/// The `[rules]` table compiled once for repeated lookups.
+///
+/// `find_rule` otherwise re-walks the `toml_edit` document on *every* lookup,
+/// re-deriving each entry's rule (including a string size-parse for capped
+/// rules) and its specificity. The engine classifies every representation of
+/// every copy against the same ruleset, and clipmesh auto-appends each unseen
+/// type — so the table only ever grows, and the per-copy cost is
+/// `reps × rules` document traversals.
+///
+/// This deliberately *borrows* the document rather than being a cache stored on
+/// `MimeRules`. A stored cache would need manual invalidation at each of the
+/// nine places that mutate the table, and missing one would silently apply
+/// stale allow/deny decisions — a failure that is invisible in normal use and
+/// fails open, letting denied content reach the wire. Borrowing makes that
+/// unrepresentable: the compiler rejects any attempt to hold a compiled view
+/// across a mutation, so recompiling after one is not a discipline but a
+/// requirement.
+pub struct CompiledRules<'a> {
+    entries: Vec<CompiledEntry<'a>>,
+    unknown: MimePolicy,
+}
+
+struct CompiledEntry<'a> {
+    key: &'a str,
+    /// `None` when the value isn't a usable `allow`/`deny` rule. The entry is
+    /// still kept: `any_match` must treat even a typo'd key as covering its
+    /// type, so `ensure` doesn't append a duplicate alongside it.
+    rule: Option<MimeRule>,
+    /// `specificity`'s components, precomputed (both are O(key length) scans).
+    literals: usize,
+    wildcards: usize,
+}
+
+impl<'a> CompiledEntry<'a> {
+    fn new((key, item): (&'a str, &Item)) -> Self {
+        let wildcards = key.bytes().filter(|&b| b == b'*' || b == b'?').count();
+        CompiledEntry {
+            key,
+            rule: parse_rule_item(item),
+            literals: key.chars().count() - wildcards,
+            wildcards,
+        }
+    }
+
+    fn specificity(&self, allow: bool) -> Specificity<'a> {
+        (
+            self.literals,
+            Reverse(self.wildcards),
+            !allow,
+            Reverse(self.key),
+        )
+    }
+}
+
+impl CompiledRules<'_> {
+    /// Whether a `size`-byte representation of `mime` may sync.
+    pub fn allows(&self, mime: &str, size: usize) -> bool {
+        match self.find_rule(mime) {
+            Some(r) => r.allow && r.max_size.map_or(true, |max| size <= max),
+            None => self.unknown == MimePolicy::Allow,
+        }
+    }
+
+    /// The rule that decides `mime`: among all keys that match it (exact or
+    /// glob, case-insensitive), the most specific one wins — see
+    /// [`specificity`]. An exact key, having the most literal characters and no
+    /// wildcards, always beats a glob.
+    fn find_rule(&self, mime: &str) -> Option<MimeRule> {
+        let mut best: Option<(Specificity<'_>, MimeRule)> = None;
+        for entry in &self.entries {
+            let Some(rule) = entry.rule else { continue };
+            if !glob_match(entry.key, mime) {
+                continue;
+            }
+            let spec = entry.specificity(rule.allow);
+            if best.as_ref().map_or(true, |(b, _)| spec > *b) {
+                best = Some((spec, rule));
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    /// Whether any key matches `mime`, valid rule or not (see
+    /// [`CompiledEntry::rule`]).
+    pub fn any_match(&self, mime: &str) -> bool {
+        self.entries.iter().any(|e| glob_match(e.key, mime))
+    }
+
+    /// Whether any of `mimes` is matched by no key (and so would be recorded by
+    /// `ensure`). Lets the caller skip touching disk when nothing is new.
+    pub fn has_unseen<'m>(&self, mimes: impl IntoIterator<Item = &'m String>) -> bool {
+        mimes.into_iter().any(|m| !self.any_match(m))
     }
 }
 
@@ -1071,6 +1158,34 @@ mod tests {
         let rules = MimeRules::load(Some(path), MimePolicy::Deny);
         assert!(!rules.has_unseen([&s("image/png")]));
         assert!(rules.has_unseen([&s("text/plain")]));
+    }
+
+    /// A compiled view must reflect the table it was built from, and a rule
+    /// change must be visible once recompiled. The borrow checker already makes
+    /// it impossible to hold a view across the mutation, so this pins the other
+    /// half: that recompiling actually picks the change up rather than
+    /// reproducing a stale decision.
+    #[test]
+    fn recompiling_after_a_rule_change_sees_the_new_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimetypes");
+        write(&path, "[rules]\n\"image/png\" = \"allow\"\n");
+        let mut rules = MimeRules::load(Some(path), MimePolicy::Deny);
+        assert!(rules.compile().allows("image/png", 1));
+
+        rules.set_rule("image/png", false);
+        assert!(
+            !rules.compile().allows("image/png", 1),
+            "a recompiled view must see the flipped rule"
+        );
+
+        // A key whose value is not a usable rule still counts as covering its
+        // type, so `ensure` won't append a duplicate beside it.
+        rules.set_rule("image/gif", true);
+        let compiled = rules.compile();
+        assert!(compiled.any_match("image/gif"));
+        assert!(!compiled.has_unseen([&s("image/gif")]));
+        assert!(compiled.has_unseen([&s("image/tiff")]));
     }
 
     #[test]
