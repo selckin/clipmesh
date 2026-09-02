@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clipmesh::clipboard::wayland::WaylandClipboard;
+use clipmesh::clipboard::Backend;
 use clipmesh::config::{self, Config, MimePolicy};
 use clipmesh::config_template;
 use clipmesh::mime::{MimeRules, Relation, RulesFileState, Verdict};
@@ -107,8 +107,9 @@ async fn main() -> Result<()> {
     );
 
     // Which selections get watched is the engine's call, made when it
-    // subscribes (see Clipboard::watch) — the backend needs no config for it.
-    let clipboard = Arc::new(WaylandClipboard::new(cfg.max_payload_size));
+    // subscribes (see Clipboard::watch); the backend only needs to know which
+    // compositor API to speak, which `select` decides.
+    let clipboard = Arc::new(Backend::select(&cfg)?);
     let rules_path = cfg.mime_rules_path.clone();
     // The config text as loaded, so a change is only acted on when the contents
     // really differ (not a bare touch). Empty on a read error — any later edit

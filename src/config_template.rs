@@ -380,6 +380,15 @@ const TEMPLATE: &[Block] = &[
         shown: Shown::Default("100"),
     },
     Block::Optional {
+        key: "backend",
+        comment: "How to reach the clipboard: \"auto\" uses the Wayland data-control\n\
+                  protocol when the compositor offers one (niri, Sway, Hyprland, KDE) and\n\
+                  otherwise Mutter's clipboard D-Bus API (GNOME). \"data-control\" or\n\
+                  \"mutter\" forces one. On Mutter only the regular clipboard exists, so\n\
+                  sync_selection and link_selections must stay off there.",
+        shown: Shown::Default("\"auto\""),
+    },
+    Block::Optional {
         key: "sync_selection",
         comment: "Also sync the middle-click selection across the mesh.",
         shown: Shown::Default("false"),

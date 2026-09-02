@@ -37,6 +37,13 @@ psk_file = "~/.config/clipmesh/psk"
 # Quiet period (ms) before broadcasting, to coalesce rapid copies.
 # debounce_ms = 100
 
+# How to reach the clipboard: "auto" uses the Wayland data-control
+# protocol when the compositor offers one (niri, Sway, Hyprland, KDE) and
+# otherwise Mutter's clipboard D-Bus API (GNOME). "data-control" or
+# "mutter" forces one. On Mutter only the regular clipboard exists, so
+# sync_selection and link_selections must stay off there.
+# backend = "auto"
+
 # Also sync the middle-click selection across the mesh.
 # sync_selection = false
 

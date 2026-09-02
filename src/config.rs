@@ -11,6 +11,20 @@ pub enum Direction {
     ReceiveOnly,
 }
 
+/// Which clipboard backend to run — see `clipboard::Backend::select`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendChoice {
+    /// The data-control protocol when the compositor offers one, else Mutter.
+    #[default]
+    Auto,
+    /// ext-data-control-v1 / zwlr-data-control-unstable-v1 (niri, Sway,
+    /// Hyprland, KDE Plasma, ...).
+    DataControl,
+    /// Mutter's remote-desktop clipboard D-Bus API (GNOME). CLIPBOARD only.
+    Mutter,
+}
+
 /// What to do with a MIME type that has no rule in the rules file yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +88,10 @@ struct RawConfig {
     max_payload_size: String,
     #[serde(default = "default_debounce_ms")]
     debounce_ms: u64,
+    /// Which clipboard backend to run: "auto" (default), "data-control" or
+    /// "mutter" (GNOME; CLIPBOARD only).
+    #[serde(default)]
+    backend: BackendChoice,
     #[serde(default)]
     sync_selection: bool,
     #[serde(default)]
@@ -118,7 +136,7 @@ struct RawConfig {
 /// (which points back here), and `raw_config_keys_matches_the_struct` pins this
 /// list to the field names serde itself reports, so a typo, a stale entry, or a
 /// `#[serde(rename)]` that moves a key can't pass unnoticed.
-pub const RAW_CONFIG_KEYS: [&str; 20] = [
+pub const RAW_CONFIG_KEYS: [&str; 21] = [
     "listen",
     "port",
     "peers",
@@ -127,6 +145,7 @@ pub const RAW_CONFIG_KEYS: [&str; 20] = [
     "psk_env",
     "max_payload_size",
     "debounce_ms",
+    "backend",
     "sync_selection",
     "link_selections",
     "direction",
@@ -179,6 +198,8 @@ pub struct Config {
     pub psk: [u8; 32],
     pub max_payload_size: usize,
     pub debounce_ms: u64,
+    /// Which clipboard backend to run; resolved by `clipboard::Backend::select`.
+    pub backend: BackendChoice,
     pub sync_selection: bool,
     /// Local clipboard↔selection mirroring (distinct from `sync_selection`).
     pub link_selections: LinkSelections,
@@ -335,6 +356,7 @@ impl Config {
             psk_env,
             max_payload_size,
             debounce_ms,
+            backend,
             sync_selection,
             link_selections,
             direction,
@@ -390,6 +412,7 @@ impl Config {
                 n => n,
             },
             debounce_ms,
+            backend,
             sync_selection,
             link_selections,
             direction,
@@ -695,6 +718,21 @@ selection_to_clipboard = true
     #[test]
     fn link_selections_rejects_unknown_keys() {
         assert!(cfg_with("[link_selections]\ntypo = true\n").is_err());
+    }
+
+    #[test]
+    fn backend_defaults_to_auto_and_names_the_two_backends() {
+        assert_eq!(cfg_with("").unwrap().backend, BackendChoice::Auto);
+        assert_eq!(
+            cfg_with("backend = \"data-control\"\n").unwrap().backend,
+            BackendChoice::DataControl
+        );
+        assert_eq!(
+            cfg_with("backend = \"mutter\"\n").unwrap().backend,
+            BackendChoice::Mutter
+        );
+        // An unknown backend is a load error, not a silent fallback to auto.
+        assert!(cfg_with("backend = \"x11\"\n").is_err());
     }
 
     #[test]
