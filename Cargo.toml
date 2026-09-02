@@ -2,8 +2,8 @@
 name = "clipmesh"
 version = "0.1.0"
 edition = "2021"
-# <[u8]>::trim_ascii (src/sync.rs) was stabilized in 1.80.
-rust-version = "1.80"
+# zbus 5.14+ (the Mutter clipboard backend) requires 1.87.
+rust-version = "1.87"
 
 [dependencies]
 anyhow = "1"
@@ -29,7 +29,16 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wl-clipboard-rs = "0.9"
+# The Mutter clipboard backend (GNOME) talks D-Bus; tokio transport only, no
+# async-io runtime alongside tokio's.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# StreamExt/FutureExt for the D-Bus signal streams (zbus re-exports only
+# futures-core).
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+# p2p: the Mutter backend's tests host a fake Mutter over a socketpair, with
+# no bus daemon; production builds don't carry the feature.
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -2,6 +2,7 @@ pub mod atoms;
 pub(crate) mod budget;
 pub mod io;
 pub mod mock;
+pub mod mutter;
 pub mod watch;
 pub mod wayland;
 

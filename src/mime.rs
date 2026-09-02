@@ -897,7 +897,7 @@ impl CompiledRules<'_> {
     /// Whether a `size`-byte representation of `mime` may sync.
     pub fn allows(&self, mime: &str, size: usize) -> bool {
         match self.find_rule(mime) {
-            Some(r) => r.allow && r.max_size.map_or(true, |max| size <= max),
+            Some(r) => r.allow && r.max_size.is_none_or(|max| size <= max),
             None => self.unknown == MimePolicy::Allow,
         }
     }
@@ -932,7 +932,7 @@ impl CompiledRules<'_> {
                 continue;
             }
             let spec = entry.specificity(rule.allow);
-            if best.as_ref().map_or(true, |(b, _)| spec > *b) {
+            if best.as_ref().is_none_or(|(b, _)| spec > *b) {
                 best = Some((spec, rule));
             }
             decided_exactly |= is_exact;
