@@ -33,10 +33,15 @@ Copy on one host, paste on all of them.
 
 ## Requirements
 
-- A Wayland compositor implementing ext-data-control-v1 or
-  zwlr-data-control-v1 (niri, Sway, Hyprland, KDE Plasma; **not** GNOME).
-  Change watching and read/write are all in-process over that protocol, so
-  no external `wl-clipboard`/`wl-paste` binary is required.
+- A Wayland compositor, reached one of two ways (`backend = "auto"` picks):
+  - **ext-data-control-v1 / zwlr-data-control-v1** (niri, Sway, Hyprland, KDE
+    Plasma): change watching and read/write are all in-process over that
+    protocol, so no external `wl-clipboard`/`wl-paste` binary is required.
+  - **GNOME (Mutter 42+, e.g. Ubuntu 22.04+)**: Mutter implements neither
+    protocol, so clipmesh uses the clipboard half of Mutter's remote-desktop
+    D-Bus API instead — the one GNOME Remote Desktop uses. No X11, no shell
+    extension, no consent dialog. Only the regular clipboard exists there:
+    see [GNOME](#gnome) below.
 
 ## Setup
 
@@ -126,6 +131,31 @@ This is a one-shot read: there is no `wl-paste --watch` and no `wl-copy`.
 ## Configuration
 
 See `examples/config.toml` for all options and defaults.
+
+### GNOME
+
+On GNOME, `backend = "auto"` finds no data-control protocol and falls back to
+Mutter's clipboard API (`backend = "mutter"` forces it; `"data-control"` forces
+the other). What that changes:
+
+- **CLIPBOARD only.** Mutter's API does not reach the middle-click PRIMARY
+  selection, so `sync_selection` and `link_selections` cannot work — clipmesh
+  refuses to start with either set on a GNOME host, naming the key to turn off.
+  Other hosts in the mesh may keep them; a GNOME node just never sends or
+  applies PRIMARY.
+- **Closing the app you copied from re-syncs a narrower copy.** Mutter's
+  clipboard manager takes the clipboard over with a single saved
+  representation (`text/plain` or one image type), and that arrives as a
+  change, so peers see a one-type version of the same content once. Harmless,
+  but visible in the logs.
+- **Content clipmesh owns lives with the daemon.** After a restart, Mutter's
+  clipboard manager keeps only a text or image copy of what clipmesh had put on
+  the clipboard; other types are gone until the next copy.
+
+Verify Mutter offers the API (it does whenever GNOME is built with remote
+desktop support, as distributions do):
+
+    busctl --user introspect org.gnome.Mutter.RemoteDesktop /org/gnome/Mutter/RemoteDesktop
 
 ### Keeping the config up to date
 
