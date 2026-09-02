@@ -1,4 +1,5 @@
 pub mod atoms;
+pub(crate) mod budget;
 pub mod io;
 pub mod mock;
 pub mod watch;
@@ -8,7 +9,42 @@ use crate::protocol::{Offer, SelectionKind};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Why a watcher's connection to the compositor is being made — which decides
+/// how its startup burst is reported.
+///
+/// The distinction is load-bearing. `Clipboard::watch` promises `Initial`
+/// "as of the subscribe", and the engine acts on that promise: `adopt_restored`
+/// records the content at **stamp 0** and deliberately never broadcasts it,
+/// because a node cannot know how old its restored clipboard is. That is right
+/// for content that was already there when the daemon started, and wrong for
+/// everything else — the watchers are supervised, so they reconnect after any
+/// compositor restart or transient error, and reporting a reconnect's burst as
+/// `Initial` demoted whatever the user had copied in the meantime to stamp 0,
+/// where any peer's older clipboard outranked it and overwrote it on the next
+/// resync.
+///
+/// Shared by both watchers (`watch.rs` for data-control, `mutter.rs` for
+/// GNOME) so the rule is stated once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Connect {
+    /// The first connection: this *is* the `watch` call, so what it finds is
+    /// pre-existing content.
+    Subscribe,
+    /// A later connection. The watcher was blind while it was down, so what it
+    /// finds now is reported as an ordinary local change: the engine reads it,
+    /// stamps it now, and propagates it.
+    Reconnect,
+}
+
+/// Bound for a watcher's startup content read. Matches
+/// `ClipboardIo::READ_TIMEOUT`: a real read of the size-capped clipboard takes
+/// milliseconds, so exceeding this means the source is not serving its pipe —
+/// and the read runs ahead of change detection, so it must not be allowed to
+/// hang there (see `watch::read_offer_bounded`).
+pub(crate) const STARTUP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a [`Clipboard`] watcher reports.
 #[derive(Debug, Clone, PartialEq, Eq)]

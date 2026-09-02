@@ -1,4 +1,4 @@
-use crate::clipboard::atoms;
+use crate::clipboard::budget::OfferBudget;
 use crate::clipboard::watch::spawn_watcher;
 use crate::clipboard::{Clipboard, ClipboardEvent};
 use crate::protocol::{describe_offer, human_bytes, Offer, SelectionKind};
@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 use wl_clipboard_rs::copy;
 use wl_clipboard_rs::paste;
 
@@ -66,7 +66,7 @@ pub(crate) fn list_types_blocking(kind: SelectionKind) -> Result<Vec<String>> {
     let mut types = advertised_types(kind)?;
     // Machinery targets are never content, so they are not "offered types" as
     // far as a caller is concerned — `assemble_offer` drops them too.
-    types.retain(|m| !atoms::is_machinery(m));
+    types.retain(|m| !crate::clipboard::atoms::is_machinery(m));
     types.dedup();
     debug!("listed the {kind:?} clipboard types: {types:?}");
     Ok(types)
@@ -125,88 +125,26 @@ pub(crate) fn read_offer_blocking(
 /// representation that changed mid-read is likewise skipped; the watcher fires
 /// again for the new content.
 ///
-/// Types are read in the compositor's advertise order (preference order, richest
-/// first), which the offer then preserves end-to-end. When the budget can't fit
-/// everything, the earlier-advertised (more-preferred) representations survive;
-/// the order is deterministic because `get_mime_types_ordered` hands it to us as
-/// an ordered list rather than an unordered set.
-///
-/// # Why this budget is not `cap_to_payload_size`
-///
-/// Both spend `max_payload_size`, but they answer different questions with
-/// different information, and the duplication cannot be removed:
-///
-/// - Here, sizes are unknowable until a representation has been read, so the
-///   only possible strategy is streaming and greedy: take them in advertise
-///   order until the budget runs out. `cap_to_payload_size` runs afterwards with
-///   every size in hand and can therefore choose smallest-first, which fits more
-///   representations. Neither strategy can be used at the other's layer.
-/// - This layer also cannot pre-filter by the MIME rules to avoid spending
-///   budget on a representation that will later be denied. The rules govern what
-///   leaves the host, not what the user may paste locally: `Stages::OWN` and
-///   `Stages::MIRROR` deliberately re-offer denied representations to the local
-///   selections. Filtering here would strip them before those pipelines ever
-///   saw them. (Tried; `both_directions_no_redundant_write_with_denied_rep`
-///   catches it.)
-///
-/// The residual wart is real but small: a large representation advertised early
-/// can consume budget that a later one then can't have, even if the rules would
-/// have dropped the first. Raising `max_payload_size` is the user-facing fix.
+/// The policy — dedup, machinery, budget, advertise order — is
+/// [`OfferBudget`]'s; this is only the blocking loop that drives it.
 fn assemble_offer(
     types: impl IntoIterator<Item = String>,
     max: usize,
     mut read: impl FnMut(&str, usize) -> Result<Vec<u8>>,
 ) -> (Offer, usize) {
-    let mut offer = Offer::new();
-    let mut total = 0usize;
+    let mut budget = OfferBudget::new(max);
     for mime in types {
-        // get_mime_types_ordered is a plain Vec with no dedup; a type advertised
-        // twice must be read and counted once, or its bytes are double-charged to
-        // the budget and could wrongly evict a later rep (the HashSet path used
-        // to dedup for free).
-        if offer.contains_key(&mime) {
+        let Some(allowed) = budget.plan(&mime) else {
             continue;
-        }
-        if atoms::is_machinery(&mime) {
-            debug!("skipping clipboard type {mime}: a selection target, never content");
-            continue;
-        }
-        // saturating_sub: total never exceeds max here, but guard against a
-        // future change turning this into a panic on attacker-influenced input.
-        let budget = max.saturating_sub(total);
-        let data = match read(&mime, budget) {
-            Ok(d) => d,
-            Err(e) => {
-                // A content type that won't read is real data loss worth a warn;
-                // a pseudo-target erroring on read is expected, so keep it quiet.
-                if atoms::is_content(&mime) {
-                    warn!("skipping clipboard type {mime}: can't read it ({e:#})");
-                } else {
-                    debug!("skipping clipboard type {mime}: not readable content ({e:#})");
-                }
-                continue;
-            }
         };
-        if mime.len() + data.len() > budget {
-            // This representation would push the offer over the cap. Skip it but
-            // keep the rest, so a small syncable payload alongside a giant image
-            // (which can never sync) still propagates. warn, not debug, so the
-            // user can see why a large representation isn't syncing. The read
-            // stopped at the budget, so the true size is only known to exceed
-            // it — raising max_payload_size is the fix for images.
-            warn!(
-                "skipping clipboard type {mime}: it doesn't fit the remaining {} \
-                 of the {} max_payload_size budget (raise max_payload_size to sync large images)",
-                human_bytes(budget),
-                human_bytes(max)
-            );
-            continue;
+        match read(&mime, allowed) {
+            Ok(data) => {
+                budget.accept(mime, data);
+            }
+            Err(e) => OfferBudget::skip_unreadable(&mime, &e),
         }
-        debug!("read clipboard type {mime} ({})", human_bytes(data.len()));
-        total += mime.len() + data.len();
-        offer.insert(mime, data);
     }
-    (offer, total)
+    budget.finish()
 }
 
 fn write_offer_blocking(kind: SelectionKind, offer: Arc<Offer>) -> Result<()> {

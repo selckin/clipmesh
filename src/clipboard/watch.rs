@@ -6,7 +6,7 @@
 //! `wl-clipboard-rs` in `wayland.rs`; this is the last subprocess removed.
 
 use crate::clipboard::wayland::read_offer_blocking;
-use crate::clipboard::ClipboardEvent;
+use crate::clipboard::{ClipboardEvent, Connect, STARTUP_READ_TIMEOUT};
 use crate::protocol::SelectionKind;
 use anyhow::{bail, Context, Result};
 use std::ops::ControlFlow;
@@ -44,6 +44,22 @@ pub fn spawn_watcher(
     thread::spawn(move || run(tx, watched, max_payload));
 }
 
+/// Whether the compositor offers a data-control protocol at all — the startup
+/// probe behind `backend = "auto"`. One connection and one registry roundtrip,
+/// binding nothing. `Err` only when there is no Wayland display to ask.
+pub fn data_control_available() -> Result<bool> {
+    let conn = Connection::connect_to_env().context("connecting to the Wayland display")?;
+    let (globals, _queue) =
+        registry_queue_init::<State>(&conn).context("initializing the Wayland registry")?;
+    let wanted = [
+        ExtDataControlManagerV1::interface().name,
+        ZwlrDataControlManagerV1::interface().name,
+    ];
+    Ok(globals
+        .contents()
+        .with_list(|list| list.iter().any(|g| wanted.contains(&g.interface.as_str()))))
+}
+
 /// Reconnect loop: the same backoff the old subprocess watcher used, so a
 /// compositor restart (or a transient Wayland error) is ridden out instead
 /// of permanently losing change detection.
@@ -67,30 +83,6 @@ fn run(tx: mpsc::UnboundedSender<ClipboardEvent>, watched: Vec<SelectionKind>, m
         }
         ControlFlow::Continue(())
     });
-}
-
-/// Why this connection to the compositor is being made — which decides how its
-/// startup burst is reported.
-///
-/// The distinction is load-bearing. `Clipboard::watch` promises `Initial`
-/// "as of the subscribe", and the engine acts on that promise: `adopt_restored`
-/// records the content at **stamp 0** and deliberately never broadcasts it,
-/// because a node cannot know how old its restored clipboard is. That is right
-/// for content that was already there when the daemon started, and wrong for
-/// everything else — this watcher is supervised, so it reconnects after any
-/// compositor restart or transient error, and reporting a reconnect's burst as
-/// `Initial` demoted whatever the user had copied in the meantime to stamp 0,
-/// where any peer's older clipboard outranked it and overwrote it on the next
-/// resync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Connect {
-    /// The first connection: this *is* the `watch` call, so what it finds is
-    /// pre-existing content.
-    Subscribe,
-    /// A later connection. The watcher was blind while it was down, so what it
-    /// finds now is reported as an ordinary local change: the engine reads it,
-    /// stamps it now, and propagates it.
-    Reconnect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,11 +258,6 @@ fn read_offer_bounded(kind: SelectionKind, max_payload: usize) -> Result<crate::
         ),
     }
 }
-
-/// Bound for the startup content read — see [`read_offer_bounded`]. Matches
-/// `ClipboardIo::READ_TIMEOUT`: a real read of the size-capped clipboard takes
-/// milliseconds, so exceeding this means the source is not serving its pipe.
-const STARTUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[allow(dead_code)] // held only to keep the device proxy alive
 enum Device {

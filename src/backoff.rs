@@ -121,6 +121,28 @@ pub fn supervise(label: &str, mut attempt: impl FnMut() -> ControlFlow<()>) {
     }
 }
 
+/// [`supervise`] for an attempt that lives on the tokio runtime — the Mutter
+/// clipboard session, which is async end to end and has no blocking dispatch to
+/// park on a thread. Same policy, same constants, same log line; only the sleep
+/// and the clock are tokio's (so a paused-time test can drive it).
+pub async fn supervise_async<F, Fut>(label: &str, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ControlFlow<()>>,
+{
+    let mut backoff = watcher_restart();
+    loop {
+        let started = tokio::time::Instant::now();
+        if attempt().await.is_break() {
+            return;
+        }
+        backoff.reset_if_stable(started.elapsed(), RESTART_STABLE_AFTER);
+        let delay = backoff.next_delay();
+        warn!("restarting the {label} in {delay:?}");
+        tokio::time::sleep(delay).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +200,28 @@ mod tests {
                 "jittered delay {d:?} outside [4s, 6s]"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_async_backs_off_like_the_thread_version() {
+        // Three failing attempts then a retirement: the sleeps between them
+        // must be the escalating 1s, 2s, 4s of the shared policy, and Break
+        // must end the loop without a fourth sleep.
+        let start = tokio::time::Instant::now();
+        let mut runs = 0;
+        supervise_async("test watcher", || {
+            runs += 1;
+            let n = runs;
+            async move {
+                if n < 4 {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(runs, 4);
+        assert_eq!(start.elapsed(), Duration::from_secs(1 + 2 + 4));
     }
 }
