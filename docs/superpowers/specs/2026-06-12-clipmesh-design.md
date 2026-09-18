@@ -29,7 +29,9 @@ is explicitly out of scope (no data-control protocol).
 ## Non-goals (YAGNI)
 
 - Relaying/forwarding between peers (assumes full connectivity).
-- Clipboard history.
+- ~~Clipboard history.~~ **Superseded** by
+  `docs/superpowers/specs/2026-09-18-clipboard-history-design.md`: in memory
+  only, bounded by entry count and total bytes, no on-disk format.
 - Peer auto-discovery (explicit host list only).
 - X11, Windows, macOS backends (the `Clipboard` trait leaves the door open).
 - Lazy/on-demand content fetch — content is captured and pushed eagerly.

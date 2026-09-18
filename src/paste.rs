@@ -16,19 +16,13 @@
 //! The spec (`docs/superpowers/specs/2026-06-21-wl-paste-mode-design.md`)
 //! describes the original push-scraping design and is superseded on that point.
 
+use crate::client;
 use crate::config::{self, Config};
-use crate::mesh::Mesh;
-use crate::peer;
-use crate::protocol::{
-    self, GetResult, GetWant, Message, Offer, PeerRole, SelectionKind, Unavailable,
-};
+use crate::protocol::{self, GetResult, GetWant, Message, Offer, SelectionKind, Unavailable};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use uuid::Uuid;
 
 /// How long to wait for the node's answer (connect + handshake + transfer)
 /// before giving up. Generous so a large clipboard over a slow link isn't
@@ -88,7 +82,12 @@ impl PasteArgs {
                     Some((f, v)) => (f, Some(v.to_string())),
                     None => (a, None),
                 },
-                a if a.starts_with('-') && a.len() > 2 => (&a[..2], Some(a[2..].to_string())),
+                // `is_char_boundary` guards a mistyped flag whose second
+                // character is multi-byte: `-é` must be an unknown flag, not a
+                // panic inside the slice.
+                a if a.starts_with('-') && a.len() > 2 && a.is_char_boundary(2) => {
+                    (&a[..2], Some(a[2..].to_string()))
+                }
                 a => (a, None),
             };
             let mut value = || {
@@ -130,7 +129,7 @@ impl PasteArgs {
 /// the first offered type.
 ///
 /// [`type_matches`]: protocol::type_matches
-fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str> {
+pub(crate) fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str> {
     let find = |want: &str| {
         offer
             .keys()
@@ -165,7 +164,7 @@ fn select_type<'a>(requested: Option<&str>, offer: &'a Offer) -> Result<&'a str>
 /// errors a user can hit — one raised locally by `select_type`, one relayed from
 /// the node as [`GetResult::NotOffered`] — render identically instead of
 /// drifting apart.
-fn list_available<'a>(types: impl IntoIterator<Item = &'a str>) -> String {
+pub(crate) fn list_available<'a>(types: impl IntoIterator<Item = &'a str>) -> String {
     let names: Vec<&str> = types.into_iter().collect();
     if names.is_empty() {
         return "none".to_string();
@@ -185,7 +184,7 @@ fn list_types(offer: &Offer) -> String {
 
 /// The bytes to emit for `mime`: the representation's data, with a trailing
 /// newline appended for `text/*` types unless `no_newline`. Binary-safe.
-fn render(mut data: Vec<u8>, mime: &str, no_newline: bool) -> Vec<u8> {
+pub(crate) fn render(mut data: Vec<u8>, mime: &str, no_newline: bool) -> Vec<u8> {
     if !no_newline && protocol::is_text(mime) {
         data.push(b'\n');
     }
@@ -206,8 +205,7 @@ fn resolve_targets(pa: &PasteArgs, cfg: &Config) -> Result<Vec<String>> {
     Ok(cfg.peers.clone())
 }
 
-/// Connect to `addr` as a one-shot paste client, ask it for `want`, and return
-/// what it answers.
+/// Ask `addr` for `want` and return what it answers.
 ///
 /// This is a *request*, not a scrape. The connection is announced as
 /// [`PeerRole::Paster`], so the node registers it only to reply: it fires no
@@ -216,8 +214,9 @@ fn resolve_targets(pa: &PasteArgs, cfg: &Config) -> Result<Vec<String>> {
 /// broadcasts to it. `narrow` also lets the node send back only the
 /// representation actually wanted.
 ///
-/// Reuses the full peer connection stack (`peer::run_connection`), so the Noise
-/// handshake, version check and framing are identical to a mesh link.
+/// The dial-ask-wait loop itself is [`client::ask`], shared with the `history`
+/// subcommand; it reuses the full peer connection stack, so the Noise handshake,
+/// version check and framing are identical to a mesh link.
 pub async fn fetch_offer(
     addr: &str,
     psk: [u8; 32],
@@ -226,69 +225,24 @@ pub async fn fetch_offer(
     narrow: GetWant,
     timeout: Duration,
 ) -> Result<Offer> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("couldn't reach clipmesh node {addr}"))?;
-    let _ = stream.set_nodelay(true);
-
-    let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
-    // The node registers as a peer from our side, so this fires once the hello
-    // exchange completes — which is when it is safe to send the request.
-    let (connect_tx, mut connect_rx) = mpsc::channel(64);
-    let mesh = Mesh::new(Uuid::new_v4(), inbound_tx, connect_tx);
-
-    // Drive the connection inline (not spawned) so returning from this function
-    // drops it, and `run_connection`'s AbortGuards tear down its reader/writer.
-    // `run_connection` adds its own framing slack on top of `max_payload`.
-    let conn = peer::run_connection(
-        stream,
-        true,
+    let result = client::ask(
+        addr,
         psk,
         max_payload,
-        mesh.clone(),
-        PeerRole::Paster,
-    );
-    tokio::pin!(conn);
-
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-
-    // Exit the select loop with the error to surface; a reply returns early from
-    // inside it.
-    let err: anyhow::Error = loop {
-        tokio::select! {
-            _ = &mut deadline => break anyhow!(
-                "no reply from {addr} within {timeout:?} — it may still be transferring a \
-                 large clipboard over a slow link"
-            ),
-            // The connection ended before answering: surface its real error
-            // (PSK/version mismatch, reset) rather than timing out.
-            res = &mut conn => break match res {
-                Ok(()) => anyhow!("connection to {addr} closed before answering"),
-                Err(e) => e.context(format!("connecting to clipmesh node {addr}")),
-            },
-            // Registered, so the writer is live: ask. The connect event carries
-            // the node's ID, so this is a targeted send — reaching one known
-            // connection through a fan-out primitive would work only by
-            // accident, and only while `broadcast`'s role filter happens to keep
-            // the remote in.
-            Some(node) = connect_rx.recv() => {
-                let frame = protocol::encode_frame(
-                    &Message::Get { kind: want, want: narrow.clone() },
-                );
-                mesh.send_frame_to(node, &frame);
-            }
-            msg = inbound_rx.recv() => match msg {
-                Some((_from, Message::GetReply { kind, result })) if kind == want => {
-                    return interpret(result, addr, want);
-                }
-                // A reply about the other selection, or anything else: keep waiting.
-                Some(_) => continue,
-                None => break anyhow!("connection to {addr} closed unexpectedly"),
-            },
-        }
-    };
-    Err(err)
+        Message::Get {
+            kind: want,
+            want: narrow,
+        },
+        timeout,
+        "clipboard",
+        // A reply about the other selection is not this question's answer.
+        |msg| match msg {
+            Message::GetReply { kind, result } if kind == want => Some(result),
+            _ => None,
+        },
+    )
+    .await?;
+    interpret(result, addr, want)
 }
 
 /// Turn a node's answer into an offer or a specific error.
@@ -403,7 +357,7 @@ fn output_bytes(pa: &PasteArgs, mut offer: Offer) -> Result<Vec<u8>> {
 /// Write `bytes` to stdout, treating a downstream-closed pipe (e.g. `… | head`)
 /// as a clean stop rather than an error — matching `wl-paste`/`cat`. Other write
 /// failures (out of space, …) still propagate.
-fn write_stdout(bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_stdout(bytes: &[u8]) -> Result<()> {
     let mut out = std::io::stdout().lock();
     match out.write_all(bytes).and_then(|()| out.flush()) {
         Ok(()) => Ok(()),
@@ -454,6 +408,15 @@ mod tests {
     use crate::protocol::test_support::offer;
 
     // ---- select_type ----
+
+    /// A mistyped short flag whose second character is multi-byte must be an
+    /// unknown flag, not a panic: `&a[..2]` on `-é` splits inside a character.
+    #[test]
+    fn a_multi_byte_short_flag_is_rejected_rather_than_panicking() {
+        let args = vec!["-é".to_string()];
+        let err = format!("{:#}", PasteArgs::parse(&args).unwrap_err());
+        assert!(err.contains("unknown paste flag"), "got: {err}");
+    }
 
     #[test]
     fn select_type_prefers_utf8_text_plain() {

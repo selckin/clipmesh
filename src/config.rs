@@ -122,6 +122,13 @@ struct RawConfig {
     /// synthesize_text_plain — back-fill text/plain locally too. Off by default.
     #[serde(default)]
     take_ownership: bool,
+    /// How many recent clipboard states to remember, in memory; 0 turns the
+    /// history off.
+    #[serde(default = "default_history_entries")]
+    history_entries: usize,
+    /// Total payload bytes the history may hold.
+    #[serde(default = "default_history_max_bytes")]
+    history_max_bytes: String,
     /// Per-type allow/deny rules file; defaults to `mimetypes` beside this
     /// config when unset.
     mime_rules_file: Option<String>,
@@ -136,7 +143,7 @@ struct RawConfig {
 /// (which points back here), and `raw_config_keys_matches_the_struct` pins this
 /// list to the field names serde itself reports, so a typo, a stale entry, or a
 /// `#[serde(rename)]` that moves a key can't pass unnoticed.
-pub const RAW_CONFIG_KEYS: [&str; 21] = [
+pub const RAW_CONFIG_KEYS: [&str; 23] = [
     "listen",
     "port",
     "peers",
@@ -157,6 +164,8 @@ pub const RAW_CONFIG_KEYS: [&str; 21] = [
     "unknown_mime",
     "synthesize_text_plain",
     "take_ownership",
+    "history_entries",
+    "history_max_bytes",
     "mime_rules_file",
 ];
 
@@ -177,6 +186,12 @@ fn default_true() -> bool {
 }
 fn default_log_level() -> String {
     "info".into()
+}
+fn default_history_entries() -> usize {
+    50
+}
+fn default_history_max_bytes() -> String {
+    "64MiB".into()
 }
 fn default_unknown_mime() -> MimePolicy {
     MimePolicy::Deny
@@ -227,6 +242,12 @@ pub struct Config {
     /// Applies to every watched selection. Off by default. Never persists
     /// password-manager secrets (subject to `exclude_sensitive`).
     pub take_ownership: bool,
+    /// How many recent clipboard states to remember in memory, for
+    /// `clipmesh history`. 0 turns the history off entirely.
+    pub history_entries: usize,
+    /// Total payload bytes the history may hold; the oldest entries are dropped
+    /// to stay under it, and a single copy larger than this is not remembered.
+    pub history_max_bytes: usize,
     /// Path to the per-type rules file. Resolved to `mimetypes` next to the
     /// config file by `load` when not set explicitly; `None` keeps the rules
     /// in memory only (used by tests).
@@ -368,6 +389,8 @@ impl Config {
             unknown_mime,
             synthesize_text_plain,
             take_ownership,
+            history_entries,
+            history_max_bytes,
             mime_rules_file,
         } = raw;
         let secret = match (psk, psk_file, psk_env) {
@@ -424,9 +447,42 @@ impl Config {
             unknown_mime,
             synthesize_text_plain,
             take_ownership,
+            history_entries,
+            // Parsed even when the history is off, so a typo in the size is
+            // reported when it is written rather than lying dormant until the
+            // day someone turns the feature on.
+            history_max_bytes: match parse_size(&history_max_bytes)? {
+                0 if history_entries > 0 => bail!(
+                    "history_max_bytes must be greater than 0; \
+                     set history_entries = 0 to turn the history off"
+                ),
+                n => n,
+            },
             mime_rules_path: mime_rules_file
                 .map(|f| PathBuf::from(shellexpand::tilde(&f).into_owned())),
         })
+    }
+
+    /// The address of the daemon running on *this* host, for a CLI that wants
+    /// to talk to it.
+    ///
+    /// `listen` is a **bind** address, and `0.0.0.0` / `::` mean "every
+    /// interface" — which is not something a client can dial. A wildcard
+    /// therefore becomes the matching loopback literal; any other bind address
+    /// is dialled as it stands, since a node bound to one LAN address is
+    /// reachable at it from this host too.
+    ///
+    /// A method rather than a stored field, so it can never disagree with
+    /// `listen` — `Config::for_test` overwrites `listen` directly.
+    pub fn local_addr(&self) -> String {
+        let port = self.port.to_string();
+        match self.listen.rsplit_once(':') {
+            Some(("0.0.0.0", _)) => format!("127.0.0.1:{port}"),
+            Some(("[::]" | "::", _)) => format!("[::1]:{port}"),
+            // Already `host:port` from `from_toml`, which applies the default
+            // port to whatever `listen` held.
+            _ => self.listen.clone(),
+        }
     }
 
     /// Convenience constructor for tests (unit and integration).
@@ -468,6 +524,46 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_defaults_to_fifty_entries_under_sixty_four_mebibytes() {
+        let cfg = Config::from_toml("listen = \"h\"\npsk = \"s\"\n").unwrap();
+        assert_eq!(cfg.history_entries, 50);
+        assert_eq!(cfg.history_max_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_zero_history_budget_points_at_the_off_switch() {
+        // `history_max_bytes = 0` with the history on remembers nothing while
+        // looking configured, so it is rejected with the key that actually means
+        // "off" — and accepted once the history really is off, so turning the
+        // feature off does not also require fixing a now-inert size.
+        let with_history = "listen = \"h\"\npsk = \"s\"\nhistory_max_bytes = \"0B\"\n";
+        let err = Config::from_toml(with_history).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("history_entries = 0"),
+            "got: {err:#}"
+        );
+        let off = format!("{with_history}history_entries = 0\n");
+        assert!(Config::from_toml(&off).is_ok());
+    }
+
+    #[test]
+    fn local_addr_turns_a_wildcard_bind_into_a_loopback_it_can_dial() {
+        let local = |listen: &str, port: &str| {
+            Config::from_toml(&format!(
+                "listen = {listen:?}\nport = {port}\npsk = \"s\"\n"
+            ))
+            .unwrap()
+            .local_addr()
+        };
+        assert_eq!(local("0.0.0.0", "48100"), "127.0.0.1:48100");
+        assert_eq!(local("::", "48100"), "[::1]:48100");
+        // A non-default port is carried through, not dropped.
+        assert_eq!(local("0.0.0.0", "9999"), "127.0.0.1:9999");
+        // A node bound to one address is reachable at it from this host too.
+        assert_eq!(local("10.0.0.7", "48100"), "10.0.0.7:48100");
+    }
     use std::io::Write;
 
     /// Parse `extra` on top of the two keys every config must have. Most tests

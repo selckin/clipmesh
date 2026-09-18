@@ -14,7 +14,9 @@ use uuid::Uuid;
 /// instead of a bare `Empty` that covered six distinct causes.
 /// v8: `Unavailable::Unservable` splits "the read produced nothing" out of
 /// `Empty`, which was reporting a clipboard too large to read as an empty one.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: `History`/`HistoryReply` — the `clipmesh history` subcommand lists a
+/// node's remembered clipboard states, prints one, and puts one back.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// All MIME representations of one clipboard state, in the source compositor's
 /// advertise order (preference order — richest first), which `IndexMap`
@@ -235,6 +237,113 @@ pub enum GetResult {
     Unavailable(Unavailable),
 }
 
+/// What a [`Message::History`] asks a node to do with its clipboard history.
+///
+/// `id` is the short hex id a listing prints — a prefix of the entry's
+/// [`content_hash`]. A prefix, not an index: the CLI is one-shot, so a copy made
+/// between the listing and the follow-up command would silently renumber every
+/// row, and the user would restore something they never saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryRequest {
+    /// The listing — summaries only, no payloads.
+    List,
+    /// One entry's content.
+    ///
+    /// `type_` narrows it to a single representation, by the same
+    /// [`type_matches`] rule `--paste -t` uses — so `history get -t image/png`
+    /// transfers the PNG and not the 30 MB of other representations beside it.
+    /// There is no "types only" shape: a listing already carries every entry's
+    /// type names, so asking for them again would be a round trip for something
+    /// the client has.
+    Get { id: String, type_: Option<String> },
+    /// Put one entry back on that node's clipboard (and onto the mesh).
+    Restore { id: String },
+}
+
+/// One row of a history listing.
+///
+/// Deliberately carries no payload: a listing of fifty entries must not drag
+/// fifty clipboard offers across the wire. That is the same reason
+/// [`GetWant::TypesOnly`] exists — a summary answers the question a listing
+/// actually asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// The entry's [`content_hash`]; the CLI renders its first bytes as the id.
+    pub hash: [u8; 32],
+    pub kind: SelectionKind,
+    /// How long ago this was recorded, resolved **on the node**.
+    ///
+    /// An absolute timestamp would be rendered against the *client's* clock, so
+    /// `history list --node <peer>` would show ages skewed by the difference
+    /// between two hosts' clocks. The mesh tolerates modest skew by design
+    /// (see the stamp guard in `sync`), and that tolerance must not leak into
+    /// what the user reads.
+    pub age_ms: u64,
+    /// Total size of every representation.
+    pub bytes: u64,
+    /// The representations, in advertise order, with their sizes.
+    pub types: Vec<(String, u64)>,
+    /// A short, one-line, terminal-safe rendering of the content, produced on
+    /// the node. `None` when nothing in the entry is textual.
+    pub preview: Option<String>,
+}
+
+/// Why a [`Message::History`] request has no answer.
+///
+/// One value per cause, for the reason [`Unavailable`] already spells out: the
+/// asking side can only say something true if it is told which of these
+/// happened. "Nothing to show" covers a disabled history, an empty one, a typo
+/// in an id and an id that matches three entries, and the right response differs
+/// in every case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryMiss {
+    /// That node runs with `history_entries = 0`.
+    Disabled,
+    /// The history is on, but nothing has been recorded yet.
+    Empty,
+    /// The id is not hexadecimal, so it cannot be any entry's.
+    ///
+    /// Distinct from [`NoSuchEntry`](HistoryMiss::NoSuchEntry): a typo, not an
+    /// entry that has since been dropped — and the two want opposite advice.
+    NotHex,
+    /// No entry's hash starts with the given id.
+    NoSuchEntry,
+    /// The id is a prefix of more than one entry; the user must type more of it.
+    Ambiguous { matches: usize },
+    /// The entry exists but offers no representation matching `-t`.
+    NotOffered { available: Vec<String> },
+    /// That node does not handle the selection the entry came from — a
+    /// PRIMARY entry against a node whose backend or config has no PRIMARY.
+    NotSynced,
+    /// The entry is there, but that node's content filters — its MIME rules and
+    /// `max_payload_size` **as they are now** — leave nothing of it. The rules
+    /// are shared mesh-wide and a peer can change them, so an entry can outlive
+    /// the configuration that recorded it.
+    ///
+    /// Carries the pipeline's own reason rather than collapsing to "no", for the
+    /// same reason [`Unavailable`] exists: "that selection isn't handled here"
+    /// is an actively wrong answer to "every type in it is denied".
+    Filtered(Unavailable),
+    /// The clipboard write failed; the node logged why.
+    WriteFailed,
+}
+
+/// The answer to a [`Message::History`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HistoryResult {
+    List(Vec<HistoryEntry>),
+    /// The requested entry's representations, narrowed to what was asked for.
+    Offer(Offer),
+    /// The entry is back on that node's clipboard. `broadcast` is false when the
+    /// node does not send that selection, so the CLI can say the restore was
+    /// local-only rather than implying the mesh followed.
+    Restored {
+        kind: SelectionKind,
+        broadcast: bool,
+    },
+    Failed(HistoryMiss),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     /// First message on every connection: announces the sender's node ID, the
@@ -274,6 +383,15 @@ pub enum Message {
         /// Orders this update against every other, live or reconnect resync.
         version: Version,
     },
+    /// Ask about a node's clipboard history — list it, fetch one entry, or put
+    /// one back. Answered with [`Message::HistoryReply`].
+    ///
+    /// No `kind`: a history spans both selections and every entry names its own,
+    /// so asking per selection would make a listing two round trips to show one
+    /// ordered list.
+    History { req: HistoryRequest },
+    /// The answer to a [`Message::History`].
+    HistoryReply { result: HistoryResult },
     /// The full MIME-rules file, shared across the mesh under whole-file
     /// last-writer-wins. `body` is the entire file text (including the
     /// `# clipmesh-version:` header line); `version` orders it the same way a
@@ -487,6 +605,53 @@ mod tests {
     use super::test_support::offer;
     use super::*;
     use uuid::Uuid;
+
+    /// bincode is not self-describing, so every message shape has to survive a
+    /// round trip through the very encoder the wire uses — a field that silently
+    /// fails to decode is the failure mode `PROTOCOL_VERSION` exists to prevent,
+    /// and it does not show up until two hosts disagree.
+    #[test]
+    fn history_messages_round_trip_through_the_wire_encoding() {
+        let messages = [
+            Message::History {
+                req: HistoryRequest::List,
+            },
+            Message::History {
+                req: HistoryRequest::Get {
+                    id: "3f2a9c17".into(),
+                    type_: Some("text/plain;charset=utf-8".into()),
+                },
+            },
+            Message::History {
+                req: HistoryRequest::Restore { id: "3f2a".into() },
+            },
+            Message::HistoryReply {
+                result: HistoryResult::List(vec![HistoryEntry {
+                    hash: [7u8; 32],
+                    kind: SelectionKind::Selection,
+                    age_ms: 12_345,
+                    bytes: 34,
+                    types: vec![("text/plain".into(), 34)],
+                    preview: Some("git rebase -i HEAD~3".into()),
+                }]),
+            },
+            Message::HistoryReply {
+                result: HistoryResult::Offer(offer(&[("image/png", b"\x89PNG")])),
+            },
+            Message::HistoryReply {
+                result: HistoryResult::Restored {
+                    kind: SelectionKind::Clipboard,
+                    broadcast: false,
+                },
+            },
+            Message::HistoryReply {
+                result: HistoryResult::Failed(HistoryMiss::Ambiguous { matches: 3 }),
+            },
+        ];
+        for msg in messages {
+            assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+        }
+    }
 
     #[test]
     fn hashed_carries_the_hash_of_its_content() {

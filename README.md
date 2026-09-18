@@ -128,6 +128,65 @@ leaving the paste to time out.
 
 This is a one-shot read: there is no `wl-paste --watch` and no `wl-copy`.
 
+## Clipboard history
+
+clipmesh remembers the recent clipboard contents a node settles on — what you
+copied on it, and what it received from a peer — so a copy you have since
+replaced is still reachable:
+
+    clipmesh history list                        # what this node remembers
+    clipmesh history restore <id>                # put one back on the clipboard
+    clipmesh history get <id> [-t <mime>] [-n]   # print one entry to stdout
+    clipmesh history list --node desktop         # a peer's history
+
+```
+$ clipmesh history list
+3 remembered clipboard(s) on 127.0.0.1:48100
+
+ID        AGE  WHERE      SIZE     CONTENT
+3f2a9c17  12s  clipboard  34 B     git rebase -i HEAD~3
+8b10de44  4m   clipboard  1.2 MiB  image/png, image/jpeg
+c7e05a92  11m  primary    88 B     https://example.com/a/very/long/…
+
+Put one back with: clipmesh history restore <id>
+```
+
+An **id** is the start of the entry's content hash. Type as much of it as is
+unambiguous; the node says so rather than guessing if it isn't. Ids are stable —
+a copy made between your `list` and your `restore` cannot renumber them the way
+a positional index would.
+
+**Restoring is copying.** The entry goes onto that node's clipboard *and* out to
+the mesh under a fresh timestamp, so every peer follows, exactly as if you had
+copied it again there. `clipmesh history restore --node desktop <id>` therefore
+puts it on desktop's clipboard, and from there on all of them.
+
+Details worth knowing:
+
+- **Memory only.** Nothing is written to disk, and the history is lost when the
+  daemon restarts — including the automatic restart after a config edit.
+- **Bounded** by `history_entries` (default 50) and `history_max_bytes` (default
+  64 MiB), whichever fills first; the oldest entries are dropped. A single copy
+  larger than the whole budget is not remembered at all. `history_entries = 0`
+  turns the feature off, and a node with it off says so rather than answering
+  with an empty list.
+- **Password-manager contents are never remembered**, on the same
+  `exclude_sensitive` rule that keeps them off the wire.
+- **Any host with the psk can list and restore a node's remembered contents**,
+  not just read its current clipboard. That is what makes `--node` useful; if it
+  is not what you want, set `history_entries = 0`.
+- Only selections the node already watches are remembered, so the middle-click
+  selection appears only with `sync_selection` or a `[link_selections]` bridge.
+- A node that doesn't send (`direction = "receive_only"`) still remembers its own
+  copies and still restores them locally — it just says the mesh didn't follow.
+- One entry per distinct content: re-copying something moves it back to the top
+  rather than listing it twice, and with `[link_selections]` on, the clipboard
+  and the selection copy of one thing are a single entry.
+- Restoring does **not** run the `[link_selections]` bridge (it is an engine
+  write, like content received from a peer), so it lands on one selection only.
+- An entry can outlive the MIME rules that recorded it — the rules are shared
+  mesh-wide. Restoring one that is now denied says exactly that.
+
 ## Configuration
 
 See `examples/config.toml` for all options and defaults.

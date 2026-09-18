@@ -84,6 +84,20 @@ psk_file = "~/.config/clipmesh/psk"
 # re-owns password-manager-flagged content while exclude_sensitive is on.
 # take_ownership = false
 
+# How many recent clipboard contents to remember, so `clipmesh history
+# list` can show them and `clipmesh history restore <id>` can put one
+# back (on this node and, from there, on the mesh). Memory only —
+# nothing is written to disk and the history is lost on restart. Set to
+# 0 to turn it off. Password-manager-flagged contents are dropped before
+# they get here, as they are before a broadcast. Note that any host
+# holding the psk can list and restore this node's remembered contents.
+# history_entries = 50
+
+# Total size the remembered contents may occupy; the oldest are dropped
+# until the total fits. A single copy larger than this is not remembered
+# at all, rather than flushing everything else to make room for itself.
+# history_max_bytes = "64MiB"
+
 # Per-type allow/deny rules file (TOML). Defaults to "mimetypes" beside
 # this config, wherever this config lives — so the path below is an example
 # of that, not a fixed default: setting it pins the rules file even if the

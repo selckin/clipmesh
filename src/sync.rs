@@ -5,15 +5,20 @@ use crate::mesh::Mesh;
 use crate::mime::{self, lock_rules, MimeRules};
 use crate::protocol::{
     describe_offer, encode_frame, human_bytes, is_text_plain, type_matches, wants_text_plain,
-    GetResult, GetWant, Hashed, Message, Offer, SelectionKind, Unavailable, Version, TEXT_PLAIN,
+    GetResult, GetWant, Hashed, HistoryMiss, HistoryRequest, HistoryResult, Message, Offer,
+    SelectionKind, Unavailable, Version, TEXT_PLAIN,
 };
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+mod settled;
+
+use settled::Settled;
 
 pub const SENSITIVE_MIME: &str = "x-kde-passwordManagerHint";
 
@@ -134,6 +139,23 @@ fn narrow_to(offer: Offer, wanted: &str) -> Option<Offer> {
 /// `wayland::assemble_offer` spends the same number as a *resource guard*, under
 /// streaming ignorance of sizes and before the rules — see its doc comment for
 /// why the two cannot be collapsed into one.
+/// Hand back a remembered entry, narrowed to `wanted` when one was named.
+///
+/// Reuses `narrow_to` — and therefore `type_matches` — so `history get -t` and
+/// `--paste -t` accept exactly the same spellings, generic names included. A
+/// second rule here would let one of the two answer a request the other refuses,
+/// with nothing to say which was right.
+fn serve_entry(offer: Offer, wanted: Option<&str>) -> HistoryResult {
+    let Some(wanted) = wanted else {
+        return HistoryResult::Offer(offer);
+    };
+    let available = offer.keys().cloned().collect();
+    match narrow_to(offer, wanted) {
+        Some(narrowed) => HistoryResult::Offer(narrowed),
+        None => HistoryResult::Failed(HistoryMiss::NotOffered { available }),
+    }
+}
+
 fn cap_to_payload_size(content: Hashed, max: usize) -> Hashed {
     if offer_size(content.offer()) <= max {
         return content; // common case: the whole offer fits
@@ -178,23 +200,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// What this node believes is the mesh-current content of one selection.
-/// One record replaces the former three parallel maps so the hash, the
-/// ordering stamp, and the origin can never describe different contents.
-#[derive(Clone, Copy)]
-struct ContentState {
-    hash: [u8; 32],
-    /// Orders this content against any other; see [`Version`].
-    version: Version,
-}
-
-impl ContentState {
-    /// True if `v` strictly supersedes this state's order.
-    fn superseded_by(&self, v: Version) -> bool {
-        v > self.version
-    }
-}
-
 /// Bridges the local clipboard and the mesh, with echo suppression,
 /// ordering, debounce, direction control, and content filtering.
 pub struct SyncEngine<C> {
@@ -205,10 +210,11 @@ pub struct SyncEngine<C> {
     io: ClipboardIo<C>,
     mesh: Arc<Mesh>,
     cfg: Arc<Config>,
-    /// Mesh-current content per selection. Updated on both broadcast and
-    /// apply; echo/dedup is "incoming hash == current hash", ordering is
-    /// `(stamp, origin)`.
-    current: Mutex<HashMap<SelectionKind, ContentState>>,
+    /// Mesh-current content per selection, and the history every change to it
+    /// feeds. Echo/dedup is "incoming hash == current hash", ordering is
+    /// `(stamp, origin)`. It owns the record privately, so the only way to
+    /// advance it is to hand it the content — see [`settled`].
+    settled: Settled,
     /// Per-selection decisions, computed once from `cfg` (see [`SelectionPolicy`]).
     policies: Policies,
     /// Hybrid logical clock: max of wall-clock ms and the highest stamp
@@ -282,6 +288,12 @@ enum Pipeline {
     Serve,
     /// Adopting the clipboard that already existed at startup.
     Restore,
+    /// A local copy this node will not put on the mesh — a copy on a
+    /// receive-only node, or on a selection it does not sync. It is still this
+    /// host's clipboard, so it is still remembered.
+    Remember,
+    /// A remembered entry being put back on the clipboard.
+    Recall,
 }
 
 impl Pipeline {
@@ -348,6 +360,31 @@ impl Pipeline {
             // clipboard reverted a rules edit another host had just made.
             Pipeline::Restore => Stages {
                 synthesize: true,
+                rules: RulesStage::Apply,
+                cap: true,
+            },
+            // A copy this node deliberately does not send must not be the thing
+            // that rewrites its rules for every peer, so `Apply`, not `Record` —
+            // the same reason `Serve` and `Restore` use it. Otherwise identical
+            // to `Broadcast`, so the content remembered here is the content a
+            // sending node would have remembered for the same copy.
+            Pipeline::Remember => Stages {
+                synthesize: true,
+                rules: RulesStage::Apply,
+                cap: true,
+            },
+            // `Apply`, not `Record`, because answering a request must never make
+            // this node rewrite its rules and push them mesh-wide. The cap stays
+            // on so the write round-trips the read-back budget.
+            //
+            // Synthesis is deliberately **off**, and this is the one place it
+            // differs from `Restore`: it is a capture-side courtesy to local
+            // legacy apps, and a history entry is not a capture. Back-filling
+            // `text/plain` here would hand back bytes that hash differently from
+            // the id the user asked for — so the restore would land as a *new*
+            // entry beside the one they picked.
+            Pipeline::Recall => Stages {
+                synthesize: false,
                 rules: RulesStage::Apply,
                 cap: true,
             },
@@ -435,6 +472,8 @@ struct SelectionPolicy {
     watch: bool,
     /// Re-offer it after a local copy so clipmesh owns the content.
     own: bool,
+    /// Keep local copies of it in the clipboard history.
+    remember: bool,
     /// The selection local changes to this one are mirrored INTO.
     mirror_into: Option<SelectionKind>,
 }
@@ -455,15 +494,27 @@ impl SelectionPolicy {
             // by reading it on demand.
             watch: on_mesh || mirror_into.is_some(),
             own: cfg.take_ownership,
+            // Only selections this node already observes. Deliberately not
+            // `history_entries > 0` alone: remembering must not be a reason to
+            // start watching a selection nothing else needs — SELECTION with
+            // `sync_selection` off stays unwatched, and the Mutter backend,
+            // which has no PRIMARY at all, keeps refusing it.
+            remember: cfg.history_entries > 0 && (on_mesh || mirror_into.is_some()),
             mirror_into,
         }
     }
 
     /// Whether any local sink would act on a change to this selection: the mesh,
-    /// the bridge, or the ownership rewrite. When none would, the batch skips
-    /// the read entirely.
+    /// the bridge, the ownership rewrite, or the history. When none would, the
+    /// batch skips the read entirely.
+    ///
+    /// The history belongs in this list for a reason that is easy to miss: on a
+    /// `receive_only` node with no bridge and no `take_ownership` the first three
+    /// are all false, so without it the batch never reads the selection and the
+    /// history stays permanently empty on exactly the class of node whose user
+    /// most wants one.
     fn has_local_sink(&self) -> bool {
-        self.send || self.mirror_into.is_some() || self.own
+        self.send || self.mirror_into.is_some() || self.own || self.remember
     }
 }
 
@@ -575,8 +626,8 @@ impl<C: Clipboard> SyncEngine<C> {
             io: ClipboardIo::new(clipboard),
             mesh,
             policies: Policies::new(&cfg),
+            settled: Settled::new(cfg.history_entries, cfg.history_max_bytes),
             cfg,
-            current: Mutex::new(HashMap::new()),
             clock: Mutex::new(0),
             skew_rejected: Mutex::new(HashSet::new()),
             mime_rules,
@@ -864,17 +915,8 @@ impl<C: Clipboard> SyncEngine<C> {
         // snapshot stale, and it is overwritten here. That direction self-heals —
         // the hash no longer matches, so the peer's next resync applies instead
         // of being suppressed — which is why it is the safer way to be wrong.
-        let mut current = self.current.lock().unwrap();
-        let already_recorded = current.get(&kind).is_some_and(|s| s.hash == content.hash());
-        if !already_recorded {
-            current.insert(
-                kind,
-                ContentState {
-                    hash: content.hash(),
-                    version: Version::new(0, self.mesh.own_id()),
-                },
-            );
-        }
+        self.settled
+            .adopt(kind, &content, self.mesh.own_id(), now_ms());
     }
 
     /// Whether this offer must be withheld because the user opted to exclude
@@ -1016,26 +1058,39 @@ impl<C: Clipboard> SyncEngine<C> {
     /// applying the content filters. The caller reads the selection once and
     /// shares `raw` with the bridge, so a single local change costs one read.
     async fn broadcast_selection(&self, kind: SelectionKind, raw: Hashed) {
-        if !self.may_send(kind) {
-            if self.cfg.verbose {
-                info!("copied {kind:?}: not sent (this node does not send)");
-            }
-            return;
-        }
         // Describe what was copied before the filters narrow it, computed once.
         // The bracketed list means "what was copied" in every outcome below
         // (consistent with the received-update summary).
         let copied = self.cfg.verbose.then(|| describe_offer(raw.offer()));
-        let Ok(content) = self.apply_stages(raw, Pipeline::Broadcast).await else {
+        // The `may_send` gate is applied *after* the filters rather than before
+        // them, because a copy this node will not send is still this host's
+        // clipboard and still belongs in its history — the history is local
+        // memory, `direction` is a wire policy. `Pipeline::Remember` is what
+        // keeps that from also making a receive-only node's copies rewrite its
+        // shared rules file.
+        let sends = self.may_send(kind);
+        let pipeline = if sends {
+            Pipeline::Broadcast
+        } else {
+            Pipeline::Remember
+        };
+        let Ok(content) = self.apply_stages(raw, pipeline).await else {
             if let Some(copied) = &copied {
                 info!("copied {kind:?} [{copied}]: not sent (nothing passed the content filters)");
             }
             return;
         };
+        if !sends {
+            self.settled.remember(kind, &content, now_ms());
+            if let Some(copied) = &copied {
+                info!("copied {kind:?} [{copied}]: not sent (this node does not send)");
+            }
+            return;
+        }
         let hash = content.hash();
         // Already the mesh-current content (we just applied it, or the user
         // re-copied identical bytes): nothing to do.
-        if self.current.lock().unwrap().get(&kind).map(|s| s.hash) == Some(hash) {
+        if self.settled.state(kind).map(|s| s.hash) == Some(hash) {
             if let Some(copied) = &copied {
                 info!("copied {kind:?} [{copied}]: not sent (already on the mesh)");
             }
@@ -1044,10 +1099,7 @@ impl<C: Clipboard> SyncEngine<C> {
         }
         let version = Version::new(self.tick(), self.mesh.own_id());
         let stamp = version.stamp;
-        self.current
-            .lock()
-            .unwrap()
-            .insert(kind, ContentState { hash, version });
+        self.settled.set(kind, &content, version, now_ms());
         if let Some(copied) = &copied {
             info!("copied {kind:?} [{copied}]: broadcast (stamp {stamp})");
         }
@@ -1271,7 +1323,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // per-selection direction override is ever added — the two happen to
         // agree today, which is exactly how such a restatement rots unnoticed.
         for kind in self.policies.kinds(|p| p.send) {
-            let Some(state) = self.current.lock().unwrap().get(&kind).copied() else {
+            let Some(state) = self.settled.state(kind) else {
                 continue;
             };
             let Some(content) = self.capture_offer(kind).await else {
@@ -1325,6 +1377,26 @@ impl<C: Clipboard> SyncEngine<C> {
                 let engine = Arc::clone(self);
                 tokio::spawn(async move { engine.on_get(from, kind, want).await });
             }
+            // Split by what the request does. `Restore` writes the clipboard,
+            // mints a stamp and advances `settled`, so it is awaited **inline**
+            // and ordered against local captures and inbound clips exactly as
+            // `apply_inbound_clip` is: spawned, a local copy landing between its
+            // write and its record would leave the record naming content the
+            // clipboard no longer holds. It costs the loop one clipboard write,
+            // which is what every inbound apply already costs it.
+            //
+            // `List` and `Get` mutate nothing, which is what makes spawning them
+            // safe — and worth doing for the same reason `Get` is spawned: both
+            // wait on the rules lock and the blocking pool, and a listing then
+            // renders every row, so awaiting them here would stall inbound
+            // clips and local captures for work nothing needs ordered.
+            Message::History {
+                req: req @ HistoryRequest::Restore { .. },
+            } => self.on_history(from, req).await,
+            Message::History { req } => {
+                let engine = Arc::clone(self);
+                tokio::spawn(async move { engine.on_history(from, req).await });
+            }
             Message::Hello { .. } => {
                 warn!("ignoring an unexpected Hello from peer {from} after handshake")
             }
@@ -1333,7 +1405,139 @@ impl<C: Clipboard> SyncEngine<C> {
             Message::GetReply { .. } => {
                 warn!("ignoring an unexpected GetReply from peer {from}")
             }
+            Message::HistoryReply { .. } => {
+                warn!("ignoring an unexpected HistoryReply from peer {from}")
+            }
         }
+    }
+
+    /// Answer a `clipmesh history` request.
+    async fn on_history(&self, from: Uuid, req: HistoryRequest) {
+        let result = self.serve_history(req).await;
+        debug!("answering a history request from {from}");
+        self.mesh
+            .send_frame_to(from, &encode_frame(&Message::HistoryReply { result }));
+    }
+
+    /// Serve one history request.
+    ///
+    /// A listing and a `get` read **nothing** from the compositor — that is the
+    /// difference between this and `serve_get`, whose answer is whatever is on
+    /// the clipboard right now. A history entry is stored content, so the
+    /// "start from the advertised names" machinery `serve_get` needs (to decide
+    /// sensitivity and synthesis before narrowing a read) has nothing to decide
+    /// here: the whole offer is already in hand.
+    async fn serve_history(&self, req: HistoryRequest) -> HistoryResult {
+        match req {
+            HistoryRequest::List => self.serve_history_list().await,
+            HistoryRequest::Get { id, type_ } => match self.settled.find(&id) {
+                // Through `Serve`, the same pipeline `--paste` answers from: a
+                // pull of a remembered clipboard must not expose what a pull of
+                // the live one would refuse. The rules are shared mesh-wide and
+                // a peer can change them, so an entry can outlive the
+                // configuration that recorded it.
+                Ok((_, content)) => match self.apply_stages(content, Pipeline::Serve).await {
+                    Ok(content) => serve_entry(content.into_offer(), type_.as_deref()),
+                    Err(reason) => HistoryResult::Failed(HistoryMiss::Filtered(reason)),
+                },
+                Err(miss) => HistoryResult::Failed(miss),
+            },
+            HistoryRequest::Restore { id } => match self.settled.find(&id) {
+                Ok((kind, content)) => self.restore_entry(kind, content).await,
+                Err(miss) => HistoryResult::Failed(miss),
+            },
+        }
+    }
+
+    /// Build the listing, with every row filtered by the MIME rules **as they
+    /// are now**.
+    ///
+    /// A listing is a pull, so the rule a pull obeys applies: it must not expose
+    /// what a push would not. Rendering the rows from the stored bytes alone
+    /// would print a preview of content that `history get` answers `Denied` for
+    /// and `--paste` refuses outright — the rules are shared mesh-wide, so a
+    /// peer can deny a type after the copy was made, and the listing was the one
+    /// pull that had not noticed.
+    ///
+    /// The rows are built inside `with_rules`, on the blocking pool, so neither
+    /// lock is held across the other and the per-row work stays off the engine's
+    /// select loop.
+    async fn serve_history_list(&self) -> HistoryResult {
+        let entries = match self.settled.entries(now_ms()) {
+            Ok(entries) => entries,
+            Err(miss) => return HistoryResult::Failed(miss),
+        };
+        let rows: Vec<crate::protocol::HistoryEntry> = self
+            .with_rules(move |rules| {
+                let compiled = rules.compile();
+                entries
+                    .into_iter()
+                    .filter_map(|(kind, age_ms, content)| {
+                        settled::summarize(kind, age_ms, &content, |mime, size| {
+                            compiled.allows(mime, size)
+                        })
+                    })
+                    .collect()
+            })
+            .await;
+        if rows.is_empty() {
+            // Not `Empty`: the node does remember things, it just may not hand
+            // any of them over any more. "Nothing remembered yet" would send the
+            // user looking for a copy that is sitting right there.
+            return HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied));
+        }
+        HistoryResult::List(rows)
+    }
+
+    /// Put a remembered entry back on the clipboard: restoring is copying.
+    ///
+    /// It writes locally and, when this node sends that selection, broadcasts
+    /// under a freshly minted `Version` so peers follow — exactly what a local
+    /// copy of the same bytes would do.
+    async fn restore_entry(&self, kind: SelectionKind, content: Hashed) -> HistoryResult {
+        // An entry can outlive the configuration that recorded it (the rules are
+        // shared mesh-wide and a peer can change them), and a PRIMARY entry can
+        // be asked of a node that has no PRIMARY at all.
+        if !self.policies.get(kind).watch {
+            return HistoryResult::Failed(HistoryMiss::NotSynced);
+        }
+        let content = match self.apply_stages(content, Pipeline::Recall).await {
+            Ok(content) => content,
+            // Not `NotSynced`: "this node has no such selection" is an actively
+            // wrong answer to "your MIME rules now deny every type in it".
+            Err(reason) => return HistoryResult::Failed(HistoryMiss::Filtered(reason)),
+        };
+        // Echo-suppressed by construction: `io.write` records the marker before
+        // writing, so the watch echo this provokes is classified `Origin::Echo`
+        // next batch and dropped rather than re-broadcast as a fresh local copy.
+        if !self.io.write(kind, content.clone()).await {
+            return HistoryResult::Failed(HistoryMiss::WriteFailed);
+        }
+        let broadcast = self.may_send(kind);
+        if !broadcast {
+            // Local-only, so it never becomes *mesh*-current here: advancing the
+            // record from content this node never sent would make a peer's
+            // genuinely newer clip look older and stop it being applied.
+            self.settled.remember(kind, &content, now_ms());
+            return HistoryResult::Restored { kind, broadcast };
+        }
+        let version = Version::new(self.tick(), self.mesh.own_id());
+        let hash = content.hash();
+        // Recorded after the successful write, as an inbound apply is, so a
+        // transient failure neither claims the content nor publishes it.
+        self.settled.set(kind, &content, version, now_ms());
+        debug!(
+            "restored {kind:?} from the history ({}, stamp {})",
+            describe_offer(content.offer()),
+            version.stamp
+        );
+        self.mesh.broadcast(&Message::Clip {
+            kind,
+            hash,
+            offer: content.into_arc(),
+            version,
+        });
+        HistoryResult::Restored { kind, broadcast }
     }
 
     /// Answer a `--paste` client's request for one selection.
@@ -1639,32 +1843,23 @@ impl<C: Clipboard> SyncEngine<C> {
         // Free when the filters changed nothing — the common case — because the
         // hash rode along with the content instead of being recomputed.
         let applied_hash = content.hash();
-        {
-            let mut current = self.current.lock().unwrap();
-            if let Some(state) = current.get(&kind).copied() {
-                if state.hash == applied_hash {
-                    // Already hold exactly this content, so no clipboard write
-                    // is needed — but still adopt a higher (stamp, origin).
-                    // The LWW timestamp must track the newest write of the
-                    // current content; keeping a stale stamp would let a later
-                    // update stamped between ours and a peer's newer one win
-                    // here yet lose on that peer, diverging the mesh.
-                    if state.superseded_by(version) {
-                        current.insert(
-                            kind,
-                            ContentState {
-                                hash: applied_hash,
-                                version,
-                            },
-                        );
-                    }
-                    debug!("inbound {kind:?} from peer {from} is already our current content; nothing to do");
-                    return "already our current content";
+        if let Some(state) = self.settled.state(kind) {
+            if state.hash == applied_hash {
+                // Already hold exactly this content, so no clipboard write is
+                // needed — but still adopt a higher (stamp, origin). The LWW
+                // timestamp must track the newest write of the current content;
+                // keeping a stale stamp would let a later update stamped between
+                // ours and a peer's newer one win here yet lose on that peer,
+                // diverging the mesh.
+                if state.superseded_by(version) {
+                    self.settled.reorder(kind, version);
                 }
-                if !state.superseded_by(version) {
-                    debug!("ignoring an older {kind:?} update from peer {from} (stamp {}); we already hold newer content", version.stamp);
-                    return "ignored (older than our content)";
-                }
+                debug!("inbound {kind:?} from peer {from} is already our current content; nothing to do");
+                return "already our current content";
+            }
+            if !state.superseded_by(version) {
+                debug!("ignoring an older {kind:?} update from peer {from} (stamp {}); we already hold newer content", version.stamp);
+                return "ignored (older than our content)";
             }
         }
         debug!(
@@ -1677,7 +1872,9 @@ impl<C: Clipboard> SyncEngine<C> {
         // content must not be re-mirrored to the partner selection nor
         // re-broadcast to the mesh under our own origin. `link_selections` is a
         // purely *local* coupling; cross-host propagation is `sync_selection`'s job.
-        if !self.io.write(kind, content).await {
+        // Cloned, not moved: the write is terminal for the `Arc`, and the record
+        // below names this same content. A `Hashed` clone is a refcount bump.
+        if !self.io.write(kind, content.clone()).await {
             return "clipboard write failed";
         }
         // Record as current only on a successful write, so a transient
@@ -1685,13 +1882,7 @@ impl<C: Clipboard> SyncEngine<C> {
         // The whole handler runs to completion on the single engine task
         // (it is awaited inline in run()'s select), so `current` cannot be
         // mutated across this await — the post-write insert is not a TOCTOU.
-        self.current.lock().unwrap().insert(
-            kind,
-            ContentState {
-                hash: applied_hash,
-                version,
-            },
-        );
+        self.settled.set(kind, &content, version, now_ms());
         "applied"
     }
 
@@ -2176,6 +2367,10 @@ mod tests {
 
     struct Harness {
         clip: Arc<MockClipboard>,
+        /// The running engine, for the paths a test drives directly rather than
+        /// through the mesh (`serve_history`, which a `Paster` would reach over
+        /// the wire).
+        engine: Arc<SyncEngine<MockClipboard>>,
         mesh: Arc<Mesh>,
         conn_rx: mpsc::Receiver<crate::protocol::Frame>,
         in_tx: mpsc::Sender<(Uuid, Message)>,
@@ -2224,12 +2419,13 @@ mod tests {
             let engine = engine.clone();
             let kind = *kind;
             wait_for("the seeded clipboard to be adopted", move || {
-                engine.current.lock().unwrap().contains_key(&kind)
+                engine.settled.state(kind).is_some()
             })
             .await;
         }
         Harness {
             clip,
+            engine,
             mesh,
             conn_rx,
             in_tx,
@@ -2768,6 +2964,461 @@ mod tests {
             h.clip.get(kind).as_ref() == Some(o)
         })
         .await;
+    }
+
+    // ---- clipboard history ----
+
+    /// The history listing, or the reason there is none.
+    async fn history(h: &Harness) -> Result<Vec<crate::protocol::HistoryEntry>, HistoryMiss> {
+        match h.engine.serve_history(HistoryRequest::List).await {
+            HistoryResult::List(entries) => Ok(entries),
+            HistoryResult::Failed(miss) => Err(miss),
+            other => panic!("a list request was answered with {other:?}"),
+        }
+    }
+
+    /// The listing's previews, newest first — what `clipmesh history list` shows.
+    async fn remembered(h: &Harness) -> Vec<String> {
+        history(h)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.preview.unwrap_or_default())
+            .collect()
+    }
+
+    /// The full id of the entry previewing as `text`.
+    async fn id_of(h: &Harness, text: &str) -> String {
+        let entry = history(h)
+            .await
+            .expect("no history")
+            .into_iter()
+            .find(|e| e.preview.as_deref() == Some(text))
+            .unwrap_or_else(|| panic!("{text:?} is not remembered"));
+        settled::hex(&entry.hash)
+    }
+
+    /// Poll the listing until `cond` holds. Its own loop rather than `wait_for`,
+    /// because a listing is genuinely async — it builds its rows behind the MIME
+    /// rules, on the blocking pool — so a synchronous predicate cannot observe
+    /// it.
+    async fn wait_history(h: &Harness, label: &str, cond: impl Fn(&[String]) -> bool) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if cond(&remembered(h).await) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    async fn wait_remembered(h: &Harness, text: &str) {
+        wait_history(h, text, |previews| previews.iter().any(|p| p == text)).await;
+    }
+
+    #[tokio::test]
+    async fn a_local_copy_is_remembered() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("first"));
+        recv_clip(&mut h).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("second"));
+        recv_clip(&mut h).await;
+        assert_eq!(remembered(&h).await, vec!["second", "first"]);
+    }
+
+    #[tokio::test]
+    async fn content_applied_from_a_peer_is_remembered() {
+        let h = start(Config::for_test("s")).await;
+        send_inbound(&h, SelectionKind::Clipboard, offer("from-peer")).await;
+        wait_applied(&h, SelectionKind::Clipboard, &offer("from-peer")).await;
+        assert_eq!(remembered(&h).await, vec!["from-peer"]);
+    }
+
+    #[tokio::test]
+    async fn the_clipboard_present_at_startup_is_the_first_history_entry() {
+        // Restored content is inert — not broadcast, not bridged, not re-owned —
+        // but "inert" means it does not propagate, not that it is forgotten. It
+        // is the entry a user is most likely to want back after copying over it.
+        let h = start_seeded(Config::for_test("s"), offer("was here")).await;
+        assert_eq!(remembered(&h).await, vec!["was here"]);
+    }
+
+    #[tokio::test]
+    async fn a_local_copy_on_a_receive_only_node_is_remembered_but_not_sent() {
+        // Two separate gates drop this copy without the history: the batch skips
+        // reading a selection with no local sink, and `broadcast_selection`
+        // returns before the filters when the node does not send.
+        let mut cfg = Config::for_test("s");
+        cfg.direction = Direction::ReceiveOnly;
+        let mut h = start(cfg).await;
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("local only"));
+        wait_remembered(&h, "local only").await;
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test]
+    async fn a_send_blocked_copy_does_not_record_unseen_types_into_the_rules_file() {
+        // The dangerous half of remembering a send-blocked copy: it now runs
+        // through a pipeline where it ran through none. `RulesStage::Record`
+        // would append the type, persist the file and push the whole ruleset
+        // mesh-wide — from a node that deliberately sends nothing.
+        let mut cfg = Config::for_test("s");
+        cfg.direction = Direction::ReceiveOnly;
+        let (_dir, path) = with_rules(&mut cfg, MimePolicy::Allow, &[("text/plain", "allow")]);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let h = start(cfg).await;
+
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[("application/x-never-seen", b"hi")]),
+        );
+        wait_history(&h, "the copy to be remembered", |previews| {
+            !previews.is_empty()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a copy this node never sends rewrote the shared MIME-rules file"
+        );
+    }
+
+    #[tokio::test]
+    async fn remembering_does_not_make_an_unwatched_selection_watched() {
+        // History must not be a reason to start watching PRIMARY: the Mutter
+        // backend has none at all, and `sync_selection = false` means the user
+        // said not to.
+        let cfg = Config::for_test("s"); // sync_selection off, no bridge
+        let h = start(cfg).await;
+        assert!(!h.engine.policies.get(SelectionKind::Selection).remember);
+        assert!(!h
+            .engine
+            .policies
+            .get(SelectionKind::Selection)
+            .has_local_sink());
+    }
+
+    #[tokio::test]
+    async fn a_secret_is_never_remembered() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[
+                ("text/plain", b"hunter2"),
+                (SENSITIVE_MIME, b"secret"),
+            ]),
+        );
+        assert_no_broadcast(&mut h).await;
+        assert_eq!(history(&h).await, Err(HistoryMiss::Empty));
+    }
+
+    #[tokio::test]
+    async fn history_off_answers_disabled_rather_than_empty() {
+        let mut cfg = Config::for_test("s");
+        cfg.history_entries = 0;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("gone"));
+        recv_clip(&mut h).await;
+        assert_eq!(history(&h).await, Err(HistoryMiss::Disabled));
+    }
+
+    #[tokio::test]
+    async fn listing_the_history_reads_no_clipboard_at_all() {
+        // The entries are already in memory. This is the mirror of
+        // `listing_types_reads_no_representation_contents`, and the proof that a
+        // listing costs the compositor nothing.
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("copied"));
+        recv_clip(&mut h).await;
+        h.clip.block_reads();
+        assert_eq!(remembered(&h).await, vec!["copied"]);
+        h.clip.allow_reads();
+    }
+
+    #[tokio::test]
+    async fn restoring_an_entry_writes_the_clipboard_and_broadcasts_it() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("wanted"));
+        recv_clip(&mut h).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("newer"));
+        let (_, _, _, newer_stamp) = recv_next_clip(&mut h).await;
+
+        let id = id_of(&h, "wanted").await;
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Restore { id: id[..8].into() })
+                .await,
+            HistoryResult::Restored {
+                kind: SelectionKind::Clipboard,
+                broadcast: true
+            }
+        );
+        assert_eq!(
+            h.clip.get(SelectionKind::Clipboard).as_ref(),
+            Some(&offer("wanted"))
+        );
+        let (kind, hash, restored, stamp) = recv_next_clip(&mut h).await;
+        assert_eq!(kind, SelectionKind::Clipboard);
+        assert_eq!(restored, offer("wanted"));
+        assert_eq!(hash, content_hash(&offer("wanted")));
+        assert!(
+            stamp > newer_stamp,
+            "a restore must outrank the copy it replaces, or peers keep the newer one"
+        );
+        // ...and it is now the newest entry, not a second copy of an old one.
+        assert_eq!(remembered(&h).await, vec!["wanted", "newer"]);
+    }
+
+    #[tokio::test]
+    async fn a_restore_is_not_re_broadcast_as_a_local_copy() {
+        // The invariant `ClipboardIo`'s whole design exists for: the write's
+        // watch echo must be dropped, not mistaken for the user copying again.
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("wanted"));
+        recv_clip(&mut h).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("newer"));
+        recv_clip(&mut h).await;
+
+        let id = id_of(&h, "wanted").await;
+        h.engine.serve_history(HistoryRequest::Restore { id }).await;
+        recv_next_clip(&mut h).await; // the restore itself
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test]
+    async fn restoring_on_a_receive_only_node_writes_locally_and_reports_no_broadcast() {
+        let mut cfg = Config::for_test("s");
+        cfg.direction = Direction::ReceiveOnly;
+        let mut h = start(cfg).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("kept"));
+        wait_remembered(&h, "kept").await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("newer"));
+        wait_remembered(&h, "newer").await;
+
+        let id = id_of(&h, "kept").await;
+        assert_eq!(
+            h.engine.serve_history(HistoryRequest::Restore { id }).await,
+            HistoryResult::Restored {
+                kind: SelectionKind::Clipboard,
+                broadcast: false
+            }
+        );
+        assert_eq!(
+            h.clip.get(SelectionKind::Clipboard).as_ref(),
+            Some(&offer("kept"))
+        );
+        assert_no_broadcast(&mut h).await;
+    }
+
+    #[tokio::test]
+    async fn a_history_lookup_distinguishes_missing_from_ambiguous() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("one"));
+        recv_clip(&mut h).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("two"));
+        recv_clip(&mut h).await;
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Restore {
+                    id: "ffffffffffff".into()
+                })
+                .await,
+            HistoryResult::Failed(HistoryMiss::NoSuchEntry)
+        );
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Restore { id: String::new() })
+                .await,
+            HistoryResult::Failed(HistoryMiss::Ambiguous { matches: 2 })
+        );
+    }
+
+    #[tokio::test]
+    async fn getting_an_entry_narrows_to_the_requested_type() {
+        let mut h = start(Config::for_test("s")).await;
+        let rich = crate::protocol::test_support::offer(&[
+            ("text/plain", b"words"),
+            ("image/png", b"\x89PNG"),
+        ]);
+        h.clip.local_copy(SelectionKind::Clipboard, rich);
+        recv_clip(&mut h).await;
+        let id = id_of(&h, "words").await;
+
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Get {
+                    id: id.clone(),
+                    type_: Some("image/png".into())
+                })
+                .await,
+            HistoryResult::Offer(crate::protocol::test_support::offer(&[(
+                "image/png",
+                b"\x89PNG"
+            )]))
+        );
+        // A type the entry does not carry names itself, and says what it has —
+        // "nothing found" would have the user hunting for a missing entry.
+        let HistoryResult::Failed(HistoryMiss::NotOffered { available }) = h
+            .engine
+            .serve_history(HistoryRequest::Get {
+                id,
+                type_: Some("application/pdf".into()),
+            })
+            .await
+        else {
+            panic!("a type the entry lacks was not reported as not offered");
+        };
+        assert_eq!(available, vec!["text/plain", "image/png"]);
+    }
+
+    #[tokio::test]
+    async fn restoring_a_selection_entry_is_refused_by_a_node_without_one() {
+        // An entry can outlive the config that recorded it, and `--node` can
+        // point a PRIMARY entry at a host that has no PRIMARY at all.
+        let mut cfg = Config::for_test("s");
+        cfg.sync_selection = true;
+        let mut h = start(cfg).await;
+        h.clip
+            .local_copy(SelectionKind::Selection, offer("middle-click"));
+        recv_clip(&mut h).await;
+        let id = id_of(&h, "middle-click").await;
+
+        // A second node that does not do PRIMARY at all.
+        let plain = start(Config::for_test("s")).await;
+        plain.engine.settled.remember(
+            SelectionKind::Selection,
+            &Hashed::new(offer("middle-click")),
+            0,
+        );
+        assert_eq!(
+            plain
+                .engine
+                .serve_history(HistoryRequest::Restore { id })
+                .await,
+            HistoryResult::Failed(HistoryMiss::NotSynced)
+        );
+    }
+
+    /// An entry outlives the configuration that recorded it: the MIME rules are
+    /// shared mesh-wide, so a peer can deny a type after the copy was made. The
+    /// entry is still listed and still has an id, so the failure has to say what
+    /// actually happened — reporting "this node has no such selection" would send
+    /// the user looking at `sync_selection`.
+    #[tokio::test]
+    async fn an_entry_a_rules_change_now_denies_says_so_rather_than_claiming_the_wrong_reason() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let (_dir, path) = with_rules(&mut cfg, MimePolicy::Allow, &[("text/plain", "allow")]);
+        let mut h = start(cfg).await;
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("remembered"));
+        recv_next_clip(&mut h).await;
+        let id = id_of(&h, "remembered").await;
+
+        // A peer denies the type this entry is made of.
+        send_rules(
+            &h,
+            future_stamp(10_000),
+            h.remote_id,
+            rules_toml(&[("text/plain", "deny")]),
+        )
+        .await;
+        // Waited for on the file rather than by retrying the restore: a restore
+        // writes the clipboard and broadcasts, so polling with it would be a
+        // loop whose every iteration changes the thing it is measuring.
+        wait_rules_contain(
+            &path,
+            "\"text/plain\" = \"deny\"",
+            "the peer's deny rule to be adopted",
+        )
+        .await;
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Restore { id: id.clone() })
+                .await,
+            HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
+        );
+        // A pull of the same entry refuses for the same reason: what a restore
+        // will not put back, a `history get` must not hand out either.
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Get { id, type_: None })
+                .await,
+            HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
+        );
+        // ...and so does the listing, which is the pull that is easiest to
+        // forget: rendered from the stored bytes alone it would print a preview
+        // of content both of the above refuse, to anyone holding the psk.
+        assert_eq!(
+            h.engine.serve_history(HistoryRequest::List).await,
+            HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
+        );
+    }
+
+    /// The listing filters per representation, not just per entry: an entry that
+    /// still has something servable is listed, with the denied representation
+    /// gone from its types, its size and — if the preview came from it — its
+    /// preview.
+    #[tokio::test]
+    async fn a_listing_row_shows_only_what_the_node_would_still_hand_over() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let (_dir, path) = with_rules(
+            &mut cfg,
+            MimePolicy::Allow,
+            &[("text/plain", "allow"), ("image/png", "allow")],
+        );
+        let mut h = start(cfg).await;
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[
+                ("text/plain", b"the secret-ish text"),
+                ("image/png", b"\x89PNG"),
+            ]),
+        );
+        recv_next_clip(&mut h).await;
+
+        send_rules(
+            &h,
+            future_stamp(10_000),
+            h.remote_id,
+            rules_toml(&[("text/plain", "deny"), ("image/png", "allow")]),
+        )
+        .await;
+        wait_rules_contain(
+            &path,
+            "\"text/plain\" = \"deny\"",
+            "the peer's deny rule to be adopted",
+        )
+        .await;
+
+        let HistoryResult::List(rows) = h.engine.serve_history(HistoryRequest::List).await else {
+            panic!("the entry still has a servable representation and must be listed");
+        };
+        assert_eq!(rows[0].types, vec![("image/png".to_string(), 4)]);
+        assert_eq!(rows[0].bytes, 4, "the denied bytes are still counted");
+        assert_eq!(
+            rows[0].preview, None,
+            "the preview came from a representation this node would now refuse"
+        );
+    }
+
+    /// `Recall` is the pipeline a restore runs through, and the two things that
+    /// must not change about it have no other cheap observation point: `Record`
+    /// would let any request rewrite this node's rules and push them mesh-wide,
+    /// and synthesis would hand back bytes hashing differently from the id the
+    /// user asked for — landing the restore as a *new* entry beside the one they
+    /// picked.
+    #[test]
+    fn recall_applies_the_rules_but_never_records_them_and_never_synthesizes() {
+        let stages = Pipeline::Recall.stages();
+        assert_eq!(stages.rules, RulesStage::Apply);
+        assert!(!stages.synthesize);
+        assert!(stages.cap);
     }
 
     #[tokio::test]
@@ -3773,7 +4424,7 @@ mod tests {
     fn ordering_is_by_stamp_then_origin() {
         let lo = Uuid::from_u128(1);
         let hi = Uuid::from_u128(2);
-        let s = ContentState {
+        let s = settled::ContentState {
             hash: [0u8; 32],
             version: Version::new(5, lo),
         };
@@ -4143,13 +4794,13 @@ mod tests {
 
         e.adopt_restored(kind, Hashed::new(offer("old"))).await;
         assert_eq!(
-            e.current.lock().unwrap()[&kind].hash,
+            e.settled.state(kind).unwrap().hash,
             content_hash(&offer("old"))
         );
 
         e.adopt_restored(kind, Hashed::new(offer("new"))).await;
         assert_eq!(
-            e.current.lock().unwrap()[&kind].hash,
+            e.settled.state(kind).unwrap().hash,
             content_hash(&offer("new")),
             "the restarted watcher's report of the live clipboard was dropped"
         );
@@ -4188,17 +4839,11 @@ mod tests {
         let kind = SelectionKind::Clipboard;
         let e = engine(MockClipboard::new(), Config::for_test("s")).engine;
         let applied = Version::new(9_000, Uuid::from_u128(7));
-        e.current.lock().unwrap().insert(
-            kind,
-            ContentState {
-                hash: content_hash(&offer("same")),
-                version: applied,
-            },
-        );
+        e.settled.set(kind, &Hashed::new(offer("same")), applied, 0);
 
         e.adopt_restored(kind, Hashed::new(offer("same"))).await;
         assert_eq!(
-            e.current.lock().unwrap()[&kind].version,
+            e.settled.state(kind).unwrap().version,
             applied,
             "re-reporting unchanged content reset its version to 0"
         );

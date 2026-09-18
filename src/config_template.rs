@@ -449,6 +449,24 @@ const TEMPLATE: &[Block] = &[
         shown: Shown::Default("false"),
     },
     Block::Optional {
+        key: "history_entries",
+        comment: "How many recent clipboard contents to remember, so `clipmesh history\n\
+                  list` can show them and `clipmesh history restore <id>` can put one\n\
+                  back (on this node and, from there, on the mesh). Memory only —\n\
+                  nothing is written to disk and the history is lost on restart. Set to\n\
+                  0 to turn it off. Password-manager-flagged contents are dropped before\n\
+                  they get here, as they are before a broadcast. Note that any host\n\
+                  holding the psk can list and restore this node's remembered contents.",
+        shown: Shown::Default("50"),
+    },
+    Block::Optional {
+        key: "history_max_bytes",
+        comment: "Total size the remembered contents may occupy; the oldest are dropped\n\
+                  until the total fits. A single copy larger than this is not remembered\n\
+                  at all, rather than flushing everything else to make room for itself.",
+        shown: Shown::Default("\"64MiB\""),
+    },
+    Block::Optional {
         key: "mime_rules_file",
         comment: "Per-type allow/deny rules file (TOML). Defaults to \"mimetypes\" beside\n\
                   this config, wherever this config lives — so the path below is an example\n\
@@ -611,6 +629,8 @@ mod tests {
             "unknown_mime",
             "synthesize_text_plain",
             "take_ownership",
+            "history_entries",
+            "history_max_bytes",
             "mime_rules_file",
         ] {
             assert!(text.contains(&format!("{key} ")), "missing {key}");

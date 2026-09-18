@@ -2,11 +2,13 @@
 //! Noise-NNpsk0-encrypted TCP, keyed by a preshared secret. See README.md.
 
 pub mod backoff;
+pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod config_template;
 pub mod fsutil;
 pub mod fswatch;
+pub mod history;
 pub mod mesh;
 pub mod mime;
 pub mod node;

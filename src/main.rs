@@ -3,14 +3,15 @@ use clipmesh::clipboard::Backend;
 use clipmesh::config::{self, Config, MimePolicy};
 use clipmesh::config_template;
 use clipmesh::mime::{MimeRules, Relation, RulesFileState, Verdict};
-use clipmesh::{node, paste};
+use clipmesh::{history, node, paste};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const USAGE: &str =
     "usage: clipmesh [--config <path>] [--allow <glob> | --deny <glob> | --rules | --sync-config]\n\
-     \x20      clipmesh --paste [-t <mime>] [-l] [-n] [-p] [--node <host[:port]>]  (wl-paste mode)";
+     \x20      clipmesh --paste [-t <mime>] [-l] [-n] [-p] [--node <host[:port]>]  (wl-paste mode)\n\
+     \x20      clipmesh history list | get <id> | restore <id>   (remembered clipboards)";
 
 /// Decide paste mode from the program name and the args (everything after
 /// argv[0]). Paste mode is entered when the binary is invoked as `wl-paste`
@@ -50,6 +51,15 @@ async fn main() -> Result<()> {
         // warning from the reused connection stack without polluting the output.
         init_cli_logging();
         return paste::run(paste_args).await;
+    }
+
+    // The history subcommand is its own mode with its own parser, detected the
+    // same way and for the same reason paste mode is: its flags (`-t`, `-n`) and
+    // its positional id are shapes the daemon flag loop below rejects, and
+    // teaching that loop about them would make it two parsers in one.
+    if argv.get(1).is_some_and(|a| a == "history") {
+        init_cli_logging();
+        return history::run(argv.get(2..).unwrap_or(&[])).await;
     }
 
     let mut config_path: Option<PathBuf> = None;
