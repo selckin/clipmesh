@@ -134,31 +134,39 @@ clipmesh remembers the recent clipboard contents a node settles on — what you
 copied on it, and what it received from a peer — so a copy you have since
 replaced is still reachable:
 
-    clipmesh history list                        # what this node remembers
-    clipmesh history restore <id>                # put one back on the clipboard
-    clipmesh history get <id> [-t <mime>] [-n]   # print one entry to stdout
-    clipmesh history list --node desktop         # a peer's history
+    clipmesh history list                       # what this node remembers
+    clipmesh history restore 2                  # put one back on the clipboard
+    clipmesh history get 2 [-t <mime>] [-n]     # print one entry to stdout
+    clipmesh history list --node desktop        # a peer's history
 
 ```
 $ clipmesh history list
 3 remembered clipboard(s) on 127.0.0.1:48100
 
-ID        AGE  WHERE      SIZE     CONTENT
-3f2a9c17  12s  clipboard  34 B     git rebase -i HEAD~3
-8b10de44  4m   clipboard  1.2 MiB  image/png, image/jpeg
-c7e05a92  11m  primary    88 B     https://example.com/a/very/long/…
+#  ID        AGE  WHERE      SIZE     CONTENT
+1  3f2a9c17  12s  clipboard  34 B     git rebase -i HEAD~3
+2  8b10de44  4m   clipboard  1.2 MiB  image/png, image/jpeg
+3  c7e05a92  11m  primary    88 B     https://example.com/a/very/long/…
 
-Put one back with: clipmesh history restore <id>
+Put one back with: clipmesh history restore <#>, or its ID — a later copy renumbers the rows but never the ids
 ```
 
-An **id** is the start of the entry's content hash. Type as much of it as is
-unambiguous; the node says so rather than guessing if it isn't. Ids are stable —
-a copy made between your `list` and your `restore` cannot renumber them the way
-a positional index would.
+`restore` and `get` take **either** column, and you never have to say which: a
+number that falls inside the listing is a row, anything else is an ID (or the
+start of one — type as much as is unambiguous, and the node says so rather than
+guessing if it isn't).
+
+They fail differently, which is why both are there. The **number** is what you
+read off the screen and retype, but it is a position: copy something between
+your `list` and your `restore` and the rows below it shift, so `restore 2` acts
+on an entry you never saw. The **ID** comes from the content, so it names the
+same clipboard however much has been copied since. Use the number
+interactively; use the ID in a script, or whenever the listing has been sitting
+on screen for a while.
 
 **Restoring is copying.** The entry goes onto that node's clipboard *and* out to
 the mesh under a fresh timestamp, so every peer follows, exactly as if you had
-copied it again there. `clipmesh history restore --node desktop <id>` therefore
+copied it again there. `clipmesh history restore --node desktop 2` therefore
 puts it on desktop's clipboard, and from there on all of them.
 
 Details worth knowing:

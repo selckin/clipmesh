@@ -78,13 +78,41 @@ Selections the node does not watch are not remembered. Remembering must not be a
 reason to start watching PRIMARY — the Mutter backend has none at all, and
 `sync_selection = false` means the user said not to.
 
-### Identity is a content hash, never a row number
+### An entry has two names, and the node decides which was typed
 
-The CLI is one-shot. Between `history list` and `history restore 2`, a copy can
-land and renumber every row, and the user restores something they never saw,
-silently. A prefix of the entry's BLAKE3 `content_hash` cannot do that; the worst
-it does is name an entry that has since been evicted, which is a typed failure.
-A prefix matching several entries is `Ambiguous`, never resolved by picking one.
+A listing prints a row number and a short id, and `get`/`restore` take either.
+They fail differently, which is why both exist.
+
+A **row number** is what a human reads off the screen and retypes. It is a
+position, and the CLI is one-shot: copy something between `history list` and
+`history restore 2` and the rows below shift, so the command acts on an entry
+the user never saw. An **id** — the start of the entry's BLAKE3 `content_hash` —
+cannot do that; the worst it does is name an entry that has since been evicted,
+which is a typed failure. A prefix matching several entries is `Ambiguous`,
+never resolved by picking one.
+
+The two namespaces are kept apart by one rule, in one place
+(`Listing::resolve`): **a run of digits is a row number; anything else is an
+id.** Both halves matter. Digits first, because the other way round `restore 3`
+would be ambiguous most of the time — a sixteenth of all ids start with `3`. And
+an out-of-range number is *not* retried as an id, because every decimal digit is
+also a hex digit: a stale `restore 23` against a history that has since shrunk
+would silently become a prefix search, land on whichever entry starts `23`, and
+— for a restore — broadcast it mesh-wide reporting success. The cost is that an
+id whose printed prefix is all digits, about one in forty, can only be named by
+its row number; that number is on the same line of the same listing.
+
+Numbering is assigned by the node, after the rules filter, and every request
+resolves against the same `listing()` order — so `list`, `get` and `restore`
+cannot disagree about which entry is number 2, and a row the listing omits never
+silently consumes a number.
+
+`Listing` deliberately keeps two lists. A number is a position, so it indexes
+the filtered rows. An id names *content*, so it is matched against every
+remembered entry, including the ones the rules currently hide — otherwise naming
+a denied entry by its perfectly valid id answers "no such entry" instead of
+`Filtered(Denied)`, and the user goes looking for an eviction that never
+happened.
 
 ### Restoring is copying
 
@@ -142,9 +170,11 @@ deliberate consistency choice rather than an oversight; see **Open questions**.
 
 ## Constraints and risks
 
-- **`PROTOCOL_VERSION` 9 forces a full-mesh upgrade.** v8 and v9 nodes refuse
+- **`PROTOCOL_VERSION` 10 forces a full-mesh upgrade.** Mismatched nodes refuse
   each other at the handshake, as designed. The README already tells users to
-  upgrade every host together.
+  upgrade every host together. (v9 shipped the history with ids only; adding row
+  numbers moved fields inside `HistoryEntry` and `HistoryMiss`, which a
+  non-self-describing encoding cannot survive without the bump.)
 - **Memory profile changes in kind.** The daemon previously held roughly one
   clipboard payload alive; it can now hold `history_max_bytes` (64 MiB by
   default) pinned by `Arc`s nothing else holds. The cap counts payload bytes by

@@ -143,35 +143,6 @@ impl History {
             })
             .collect()
     }
-
-    /// The entry whose hex id starts with `id`.
-    fn find(&self, id: &str) -> Result<(SelectionKind, Hashed), HistoryMiss> {
-        if !self.enabled() {
-            return Err(HistoryMiss::Disabled);
-        }
-        if self.entries.is_empty() {
-            return Err(HistoryMiss::Empty);
-        }
-        if id.chars().any(|c| !c.is_ascii_hexdigit()) {
-            return Err(HistoryMiss::NotHex);
-        }
-        let wanted = id.to_ascii_lowercase();
-        let mut matches = self
-            .entries
-            .iter()
-            .filter(|e| hex(&e.content.hash()).starts_with(&wanted));
-        let Some(first) = matches.next() else {
-            return Err(HistoryMiss::NoSuchEntry);
-        };
-        // A prefix naming several entries must not be resolved by picking one.
-        // Choosing silently is the exact failure ids exist to prevent: the user
-        // restores something they never saw, and nothing says so.
-        let extra = matches.count();
-        if extra > 0 {
-            return Err(HistoryMiss::Ambiguous { matches: extra + 1 });
-        }
-        Ok((first.kind, first.content.clone()))
-    }
 }
 
 /// The mesh-current content record plus the history it feeds.
@@ -273,10 +244,6 @@ impl Settled {
         }
         Ok(entries)
     }
-
-    pub(super) fn find(&self, id: &str) -> Result<(SelectionKind, Hashed), HistoryMiss> {
-        self.history.lock().unwrap().find(id)
-    }
 }
 
 /// One listing row, built from the representations that pass `allows`.
@@ -288,6 +255,7 @@ impl Settled {
 /// content that `history get` and `--paste` both decline. `None` when nothing
 /// survives: a row nobody can fetch or restore is worse than no row.
 pub(super) fn summarize(
+    index: u32,
     kind: SelectionKind,
     age_ms: u64,
     content: &Hashed,
@@ -303,6 +271,7 @@ pub(super) fn summarize(
         return None;
     }
     Some(HistoryEntry {
+        index,
         hash: content.hash(),
         kind,
         age_ms,
@@ -312,7 +281,7 @@ pub(super) fn summarize(
     })
 }
 
-/// Lowercase hex of a content hash — the full id a short one is a prefix of.
+/// Lowercase hex of a content hash — the full id a printed one is a prefix of.
 pub(super) fn hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -424,21 +393,22 @@ mod tests {
     fn list(s: &Settled, now: u64) -> Result<Vec<HistoryEntry>, HistoryMiss> {
         Ok(s.entries(now)?
             .into_iter()
-            .filter_map(|(kind, age, content)| summarize(kind, age, &content, |_, _| true))
+            .enumerate()
+            .filter_map(|(i, (kind, age, content))| {
+                summarize(i as u32 + 1, kind, age, &content, |_, _| true)
+            })
             .collect())
     }
 
-    /// The ids a listing shows, newest first.
-    fn ids(s: &Settled, now: u64) -> Vec<String> {
+    /// The previews a listing shows, newest first — the rows as a user reads
+    /// them, and the only thing that identifies an entry now that rows are
+    /// numbered by position.
+    fn rows(s: &Settled, now: u64) -> Vec<String> {
         list(s, now)
             .unwrap()
             .iter()
-            .map(|e| hex(&e.hash)[..8].to_string())
+            .map(|e| e.preview.clone().unwrap_or_default())
             .collect()
-    }
-
-    fn id_of(text: &str) -> String {
-        hex(&Hashed::new(text_offer(text)).hash())
     }
 
     #[test]
@@ -451,7 +421,8 @@ mod tests {
         s.remember(SEL, &Hashed::new(text_offer("a")), 100);
         let listed = list(&s, 100).unwrap();
         assert_eq!(listed.len(), 3, "the re-copy duplicated an entry");
-        assert_eq!(hex(&listed[0].hash), id_of("a"));
+        assert_eq!(listed[0].preview.as_deref(), Some("a"));
+        assert_eq!(listed[0].index, 1, "the newest entry is number 1");
         assert_eq!(listed[0].age_ms, 0, "the re-copy kept the old timestamp");
         assert_eq!(
             listed[0].kind, SEL,
@@ -475,7 +446,7 @@ mod tests {
         for (i, t) in ["a", "b", "c"].iter().enumerate() {
             s.remember(CLIP, &Hashed::new(text_offer(t)), i as u64);
         }
-        assert_eq!(ids(&s, 9), vec![&id_of("c")[..8], &id_of("b")[..8]]);
+        assert_eq!(rows(&s, 9), vec!["c", "b"]);
     }
 
     #[test]
@@ -509,7 +480,7 @@ mod tests {
         // It must neither be stored nor flush the entries it cannot fit beside.
         let listed = list(&s, 1).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(hex(&listed[0].hash), id_of("keep me"));
+        assert_eq!(listed[0].preview.as_deref(), Some("keep me"));
     }
 
     #[test]
@@ -517,41 +488,29 @@ mod tests {
         let s = Settled::new(0, 64 * 1024);
         s.remember(CLIP, &Hashed::new(text_offer("a")), 0);
         assert_eq!(list(&s, 0), Err(HistoryMiss::Disabled));
-        assert_eq!(s.find("00"), Err(HistoryMiss::Disabled));
     }
 
     #[test]
     fn an_empty_history_is_distinguished_from_a_disabled_one() {
         let s = settled();
         assert_eq!(list(&s, 0), Err(HistoryMiss::Empty));
-        assert_eq!(s.find("00"), Err(HistoryMiss::Empty));
     }
 
     #[test]
-    fn a_lookup_distinguishes_missing_from_ambiguous() {
+    fn rows_are_numbered_from_the_newest_down() {
+        // The number is the row's position, so it is what `get` and `restore`
+        // take and it has to match what the listing prints, in the listing's
+        // order.
         let s = settled();
-        s.remember(CLIP, &Hashed::new(text_offer("a")), 0);
-        s.remember(CLIP, &Hashed::new(text_offer("b")), 1);
-        let a = id_of("a");
+        for (i, t) in ["oldest", "middle", "newest"].iter().enumerate() {
+            s.remember(CLIP, &Hashed::new(text_offer(t)), i as u64);
+        }
+        let listed = list(&s, 9).unwrap();
         assert_eq!(
-            s.find(&a).unwrap().1.hash(),
-            Hashed::new(text_offer("a")).hash()
+            listed.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
         );
-        assert_eq!(
-            s.find(&a.to_ascii_uppercase()).unwrap().1.hash(),
-            Hashed::new(text_offer("a")).hash(),
-            "an id typed back in upper case must still match"
-        );
-        assert_eq!(s.find("ffffffffff").unwrap_err(), HistoryMiss::NoSuchEntry);
-        // A typo and an evicted entry want opposite advice, so they are not the
-        // same answer.
-        assert_eq!(s.find("zz").unwrap_err(), HistoryMiss::NotHex);
-        // The empty prefix matches everything, which is the ambiguity case with
-        // nothing typed at all.
-        assert_eq!(
-            s.find("").unwrap_err(),
-            HistoryMiss::Ambiguous { matches: 2 }
-        );
+        assert_eq!(rows(&s, 9), vec!["newest", "middle", "oldest"]);
     }
 
     #[test]

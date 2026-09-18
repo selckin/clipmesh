@@ -16,7 +16,11 @@ use uuid::Uuid;
 /// `Empty`, which was reporting a clipboard too large to read as an empty one.
 /// v9: `History`/`HistoryReply` — the `clipmesh history` subcommand lists a
 /// node's remembered clipboard states, prints one, and puts one back.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// v10: a history entry is named by its row number as well as its id, so
+/// `HistoryEntry` carries the number and `HistoryMiss` loses `NotHex` and gains
+/// a row count. Every field after the new one shifts, which is exactly what a
+/// non-self-describing encoding cannot survive without a bump.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// All MIME representations of one clipboard state, in the source compositor's
 /// advertise order (preference order — richest first), which `IndexMap`
@@ -239,10 +243,24 @@ pub enum GetResult {
 
 /// What a [`Message::History`] asks a node to do with its clipboard history.
 ///
-/// `id` is the short hex id a listing prints — a prefix of the entry's
-/// [`content_hash`]. A prefix, not an index: the CLI is one-shot, so a copy made
-/// between the listing and the follow-up command would silently renumber every
-/// row, and the user would restore something they never saw.
+/// `entry` is what a listing prints in one of its two leading columns: the row
+/// number (1 is the newest) or the short hex id. **One rule decides which**, and
+/// it lives on the node, where both the row count and the hashes are known: a
+/// run of digits is a row number, and anything else is a prefix of a content
+/// hash. A number that has run off the end is *not* retried as an id — every
+/// decimal digit is also a hex digit, so falling through would turn a stale row
+/// number into a prefix search that lands on some unrelated entry and restores
+/// it. The price is that an id whose printed prefix happens to be all digits —
+/// about one in forty — can only be named by its row number, which is on the
+/// same line of the same listing.
+///
+/// Both exist because they fail differently. A row number is what a human reads
+/// off the screen and retypes, but it is a *position*: a copy made between the
+/// listing and the follow-up command renumbers the rows below it, and the
+/// command then acts on something the user never saw. An id is derived from the
+/// content, so it names the same clipboard no matter what has been copied since
+/// — at the cost of being eight characters to type. Scripts and anything that
+/// keeps a listing around should use the id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryRequest {
     /// The listing — summaries only, no payloads.
@@ -255,9 +273,12 @@ pub enum HistoryRequest {
     /// There is no "types only" shape: a listing already carries every entry's
     /// type names, so asking for them again would be a round trip for something
     /// the client has.
-    Get { id: String, type_: Option<String> },
+    Get {
+        entry: String,
+        type_: Option<String>,
+    },
     /// Put one entry back on that node's clipboard (and onto the mesh).
-    Restore { id: String },
+    Restore { entry: String },
 }
 
 /// One row of a history listing.
@@ -268,7 +289,15 @@ pub enum HistoryRequest {
 /// actually asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
-    /// The entry's [`content_hash`]; the CLI renders its first bytes as the id.
+    /// This row's number, 1 for the newest.
+    ///
+    /// Assigned by the node, after the rules filter below has decided which
+    /// entries it would serve at all, so a row the listing does not print never
+    /// consumes a number. Numbering client-side would have worked only while the
+    /// client and the node filtered identically.
+    pub index: u32,
+    /// The entry's [`content_hash`]. The CLI prints its first characters as the
+    /// id — the way to name this clipboard that a later copy cannot change.
     pub hash: [u8; 32],
     pub kind: SelectionKind,
     /// How long ago this was recorded, resolved **on the node**.
@@ -301,15 +330,15 @@ pub enum HistoryMiss {
     Disabled,
     /// The history is on, but nothing has been recorded yet.
     Empty,
-    /// The id is not hexadecimal, so it cannot be any entry's.
+    /// Neither a row in range nor a prefix of any entry's id.
     ///
-    /// Distinct from [`NoSuchEntry`](HistoryMiss::NoSuchEntry): a typo, not an
-    /// entry that has since been dropped — and the two want opposite advice.
-    NotHex,
-    /// No entry's hash starts with the given id.
-    NoSuchEntry,
+    /// `entries` is how many rows the listing would show, because that is the
+    /// correction the user usually needs: a number that ran off the end means
+    /// the listing it came from is stale, and how far the current one goes is
+    /// the thing to say.
+    NoSuchEntry { entries: u32 },
     /// The id is a prefix of more than one entry; the user must type more of it.
-    Ambiguous { matches: usize },
+    Ambiguous { matches: u32 },
     /// The entry exists but offers no representation matching `-t`.
     NotOffered { available: Vec<String> },
     /// That node does not handle the selection the entry came from — a
@@ -618,15 +647,16 @@ mod tests {
             },
             Message::History {
                 req: HistoryRequest::Get {
-                    id: "3f2a9c17".into(),
+                    entry: "3f2a9c17".into(),
                     type_: Some("text/plain;charset=utf-8".into()),
                 },
             },
             Message::History {
-                req: HistoryRequest::Restore { id: "3f2a".into() },
+                req: HistoryRequest::Restore { entry: "2".into() },
             },
             Message::HistoryReply {
                 result: HistoryResult::List(vec![HistoryEntry {
+                    index: 1,
                     hash: [7u8; 32],
                     kind: SelectionKind::Selection,
                     age_ms: 12_345,
@@ -645,7 +675,7 @@ mod tests {
                 },
             },
             Message::HistoryReply {
-                result: HistoryResult::Failed(HistoryMiss::Ambiguous { matches: 3 }),
+                result: HistoryResult::Failed(HistoryMiss::NoSuchEntry { entries: 4 }),
             },
         ];
         for msg in messages {

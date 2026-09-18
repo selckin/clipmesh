@@ -22,23 +22,29 @@ use std::time::Duration;
 /// tiny, but a `get` can carry a whole clipboard over a slow link.
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many characters of the id a listing prints, and the shortest prefix
-/// worth showing. Long enough that two entries colliding on it is not something
-/// anyone will see, short enough to retype.
+/// How many characters of an entry's hash the listing prints. Short enough to
+/// retype, long enough that two entries colliding on it is not something anyone
+/// will see.
 const ID_CHARS: usize = 8;
 
 const USAGE: &str =
-    "usage: clipmesh history list                       (what this node remembers)\n\
-     \x20      clipmesh history get <id> [-t <mime>] [-n]  (print one entry)\n\
-     \x20      clipmesh history restore <id>               (put one back on the clipboard)\n\
+    "usage: clipmesh history list                      (what this node remembers)\n\
+     \x20      clipmesh history get <e> [-t <mime>] [-n]  (print one entry)\n\
+     \x20      clipmesh history restore <e>               (put it back on the clipboard)\n\
+     \x20      ... <e> is a row number or an ID, both from `history list`\n\
      \x20      ... each also taking [--node <host[:port]>] [--config <path>]";
 
 /// What the invocation asks the node to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     List,
-    Get { id: String },
-    Restore { id: String },
+    /// Print entry `entry` — a row number or an id; the node decides which.
+    Get {
+        entry: String,
+    },
+    Restore {
+        entry: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,19 +128,26 @@ impl HistoryArgs {
         // and taking the next argument positionally made it "restore the entry
         // called --node". Each verb then says what it does and does not take,
         // instead of a shared message telling `list` users about an id.
+        // Passed through as typed: which of a node's two ways of naming a row
+        // this is — its number or its id — is the *node's* decision, because
+        // telling them apart needs the row count and the hashes. Guessing here
+        // would put that rule in two places, and the client's copy would be the
+        // one that is wrong.
         let one = |what: &str| match ids.as_slice() {
-            [id] => Ok((*id).clone()),
-            [] => bail!("history {what} needs an id (from `clipmesh history list`)\n{USAGE}"),
-            _ => bail!("history {what} takes one id; got {}\n{USAGE}", ids.len()),
+            [entry] => Ok((*entry).clone()),
+            [] => bail!(
+                "history {what} needs the number or id `clipmesh history list` printed\n{USAGE}"
+            ),
+            _ => bail!("history {what} takes one entry; got {}\n{USAGE}", ids.len()),
         };
         out.command = match verb.as_str() {
             "list" if !ids.is_empty() => {
                 bail!("history list takes no arguments; got {:?}\n{USAGE}", ids[0])
             }
             "list" => Command::List,
-            "get" => Command::Get { id: one("get")? },
+            "get" => Command::Get { entry: one("get")? },
             "restore" => Command::Restore {
-                id: one("restore")?,
+                entry: one("restore")?,
             },
             other => bail!("unknown history command {other:?}\n{USAGE}"),
         };
@@ -175,11 +188,13 @@ pub async fn run(args: &[String]) -> Result<()> {
 
     let req = match &ha.command {
         Command::List => HistoryRequest::List,
-        Command::Get { id } => HistoryRequest::Get {
-            id: id.clone(),
+        Command::Get { entry } => HistoryRequest::Get {
+            entry: entry.clone(),
             type_: ha.type_.clone(),
         },
-        Command::Restore { id } => HistoryRequest::Restore { id: id.clone() },
+        Command::Restore { entry } => HistoryRequest::Restore {
+            entry: entry.clone(),
+        },
     };
     let what = match ha.command {
         Command::List => "history listing",
@@ -236,13 +251,15 @@ fn explain(miss: HistoryMiss, addr: &str) -> String {
         HistoryMiss::Empty => {
             format!("{addr} has not remembered any clipboard contents yet")
         }
-        HistoryMiss::NotHex => {
-            "an id is hexadecimal, like 3f2a9c17 — `clipmesh history list` prints them".to_string()
-        }
-        HistoryMiss::NoSuchEntry => format!(
-            "no remembered clipboard on {addr} has that id — it may have been \
-             dropped to stay under that node's history limits (`clipmesh history \
-             list` shows what is left)"
+        // A number that ran off the end usually means the listing it came from
+        // is stale — a copy since then renumbered the rows — so say how far the
+        // current one goes rather than just "no".
+        HistoryMiss::NoSuchEntry { entries } => format!(
+            "{addr} has no such entry: it remembers {entries}, numbered 1 to \
+             {entries}, and no id there starts with that (`clipmesh history \
+             list` shows what is left — an entry may have been dropped to stay \
+             under that node's history limits, and a copy since your last \
+             listing renumbers the rows but never the ids)"
         ),
         HistoryMiss::Ambiguous { matches } => {
             format!("that id matches {matches} remembered clipboards on {addr} — type more of it")
@@ -318,11 +335,12 @@ fn content_of(entry: &HistoryEntry) -> String {
 
 /// The `history list` table.
 fn render_listing(entries: &[HistoryEntry], addr: &str) -> String {
-    let rows: Vec<[String; 5]> = entries
+    let rows: Vec<[String; 6]> = entries
         .iter()
         .map(|e| {
             [
-                hex_prefix(&e.hash),
+                e.index.to_string(),
+                short_id(&e.hash),
                 age(e.age_ms),
                 where_of(e.kind).to_string(),
                 human_bytes(e.bytes as usize),
@@ -330,23 +348,23 @@ fn render_listing(entries: &[HistoryEntry], addr: &str) -> String {
             ]
         })
         .collect();
-    let header = ["ID", "AGE", "WHERE", "SIZE", "CONTENT"].map(str::to_string);
+    let header = ["#", "ID", "AGE", "WHERE", "SIZE", "CONTENT"].map(str::to_string);
     // Width every column but the last to its widest cell; the content column
     // runs to the end of the line and is never padded, so a wide preview cannot
     // push trailing spaces into a copied line.
-    let mut widths = [0usize; 4];
+    let mut widths = [0usize; 5];
     for row in std::iter::once(&header).chain(&rows) {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
         }
     }
-    let line = |row: &[String; 5]| {
+    let line = |row: &[String; 6]| {
         let mut out = String::new();
         for (w, cell) in widths.iter().zip(row) {
             out.push_str(cell);
             out.push_str(&" ".repeat(w - cell.chars().count() + 2));
         }
-        out.push_str(&row[4]);
+        out.push_str(&row[5]);
         format!("{}\n", out.trim_end())
     };
     let mut out = format!("{} remembered clipboard(s) on {addr}\n\n", entries.len());
@@ -354,7 +372,10 @@ fn render_listing(entries: &[HistoryEntry], addr: &str) -> String {
     for row in &rows {
         out.push_str(&line(row));
     }
-    out.push_str("\nPut one back with: clipmesh history restore <id>\n");
+    out.push_str(
+        "\nPut one back with: clipmesh history restore <#>, or its ID — \
+         a later copy renumbers the rows but never the ids\n",
+    );
     out
 }
 
@@ -375,9 +396,9 @@ fn render_restored(addr: &str, kind: SelectionKind, broadcast: bool) -> String {
     }
 }
 
-/// The short id a listing prints: the first [`ID_CHARS`] hex characters of the
-/// content hash. A restore accepts this, or any other prefix.
-fn hex_prefix(hash: &[u8; 32]) -> String {
+/// The id a listing prints for an entry: the first [`ID_CHARS`] hex characters
+/// of its content hash. A `get`/`restore` accepts this, or any longer prefix.
+fn short_id(hash: &[u8; 32]) -> String {
     hash.iter()
         .flat_map(|b| [b >> 4, b & 0xf])
         .take(ID_CHARS)
@@ -397,9 +418,10 @@ mod tests {
         HistoryArgs::parse(&args(v))
     }
 
-    fn entry(hash: u8, age_ms: u64, kind: SelectionKind, preview: Option<&str>) -> HistoryEntry {
+    fn entry(n: u8, age_ms: u64, kind: SelectionKind, preview: Option<&str>) -> HistoryEntry {
         HistoryEntry {
-            hash: [hash; 32],
+            index: n as u32,
+            hash: [n; 32],
             kind,
             age_ms,
             bytes: 34,
@@ -413,14 +435,24 @@ mod tests {
         assert_eq!(parse(&["list"]).unwrap().command, Command::List);
         assert_eq!(
             parse(&["restore", "3f2a"]).unwrap().command,
-            Command::Restore { id: "3f2a".into() }
+            Command::Restore {
+                entry: "3f2a".into()
+            }
         );
         assert_eq!(
             parse(&["get", "3f2a"]).unwrap().command,
-            Command::Get { id: "3f2a".into() }
+            Command::Get {
+                entry: "3f2a".into()
+            }
         );
-        // An id is not optional: a `restore` with nothing to restore would
-        // otherwise have to guess, which is what ids exist to prevent.
+        // A row number works just as well as an id, and which one this is is
+        // the node's decision — the client passes it through as typed.
+        assert_eq!(
+            parse(&["restore", "2"]).unwrap().command,
+            Command::Restore { entry: "2".into() }
+        );
+        // Naming nothing is not optional: a `restore` with nothing to restore
+        // would otherwise have to guess, which is what naming exists to prevent.
         assert!(parse(&["restore"]).is_err());
         assert!(parse(&["get"]).is_err());
         assert!(parse(&[]).is_err());
@@ -430,7 +462,7 @@ mod tests {
             "{:#}",
             parse(&["restore", "--config", "/c.toml"]).unwrap_err()
         );
-        assert!(err.contains("needs an id"), "got: {err}");
+        assert!(err.contains("needs the number or id"), "got: {err}");
         // Nor is a second id silently dropped.
         assert!(parse(&["restore", "3f2a", "8b10"]).is_err());
         assert!(parse(&["forget", "3f2a"]).is_err());
@@ -464,10 +496,20 @@ mod tests {
     #[test]
     fn an_id_may_come_after_the_flags() {
         let a = parse(&["restore", "--node", "desktop", "3f2a"]).unwrap();
-        assert_eq!(a.command, Command::Restore { id: "3f2a".into() });
+        assert_eq!(
+            a.command,
+            Command::Restore {
+                entry: "3f2a".into()
+            }
+        );
         assert_eq!(a.node.as_deref(), Some("desktop"));
         let b = parse(&["get", "--type=image/png", "3f2a"]).unwrap();
-        assert_eq!(b.command, Command::Get { id: "3f2a".into() });
+        assert_eq!(
+            b.command,
+            Command::Get {
+                entry: "3f2a".into()
+            }
+        );
         assert_eq!(b.type_.as_deref(), Some("image/png"));
     }
 
@@ -519,13 +561,19 @@ mod tests {
     }
 
     #[test]
-    fn the_listing_shows_an_id_a_restore_accepts() {
+    fn the_listing_shows_both_ways_of_naming_a_row() {
+        // Both, because they fail differently: the number is what a human
+        // retypes, the id is what survives a copy landing in between.
         let listing = render_listing(
             &[entry(0x3f, 12_000, SelectionKind::Clipboard, Some("x"))],
             "h:1",
         );
         assert!(listing.contains("3f3f3f3f"), "got:\n{listing}");
-        assert_eq!(hex_prefix(&[0x3f; 32]).len(), ID_CHARS);
+        assert!(
+            listing.contains("63"),
+            "the row number is missing:\n{listing}"
+        );
+        assert_eq!(short_id(&[0x3f; 32]).len(), ID_CHARS);
     }
 
     #[test]
@@ -587,8 +635,7 @@ mod tests {
         let reasons = [
             HistoryMiss::Disabled,
             HistoryMiss::Empty,
-            HistoryMiss::NotHex,
-            HistoryMiss::NoSuchEntry,
+            HistoryMiss::NoSuchEntry { entries: 4 },
             HistoryMiss::Filtered(Unavailable::Denied),
             HistoryMiss::Filtered(Unavailable::TooLarge),
             HistoryMiss::Ambiguous { matches: 3 },

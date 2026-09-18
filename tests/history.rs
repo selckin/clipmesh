@@ -152,7 +152,7 @@ async fn getting_an_entry_narrows_the_transfer_to_one_type() {
         &node,
         &cfg,
         HistoryRequest::Get {
-            id: id[..8].to_string(),
+            entry: id[..8].to_string(),
             type_: Some("text/plain".into()),
         },
     )
@@ -201,7 +201,7 @@ async fn restoring_over_the_wire_makes_a_peer_follow() {
             &node_a,
             &cfg_a,
             HistoryRequest::Restore {
-                id: id[..8].to_string()
+                entry: id[..8].to_string()
             }
         )
         .await,
@@ -239,7 +239,14 @@ async fn restoring_by_an_ambiguous_prefix_is_an_error_not_a_guess() {
 
     // The empty prefix matches everything — nothing typed at all.
     assert_eq!(
-        ask(&node, &cfg, HistoryRequest::Restore { id: String::new() }).await,
+        ask(
+            &node,
+            &cfg,
+            HistoryRequest::Restore {
+                entry: String::new()
+            }
+        )
+        .await,
         HistoryResult::Failed(HistoryMiss::Ambiguous { matches: 2 })
     );
     assert_eq!(
@@ -247,11 +254,11 @@ async fn restoring_by_an_ambiguous_prefix_is_an_error_not_a_guess() {
             &node,
             &cfg,
             HistoryRequest::Restore {
-                id: "ffffffffffffffff".into()
+                entry: "ffffffffffffffff".into()
             }
         )
         .await,
-        HistoryResult::Failed(HistoryMiss::NoSuchEntry)
+        HistoryResult::Failed(HistoryMiss::NoSuchEntry { entries: 2 })
     );
     // Neither guess touched the clipboard.
     assert_eq!(

@@ -446,6 +446,77 @@ impl Action {
     }
 }
 
+/// What one history request resolves against.
+#[derive(Default)]
+struct Listing {
+    /// The rows this node would print: filtered by the MIME rules **as they are
+    /// now** and numbered from 1.
+    ///
+    /// Filtered because a listing is a pull and a pull must not expose what a
+    /// push would not — rendering rows from the stored bytes alone would print a
+    /// preview of content `history get` answers `Denied` for and `--paste`
+    /// refuses outright. Numbered *after* that filter, so a row the listing does
+    /// not print never silently consumes a number.
+    rows: Vec<(crate::protocol::HistoryEntry, Hashed)>,
+    /// Every remembered entry, including the ones the rules currently hide.
+    ///
+    /// An **id** names content, so it has to keep naming that content even once
+    /// the rules have stopped serving it: resolving ids against `rows` alone
+    /// turned "every type in it is denied" into "no such entry", which sends the
+    /// user hunting for an eviction that never happened — precisely the swap
+    /// `HistoryMiss::Filtered` exists to prevent. A **number** is a position in
+    /// the listing, so it is resolved against `rows` and nothing else.
+    all: Vec<(SelectionKind, Hashed)>,
+}
+
+impl Listing {
+    /// The entry a `get` or `restore` names, by row number or by id.
+    ///
+    /// **One rule, in one place, because the two namespaces must not overlap: a
+    /// run of digits is always a row number, and anything else is a prefix of a
+    /// content hash.** Letting an out-of-range number fall through to the id
+    /// search is the dangerous direction — every decimal digit is also a hex
+    /// digit, so `restore 23` against a history that has since shrunk would
+    /// quietly become a prefix search, land on whichever entry happens to start
+    /// `23`, and broadcast it mesh-wide reporting success. `restore 0` is the
+    /// same hazard with far better odds: a sixteenth of all ids start with `0`.
+    ///
+    /// The cost of the rule is that an id whose printed prefix is all digits —
+    /// about one in forty — cannot be typed as an id. That entry is still on the
+    /// same listing row, named by the number right beside it.
+    ///
+    /// An id is matched as a prefix, so a longer one narrows it and the full
+    /// 64-character hash always works.
+    fn resolve(&self, entry: &str) -> Result<(SelectionKind, Hashed), HistoryMiss> {
+        let entries = self.rows.len() as u32;
+        if !entry.is_empty() && entry.bytes().all(|b| b.is_ascii_digit()) {
+            return entry
+                .parse::<u32>()
+                .ok()
+                .and_then(|index| self.rows.get(index.checked_sub(1)? as usize))
+                .map(|(row, content)| (row.kind, content.clone()))
+                .ok_or(HistoryMiss::NoSuchEntry { entries });
+        }
+        let wanted = entry.to_ascii_lowercase();
+        // An empty prefix matches every entry, which is the ambiguous case with
+        // nothing typed at all — never "the first one".
+        let matched: Vec<&(SelectionKind, Hashed)> = self
+            .all
+            .iter()
+            .filter(|(_, content)| settled::hex(&content.hash()).starts_with(&wanted))
+            .collect();
+        match matched.as_slice() {
+            [(kind, content)] => Ok((*kind, content.clone())),
+            [] => Err(HistoryMiss::NoSuchEntry { entries }),
+            // Resolving this by picking one is the exact failure ids exist to
+            // prevent: the user acts on something they never saw.
+            many => Err(HistoryMiss::Ambiguous {
+                matches: many.len() as u32,
+            }),
+        }
+    }
+}
+
 /// The broadcasts and writes a debounce batch produces, computed up front so
 /// propagation never rides watch echoes. Each selection is written at most once.
 struct BatchPlan {
@@ -1428,9 +1499,21 @@ impl<C: Clipboard> SyncEngine<C> {
     /// sensitivity and synthesis before narrowing a read) has nothing to decide
     /// here: the whole offer is already in hand.
     async fn serve_history(&self, req: HistoryRequest) -> HistoryResult {
+        let listing = match self.listing().await {
+            Ok(listing) => listing,
+            Err(miss) => return HistoryResult::Failed(miss),
+        };
         match req {
-            HistoryRequest::List => self.serve_history_list().await,
-            HistoryRequest::Get { id, type_ } => match self.settled.find(&id) {
+            HistoryRequest::List if listing.rows.is_empty() => {
+                // Not `Empty`: the node does remember things, it just may not
+                // hand any of them over any more. "Nothing remembered yet" would
+                // send the user looking for a copy that is sitting right there.
+                HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
+            }
+            HistoryRequest::List => {
+                HistoryResult::List(listing.rows.iter().map(|(row, _)| row.clone()).collect())
+            }
+            HistoryRequest::Get { entry, type_ } => match listing.resolve(&entry) {
                 // Through `Serve`, the same pipeline `--paste` answers from: a
                 // pull of a remembered clipboard must not expose what a pull of
                 // the live one would refuse. The rules are shared mesh-wide and
@@ -1442,51 +1525,42 @@ impl<C: Clipboard> SyncEngine<C> {
                 },
                 Err(miss) => HistoryResult::Failed(miss),
             },
-            HistoryRequest::Restore { id } => match self.settled.find(&id) {
+            HistoryRequest::Restore { entry } => match listing.resolve(&entry) {
                 Ok((kind, content)) => self.restore_entry(kind, content).await,
                 Err(miss) => HistoryResult::Failed(miss),
             },
         }
     }
 
-    /// Build the listing, with every row filtered by the MIME rules **as they
-    /// are now**.
+    /// What this node's history looks like to one request.
     ///
-    /// A listing is a pull, so the rule a pull obeys applies: it must not expose
-    /// what a push would not. Rendering the rows from the stored bytes alone
-    /// would print a preview of content that `history get` answers `Denied` for
-    /// and `--paste` refuses outright — the rules are shared mesh-wide, so a
-    /// peer can deny a type after the copy was made, and the listing was the one
-    /// pull that had not noticed.
+    /// Every history request goes through here, and that is the point: a row
+    /// number is a position, so `list`, `get` and `restore` have to agree about
+    /// which entry is number 2 or the CLI hands the user a number that means
+    /// something else by the time they use it. (Between two *invocations* a new
+    /// copy still renumbers the rows below it — that is what a position costs,
+    /// and it is why an id exists beside it.)
     ///
-    /// The rows are built inside `with_rules`, on the blocking pool, so neither
-    /// lock is held across the other and the per-row work stays off the engine's
-    /// select loop.
-    async fn serve_history_list(&self) -> HistoryResult {
-        let entries = match self.settled.entries(now_ms()) {
-            Ok(entries) => entries,
-            Err(miss) => return HistoryResult::Failed(miss),
-        };
-        let rows: Vec<crate::protocol::HistoryEntry> = self
+    /// Built inside `with_rules`, on the blocking pool, so neither lock is held
+    /// across the other and the per-row work stays off the engine's select loop.
+    async fn listing(&self) -> Result<Listing, HistoryMiss> {
+        let entries = self.settled.entries(now_ms())?;
+        Ok(self
             .with_rules(move |rules| {
                 let compiled = rules.compile();
-                entries
-                    .into_iter()
-                    .filter_map(|(kind, age_ms, content)| {
-                        settled::summarize(kind, age_ms, &content, |mime, size| {
-                            compiled.allows(mime, size)
-                        })
-                    })
-                    .collect()
+                let mut listing = Listing::default();
+                for (kind, age_ms, content) in entries {
+                    let index = listing.rows.len() as u32 + 1;
+                    if let Some(row) = settled::summarize(index, kind, age_ms, &content, |m, n| {
+                        compiled.allows(m, n)
+                    }) {
+                        listing.rows.push((row, content.clone()));
+                    }
+                    listing.all.push((kind, content));
+                }
+                listing
             })
-            .await;
-        if rows.is_empty() {
-            // Not `Empty`: the node does remember things, it just may not hand
-            // any of them over any more. "Nothing remembered yet" would send the
-            // user looking for a copy that is sitting right there.
-            return HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied));
-        }
-        HistoryResult::List(rows)
+            .await)
     }
 
     /// Put a remembered entry back on the clipboard: restoring is copying.
@@ -3015,6 +3089,17 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
     }
 
+    /// The id a `text/html`-only entry would have. Derived rather than read off
+    /// a listing, because the entry under test is one the listing no longer
+    /// shows — which is the whole point of the test using it.
+    fn html_id(html: &str) -> String {
+        let content = Hashed::new(crate::protocol::test_support::offer(&[(
+            "text/html",
+            html.as_bytes(),
+        )]));
+        settled::hex(&content.hash())
+    }
+
     async fn wait_remembered(h: &Harness, text: &str) {
         wait_history(h, text, |previews| previews.iter().any(|p| p == text)).await;
     }
@@ -3150,7 +3235,9 @@ mod tests {
         let id = id_of(&h, "wanted").await;
         assert_eq!(
             h.engine
-                .serve_history(HistoryRequest::Restore { id: id[..8].into() })
+                .serve_history(HistoryRequest::Restore {
+                    entry: id[..8].into()
+                })
                 .await,
             HistoryResult::Restored {
                 kind: SelectionKind::Clipboard,
@@ -3184,7 +3271,9 @@ mod tests {
         recv_clip(&mut h).await;
 
         let id = id_of(&h, "wanted").await;
-        h.engine.serve_history(HistoryRequest::Restore { id }).await;
+        h.engine
+            .serve_history(HistoryRequest::Restore { entry: id })
+            .await;
         recv_next_clip(&mut h).await; // the restore itself
         assert_no_broadcast(&mut h).await;
     }
@@ -3201,7 +3290,9 @@ mod tests {
 
         let id = id_of(&h, "kept").await;
         assert_eq!(
-            h.engine.serve_history(HistoryRequest::Restore { id }).await,
+            h.engine
+                .serve_history(HistoryRequest::Restore { entry: id })
+                .await,
             HistoryResult::Restored {
                 kind: SelectionKind::Clipboard,
                 broadcast: false
@@ -3214,6 +3305,41 @@ mod tests {
         assert_no_broadcast(&mut h).await;
     }
 
+    /// A row number and an id name the same rows, and the rule that tells them
+    /// apart is what keeps the two namespaces from colliding: a decimal inside
+    /// the row count is a number, anything else is an id. The other way round,
+    /// `restore 3` would be ambiguous most of the time — a sixteenth of all ids
+    /// start with `3`.
+    #[tokio::test]
+    async fn an_entry_can_be_named_by_its_row_number_or_by_its_id() {
+        let mut h = start(Config::for_test("s")).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("older"));
+        recv_clip(&mut h).await;
+        h.clip.local_copy(SelectionKind::Clipboard, offer("newer"));
+        recv_clip(&mut h).await;
+
+        // Row 2 is the older of the two...
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Get {
+                    entry: "2".into(),
+                    type_: None
+                })
+                .await,
+            HistoryResult::Offer(offer("older"))
+        );
+        // ...and so is its id, whether typed short or in full.
+        let id = id_of(&h, "older").await;
+        for entry in [id[..8].to_string(), id.clone(), id.to_ascii_uppercase()] {
+            assert_eq!(
+                h.engine
+                    .serve_history(HistoryRequest::Get { entry, type_: None })
+                    .await,
+                HistoryResult::Offer(offer("older"))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_history_lookup_distinguishes_missing_from_ambiguous() {
         let mut h = start(Config::for_test("s")).await;
@@ -3221,20 +3347,72 @@ mod tests {
         recv_clip(&mut h).await;
         h.clip.local_copy(SelectionKind::Clipboard, offer("two"));
         recv_clip(&mut h).await;
+        // Out of range as a number, and not an id either. The count is what the
+        // user needs back: their listing has gone stale.
+        for entry in ["ffffffffffff", "9"] {
+            assert_eq!(
+                h.engine
+                    .serve_history(HistoryRequest::Restore {
+                        entry: entry.into()
+                    })
+                    .await,
+                HistoryResult::Failed(HistoryMiss::NoSuchEntry { entries: 2 }),
+                "for {entry:?}"
+            );
+        }
+        // The empty prefix matches every entry, which is the ambiguous case with
+        // nothing typed at all — never "the first one".
         assert_eq!(
             h.engine
                 .serve_history(HistoryRequest::Restore {
-                    id: "ffffffffffff".into()
+                    entry: String::new()
                 })
-                .await,
-            HistoryResult::Failed(HistoryMiss::NoSuchEntry)
-        );
-        assert_eq!(
-            h.engine
-                .serve_history(HistoryRequest::Restore { id: String::new() })
                 .await,
             HistoryResult::Failed(HistoryMiss::Ambiguous { matches: 2 })
         );
+    }
+
+    /// A number that has run off the end must **not** fall through to the id
+    /// search. Every decimal digit is also a hex digit, so it would quietly
+    /// become a prefix search, land on whichever entry happens to start with
+    /// those digits, and — for a restore — broadcast it mesh-wide reporting
+    /// success. `0` is the same hazard with far better odds: a sixteenth of all
+    /// ids start with `0`.
+    #[tokio::test]
+    async fn an_out_of_range_number_is_never_reinterpreted_as_an_id() {
+        let mut h = start(Config::for_test("s")).await;
+        // Enough entries that some id is near-certain to start with each digit,
+        // which is what makes the fall-through reachable at all.
+        for i in 0..20 {
+            h.clip
+                .local_copy(SelectionKind::Clipboard, offer(&format!("copy {i}")));
+            recv_clip(&mut h).await;
+        }
+        // The guard is only exercised while some id really does start with the
+        // digits below — otherwise the fall-through has nothing to land on and
+        // this test would pass without testing anything.
+        let ids: Vec<String> = (0..20)
+            .map(|i| settled::hex(&Hashed::new(offer(&format!("copy {i}"))).hash()))
+            .collect();
+        assert!(
+            ids.iter().filter(|id| id.starts_with('0')).count() == 1,
+            "this test needs exactly one id starting with `0`, so the old \
+             fall-through would have silently restored it"
+        );
+
+        for entry in ["0", "21", "9999"] {
+            assert_eq!(
+                h.engine
+                    .serve_history(HistoryRequest::Restore {
+                        entry: entry.into()
+                    })
+                    .await,
+                HistoryResult::Failed(HistoryMiss::NoSuchEntry { entries: 20 }),
+                "{entry:?} was resolved as an id"
+            );
+        }
+        // Nothing was restored behind the user's back.
+        assert_no_broadcast(&mut h).await;
     }
 
     #[tokio::test]
@@ -3251,7 +3429,7 @@ mod tests {
         assert_eq!(
             h.engine
                 .serve_history(HistoryRequest::Get {
-                    id: id.clone(),
+                    entry: id.clone(),
                     type_: Some("image/png".into())
                 })
                 .await,
@@ -3265,7 +3443,7 @@ mod tests {
         let HistoryResult::Failed(HistoryMiss::NotOffered { available }) = h
             .engine
             .serve_history(HistoryRequest::Get {
-                id,
+                entry: id,
                 type_: Some("application/pdf".into()),
             })
             .await
@@ -3297,7 +3475,7 @@ mod tests {
         assert_eq!(
             plain
                 .engine
-                .serve_history(HistoryRequest::Restore { id })
+                .serve_history(HistoryRequest::Restore { entry: id })
                 .await,
             HistoryResult::Failed(HistoryMiss::NotSynced)
         );
@@ -3338,7 +3516,7 @@ mod tests {
         .await;
         assert_eq!(
             h.engine
-                .serve_history(HistoryRequest::Restore { id: id.clone() })
+                .serve_history(HistoryRequest::Restore { entry: id.clone() })
                 .await,
             HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
         );
@@ -3346,7 +3524,10 @@ mod tests {
         // will not put back, a `history get` must not hand out either.
         assert_eq!(
             h.engine
-                .serve_history(HistoryRequest::Get { id, type_: None })
+                .serve_history(HistoryRequest::Get {
+                    entry: id,
+                    type_: None
+                })
                 .await,
             HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
         );
@@ -3355,6 +3536,61 @@ mod tests {
         // of content both of the above refuse, to anyone holding the psk.
         assert_eq!(
             h.engine.serve_history(HistoryRequest::List).await,
+            HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
+        );
+    }
+
+    /// A denied entry keeps its id, and naming it keeps reporting *why* it
+    /// cannot be served. Resolving ids against the listed rows alone made this
+    /// "no such entry" as soon as one other entry was still servable — sending
+    /// the user after an eviction that never happened, which is the exact swap
+    /// `Filtered` exists to prevent.
+    #[tokio::test]
+    async fn a_denied_entry_is_still_found_by_its_id_beside_a_servable_one() {
+        let mut cfg = Config::for_test("s");
+        cfg.share_mime_rules = true;
+        let (_dir, path) = with_rules(
+            &mut cfg,
+            MimePolicy::Allow,
+            &[("text/plain", "allow"), ("text/html", "allow")],
+        );
+        let mut h = start(cfg).await;
+        h.clip.local_copy(
+            SelectionKind::Clipboard,
+            crate::protocol::test_support::offer(&[("text/html", b"<b>denied later</b>")]),
+        );
+        recv_next_clip(&mut h).await;
+        let denied = html_id("<b>denied later</b>");
+        h.clip
+            .local_copy(SelectionKind::Clipboard, offer("stays servable"));
+        recv_next_clip(&mut h).await;
+
+        send_rules(
+            &h,
+            future_stamp(10_000),
+            h.remote_id,
+            rules_toml(&[("text/plain", "allow"), ("text/html", "deny")]),
+        )
+        .await;
+        wait_rules_contain(
+            &path,
+            "\"text/html\" = \"deny\"",
+            "the peer's deny rule to be adopted",
+        )
+        .await;
+
+        // One row still lists, so the `rows.is_empty()` rescue does not apply.
+        let HistoryResult::List(rows) = h.engine.serve_history(HistoryRequest::List).await else {
+            panic!("the servable entry must still be listed");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            h.engine
+                .serve_history(HistoryRequest::Get {
+                    entry: denied,
+                    type_: None
+                })
+                .await,
             HistoryResult::Failed(HistoryMiss::Filtered(Unavailable::Denied))
         );
     }
